@@ -2,6 +2,9 @@
 [![Release](https://img.shields.io/github/v/release/DjaiElevate/coherent-numbers?style=for-the-badge)](https://github.com/DjaiElevate/coherent-numbers/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/Made%20with-Python-blue?style=for-the-badge&logo=python)](https://www.python.org/)
+<p align="center">
+  <img src="banner.png" alt="Coherent Numbers – A Harmonic Framework" width="100%">
+</p>
 
 **Author:** Djai Steven Charan  
 **Project:** Walking With Soul – Sacred Physics  
