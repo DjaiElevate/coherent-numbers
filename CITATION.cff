@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+message: If you use this, please cite it!
+title: Coherent Numbers
+authors:
+  - family-names: Charan
+    given-names: Djai Steven
+license: MIT
+version: 0.1.0
