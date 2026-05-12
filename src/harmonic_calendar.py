@@ -20,6 +20,14 @@ RUN_ANALYSIS = False
 
 PHASE_CYCLE = 108  # 0..107 inclusive
 
+# Locked random-anchor seed (memo v0.3.2 seed-locking amendment, 2026-05-12).
+# The 1,000 random-anchor 108-phase control calendars are generated with this
+# seed. The integer is the ISO-compact amendment date; it was locked before
+# any real-data PSS values, any real phase assignments, or any verdict
+# outputs were computed. It is not derived from the dataset, market outcomes,
+# calendar performance, or any observed protocol result.
+RANDOM_ANCHOR_SEED: int = 20260512
+
 
 # ── March-20 anchor calendar ──────────────────────────────────────────────────
 

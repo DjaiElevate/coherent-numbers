@@ -17,6 +17,7 @@ from datetime import date, timedelta
 
 from harmonic_calendar import (
     PHASE_CYCLE,
+    RANDOM_ANCHOR_SEED,
     march20_anchor_for_year,
     assign_march20_phase,
     assign_january_anchored_phase,
@@ -29,6 +30,16 @@ from harmonic_calendar import (
 
 def test_phase_cycle_is_108():
     assert PHASE_CYCLE == 108
+
+
+# ── RANDOM_ANCHOR_SEED locked by v0.3.2 amendment ────────────────────────────
+
+def test_random_anchor_seed_is_locked_to_amendment_date():
+    # Locked in memo v0.3.2 seed-locking amendment (2026-05-12). The integer is
+    # the ISO-compact amendment date and was chosen before any real-data PSS,
+    # real SPY phase assignment, or Commit 4 verdict output was computed.
+    assert RANDOM_ANCHOR_SEED == 20260512
+    assert isinstance(RANDOM_ANCHOR_SEED, int)
 
 
 # ── march20_anchor_for_year ───────────────────────────────────────────────────
