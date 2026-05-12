@@ -14,19 +14,36 @@ import math
 import random
 from datetime import date, timedelta
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 RUN_ANALYSIS = False
 
 PHASE_CYCLE = 108  # 0..107 inclusive
 
-# Locked random-anchor seed (memo v0.3.2 seed-locking amendment, 2026-05-12).
-# The 1,000 random-anchor 108-phase control calendars are generated with this
-# seed. The integer is the ISO-compact amendment date; it was locked before
-# any real-data PSS values, any real phase assignments, or any verdict
-# outputs were computed. It is not derived from the dataset, market outcomes,
-# calendar performance, or any observed protocol result.
+# Random-anchor seed — locked in memo v0.3.2 (seed-locking amendment, 2026-05-12)
+# and PRESERVED IN v0.3.3 FOR AUDIT TRACEABILITY ONLY. Under v0.3.3 the registered
+# anchor-control null is the deterministic exhaustive enumeration of all 365
+# integer-DOY anchors (see `enumerate_anchor_doys` below); no random sampling is
+# performed and this seed is not consumed by the registered control. The constant
+# is retained so the v0.3.2 → v0.3.3 audit trail remains traceable.
 RANDOM_ANCHOR_SEED: int = 20260512
+
+# Locked v0.3.3 anchor-control parameters.
+#
+# The registered anchor-control null is the exhaustive population of all 365
+# integer day-of-year anchored 108-phase calendars (DOY 1..365 inclusive). The
+# pass/fail comparison against this finite population is deterministic and
+# rank-based, using strict beating only (ties do not contribute to a pass).
+#
+#   TRAINING_RANK_THRESHOLD = ceil(0.95 * 365) = 347
+#   HOLDOUT_RANK_THRESHOLD  = ceil(0.90 * 365) = 329
+#
+# A reported `strict_percentile = strictly_below / 365` may be displayed for
+# human readability, but pass/fail is determined by the integer thresholds
+# above, not by any interpolated percentile function.
+ANCHOR_CONTROL_POPULATION_SIZE: int = 365
+TRAINING_RANK_THRESHOLD: int = 347   # ceil(0.95 * 365); 0.95*365 = 346.75
+HOLDOUT_RANK_THRESHOLD: int = 329    # ceil(0.90 * 365); 0.90*365 = 328.5
 
 
 # ── March-20 anchor calendar ──────────────────────────────────────────────────
@@ -108,6 +125,11 @@ def assign_gregorian_month(d: date) -> int:
 def generate_random_anchor_doys(n_anchors: int, seed: int) -> List[int]:
     """Return *n_anchors* distinct random DOY integers sampled from 1..365.
 
+    NOTE (v0.3.3): This helper is retained as a general utility and is still
+    covered by its original tests, but it is NOT used by the registered v0.3.3
+    anchor-control null. The registered control uses `enumerate_anchor_doys()`
+    (exhaustive enumeration of 1..365).
+
     Anchors are always in the 365-day DOY space (never 366), regardless of
     whether any particular year is a leap year.
     Anchors near DOY 79 (≈ March 20) are allowed and not excluded.
@@ -122,6 +144,52 @@ def generate_random_anchor_doys(n_anchors: int, seed: int) -> List[int]:
         )
     rng = random.Random(seed)
     return rng.sample(range(1, 366), n_anchors)
+
+
+# ── v0.3.3 exhaustive anchor-control population ──────────────────────────────
+
+def enumerate_anchor_doys() -> List[int]:
+    """Return the exhaustive integer-DOY anchor-control population (1..365).
+
+    This is the deterministic, finite, non-random anchor population used by the
+    v0.3.3 registered control. The list always contains exactly 365 entries
+    (1, 2, ..., 365) in ascending order. No random seed is consumed.
+
+    DOY 79 (≈ March 20 in non-leap years) and DOY 80 (March 20 in leap years
+    under the DOY-1-offset anchor rule) are both included; the candidate-anchor
+    calendar is not manually excluded from the control population.
+    """
+    return list(range(1, ANCHOR_CONTROL_POPULATION_SIZE + 1))
+
+
+# ── v0.3.3 finite-population rank/percentile convention ──────────────────────
+
+def strictly_below_count(target: float, distribution: Sequence[float]) -> int:
+    """Number of values in *distribution* that are strictly less than *target*.
+
+    Ties (values exactly equal to *target*) are NOT counted. This is the basic
+    primitive of the v0.3.3 strict-beat rank convention.
+    """
+    return sum(1 for x in distribution if x < target)
+
+
+def strict_rank_pass(
+    target: float,
+    distribution: Sequence[float],
+    threshold_count: int,
+) -> bool:
+    """Locked v0.3.3 rank-based pass test on a finite anchor-control distribution.
+
+    Returns True iff *target* is strictly greater than at least
+    *threshold_count* values in *distribution*. Ties do not help the pass.
+
+    Used with TRAINING_RANK_THRESHOLD (347) for the training screen and
+    HOLDOUT_RANK_THRESHOLD (329) for the holdout primary against the
+    exhaustive 365-anchor null.
+    """
+    if threshold_count < 0:
+        raise ValueError("threshold_count must be non-negative, got {}".format(threshold_count))
+    return strictly_below_count(target, distribution) >= threshold_count
 
 
 # ── PSS (Phase Structure Score) ───────────────────────────────────────────────

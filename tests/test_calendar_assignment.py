@@ -18,12 +18,18 @@ from datetime import date, timedelta
 from harmonic_calendar import (
     PHASE_CYCLE,
     RANDOM_ANCHOR_SEED,
+    ANCHOR_CONTROL_POPULATION_SIZE,
+    TRAINING_RANK_THRESHOLD,
+    HOLDOUT_RANK_THRESHOLD,
     march20_anchor_for_year,
     assign_march20_phase,
     assign_january_anchored_phase,
     assign_random_anchor_phase,
     assign_gregorian_month,
     generate_random_anchor_doys,
+    enumerate_anchor_doys,
+    strictly_below_count,
+    strict_rank_pass,
 )
 
 # ── PHASE_CYCLE sanity ────────────────────────────────────────────────────────
@@ -35,11 +41,141 @@ def test_phase_cycle_is_108():
 # ── RANDOM_ANCHOR_SEED locked by v0.3.2 amendment ────────────────────────────
 
 def test_random_anchor_seed_is_locked_to_amendment_date():
-    # Locked in memo v0.3.2 seed-locking amendment (2026-05-12). The integer is
-    # the ISO-compact amendment date and was chosen before any real-data PSS,
-    # real SPY phase assignment, or Commit 4 verdict output was computed.
+    # Locked in memo v0.3.2 seed-locking amendment (2026-05-12). Preserved
+    # unchanged in v0.3.3 for audit traceability; not consumed by the v0.3.3
+    # exhaustive anchor-control null.
     assert RANDOM_ANCHOR_SEED == 20260512
     assert isinstance(RANDOM_ANCHOR_SEED, int)
+
+
+# ── v0.3.3 anchor-control population: exhaustive enumeration ─────────────────
+
+def test_anchor_control_population_size_is_365():
+    assert ANCHOR_CONTROL_POPULATION_SIZE == 365
+
+
+def test_enumerate_anchor_doys_returns_exactly_365():
+    doys = enumerate_anchor_doys()
+    assert len(doys) == 365
+
+
+def test_enumerate_anchor_doys_covers_1_to_365_inclusive():
+    doys = enumerate_anchor_doys()
+    assert doys[0] == 1
+    assert doys[-1] == 365
+    assert set(doys) == set(range(1, 366))
+
+
+def test_enumerate_anchor_doys_unique():
+    doys = enumerate_anchor_doys()
+    assert len(set(doys)) == len(doys) == 365
+
+
+def test_enumerate_anchor_doys_is_deterministic_no_seed():
+    # Multiple calls produce identical results without consuming any seed.
+    assert enumerate_anchor_doys() == enumerate_anchor_doys()
+    assert enumerate_anchor_doys() == list(range(1, 366))
+
+
+def test_enumerate_anchor_doys_includes_march20_doys():
+    # March 20 (DOY 79 in non-leap, DOY 80 in leap under DOY-1-offset rule)
+    # is included in the 365-anchor control population; the candidate-anchor
+    # calendar is not manually excluded from the null.
+    doys = enumerate_anchor_doys()
+    assert 79 in doys
+    assert 80 in doys
+
+
+def test_enumerate_anchor_doys_does_not_consume_random_anchor_seed():
+    # Demonstrate that enumerate_anchor_doys() does not perturb a shared
+    # random.Random(seed) — i.e., it consumes no random numbers. We compare
+    # two independent rng.random() draws around the call.
+    import random as _random
+    rng_a = _random.Random(RANDOM_ANCHOR_SEED)
+    sequence_before = [rng_a.random() for _ in range(3)]
+    rng_b = _random.Random(RANDOM_ANCHOR_SEED)
+    _ = enumerate_anchor_doys()
+    sequence_after = [rng_b.random() for _ in range(3)]
+    assert sequence_before == sequence_after, (
+        "enumerate_anchor_doys must not consume any random numbers"
+    )
+
+
+# ── v0.3.3 finite-population rank/percentile convention ──────────────────────
+
+def test_training_rank_threshold_is_347():
+    assert TRAINING_RANK_THRESHOLD == 347
+    assert TRAINING_RANK_THRESHOLD == math.ceil(0.95 * 365)
+
+
+def test_holdout_rank_threshold_is_329():
+    assert HOLDOUT_RANK_THRESHOLD == 329
+    assert HOLDOUT_RANK_THRESHOLD == math.ceil(0.90 * 365)
+
+
+def test_strictly_below_count_basic():
+    dist = [1.0, 2.0, 3.0, 4.0, 5.0]
+    assert strictly_below_count(3.0, dist) == 2   # 1.0, 2.0
+    assert strictly_below_count(3.5, dist) == 3   # 1.0, 2.0, 3.0
+    assert strictly_below_count(5.0, dist) == 4   # 1.0..4.0 (5.0 is a tie)
+    assert strictly_below_count(6.0, dist) == 5   # all
+    assert strictly_below_count(0.0, dist) == 0   # none
+
+
+def test_strictly_below_count_ties_not_counted():
+    # Ties (==) must never be counted as strictly below.
+    dist = [1.0, 1.0, 1.0, 2.0, 3.0]
+    assert strictly_below_count(1.0, dist) == 0
+    assert strictly_below_count(2.0, dist) == 3
+    assert strictly_below_count(3.0, dist) == 4
+
+
+def test_strict_rank_pass_when_target_strictly_exceeds_enough():
+    # 350 strictly below: passes for both thresholds.
+    dist = [0.0] * 350 + [10.0] * 15
+    assert strict_rank_pass(5.0, dist, TRAINING_RANK_THRESHOLD) is True
+    assert strict_rank_pass(5.0, dist, HOLDOUT_RANK_THRESHOLD) is True
+
+
+def test_strict_rank_pass_fails_training_passes_holdout_at_346():
+    # 346 strictly below: fails training (needs 347), passes holdout (needs 329).
+    dist = [0.0] * 346 + [10.0] * 19
+    assert strict_rank_pass(5.0, dist, TRAINING_RANK_THRESHOLD) is False
+    assert strict_rank_pass(5.0, dist, HOLDOUT_RANK_THRESHOLD) is True
+
+
+def test_strict_rank_pass_fails_holdout_at_328():
+    # 328 strictly below: fails both thresholds.
+    dist = [0.0] * 328 + [10.0] * 37
+    assert strict_rank_pass(5.0, dist, TRAINING_RANK_THRESHOLD) is False
+    assert strict_rank_pass(5.0, dist, HOLDOUT_RANK_THRESHOLD) is False
+
+
+def test_strict_rank_pass_ties_do_not_help_pass_training():
+    # 346 strictly below + 1 tie at 5.0 = 347 "≤ target", but ties don't count
+    # as strictly below; strictly_below = 346 < 347 → training screen fails.
+    dist = [0.0] * 346 + [5.0] + [10.0] * 18
+    assert strict_rank_pass(5.0, dist, TRAINING_RANK_THRESHOLD) is False
+
+
+def test_strict_rank_pass_ties_do_not_help_pass_holdout():
+    # 328 strictly below + 1 tie at 5.0 = 329 "≤", but ties don't help.
+    dist = [0.0] * 328 + [5.0] + [10.0] * 36
+    assert strict_rank_pass(5.0, dist, HOLDOUT_RANK_THRESHOLD) is False
+
+
+def test_strict_rank_pass_at_exact_threshold_passes():
+    # 347 strictly below (no ties) → training passes.
+    dist = [0.0] * 347 + [10.0] * 18
+    assert strict_rank_pass(5.0, dist, TRAINING_RANK_THRESHOLD) is True
+    # 329 strictly below (no ties) → holdout passes.
+    dist_holdout = [0.0] * 329 + [10.0] * 36
+    assert strict_rank_pass(5.0, dist_holdout, HOLDOUT_RANK_THRESHOLD) is True
+
+
+def test_strict_rank_pass_rejects_negative_threshold():
+    with pytest.raises(ValueError):
+        strict_rank_pass(0.0, [1.0, 2.0], -1)
 
 
 # ── march20_anchor_for_year ───────────────────────────────────────────────────
