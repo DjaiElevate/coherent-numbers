@@ -1,0 +1,1 @@
+Coherent Numbers are a higher-octave representation of real quantities where infinite values resolve to finite, harmonic ratios across a 12-phase base. The framework aims to preserve geometric and energetic invariants and offer practical benefits for wave/angle math and energy systems.
