@@ -32,8 +32,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import human_field_base12_pullback_atlas as atlas  # noqa: E402
 
-# Authorized canonical run gate (this is the explicitly authorized gate).
-CANONICAL_RUN_AUTHORIZED = True
+# Inert by default. The 20260517_201553 run is recorded (commit c67e89b);
+# the runner is reset so canonical execution requires explicit, deliberate
+# re-authorization (flip to True AND pass --authorize-canonical-run). This
+# safety reset changes no run artifact and no computation output.
+CANONICAL_RUN_AUTHORIZED = False
 
 _REFUSAL = (
     "Canonical atlas run is NOT authorized. Set CANONICAL_RUN_AUTHORIZED=True "
