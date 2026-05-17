@@ -25,7 +25,7 @@ import csv
 import json
 import os
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -456,6 +456,9 @@ def write_markdown(path: str, text: str) -> None:
 
 # ── 13. Metadata builder ─────────────────────────────────────────────────────
 
+NORMALIZATION_STATUS_VALUES = ("used", "not_used", "deferred")
+
+
 def build_metadata(
     coverage_start: date,
     coverage_end: date,
@@ -463,9 +466,18 @@ def build_metadata(
     by_year_reported: bool,
     state_status: str,
     feasibility_class: str,
+    gdelt_normalization_files_status: str = "deferred",
+    min_event_floor: Optional[int] = None,
+    option_c_threshold: Optional[float] = None,
 ) -> Dict[str, object]:
     if coverage_end >= SEAL_START:
         raise Protocol2023PlusBreach("metadata coverage_end is 2023+")
+    if gdelt_normalization_files_status not in NORMALIZATION_STATUS_VALUES:
+        raise ValueError(
+            "gdelt_normalization_files_status must be one of {}; got {!r}".format(
+                NORMALIZATION_STATUS_VALUES, gdelt_normalization_files_status
+            )
+        )
     return {
         "governing_protocol_commit": GOVERNING_PROTOCOL_COMMIT,
         "authorization_commit": AUTHORIZATION_COMMIT,
@@ -486,4 +498,22 @@ def build_metadata(
         "state_count_feasibility_status": state_status,
         "feasibility_class": feasibility_class,
         "feasibility_class_note": F_NOTES.get(feasibility_class, ""),
+        # Authorization-memo requirement: record normalization-file choice.
+        "gdelt_normalization_files_status": gdelt_normalization_files_status,
+        "gdelt_normalization_files_note": (
+            "Normalization files are not applied in this scaffold. The "
+            "normalization choice must be pinned before any real count-only "
+            "run authorization."
+        ),
+        # Pinned-parameter echoes. Explicit None when unpinned (never omitted).
+        "min_event_floor": min_event_floor,
+        "min_event_floor_note": (
+            "min_event_floor must be pinned before any real count-only "
+            "feasibility run."
+        ),
+        "option_c_threshold": option_c_threshold,
+        "option_c_threshold_note": (
+            "Option-C threshold must be explicitly supplied; no silent "
+            "default is allowed."
+        ),
     }

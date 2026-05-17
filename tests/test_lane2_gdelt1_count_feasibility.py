@@ -218,6 +218,53 @@ def test_metadata_fields_and_seal():
                          "unresolved", "F2")
 
 
+def test_metadata_normalization_status_default_and_note():
+    md = m.build_metadata(date(2005, 1, 1), date(2022, 12, 31), True, True,
+                          "unresolved", "F2")
+    assert md["gdelt_normalization_files_status"] == "deferred"
+    assert "must be pinned before any real count-only run" in (
+        md["gdelt_normalization_files_note"]
+    )
+
+
+def test_metadata_normalization_status_validated():
+    for s in ("used", "not_used", "deferred"):
+        md = m.build_metadata(date(2005, 1, 1), date(2022, 12, 31), True, True,
+                              "unresolved", "F2",
+                              gdelt_normalization_files_status=s)
+        assert md["gdelt_normalization_files_status"] == s
+    with pytest.raises(ValueError):
+        m.build_metadata(date(2005, 1, 1), date(2022, 12, 31), True, True,
+                         "unresolved", "F2",
+                         gdelt_normalization_files_status="maybe")
+
+
+def test_metadata_min_event_floor_and_threshold_present_even_when_none():
+    md = m.build_metadata(date(2005, 1, 1), date(2022, 12, 31), True, True,
+                          "unresolved", "F2")
+    assert "min_event_floor" in md and md["min_event_floor"] is None
+    assert "option_c_threshold" in md and md["option_c_threshold"] is None
+    assert "must be pinned" in md["min_event_floor_note"]
+    assert "no silent default" in md["option_c_threshold_note"]
+
+
+def test_metadata_echoes_supplied_floor_and_threshold():
+    md = m.build_metadata(date(2005, 1, 1), date(2022, 12, 31), True, True,
+                          "resolved", "F3", min_event_floor=40,
+                          option_c_threshold=125.0)
+    assert md["min_event_floor"] == 40
+    assert md["option_c_threshold"] == 125.0
+
+
+def test_unused_field_import_removed():
+    import inspect
+    src = inspect.getsource(m)
+    assert "from dataclasses import dataclass\n" in src
+    assert "from dataclasses import dataclass, field" not in src
+    # dataclasses.field is not bound in the module namespace
+    assert not hasattr(m, "field")
+
+
 # ── 12. prohibited-computation guards ────────────────────────────────────────
 
 def test_no_prohibited_symbols_in_module():
