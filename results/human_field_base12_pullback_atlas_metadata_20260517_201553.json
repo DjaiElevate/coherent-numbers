@@ -1,0 +1,68 @@
+{
+  "design_memo_path": "docs/human_field_base12_pullback_atlas_design_memo_v0.1.md",
+  "implementation_plan_path": "docs/human_field_base12_pullback_atlas_implementation_plan_v0.1.md",
+  "candidate_c_references": {
+    "design_memo": "401ce45 docs/candidate_c_design_memo_v0.1.md",
+    "lock_acceptance": "dc97576 docs/candidate_c_design_memo_v0.1_lock_acceptance.md",
+    "verdict_log": "a19b2e9 results/candidate_c_results_20260515_051236_f3a6bf48.{json,md}",
+    "closure_memo": "1659819 docs/candidate_c_closure_memo_v0.1.md",
+    "phase_label_source": "src/candidate_c_lens.py::assign_annual_sector_phase"
+  },
+  "freeze_manifest_reference": "docs/pullback_population_freeze_manifest_v0.1.md @ 5225bfd",
+  "spy_artifact_reference": "data/raw/spy_yahoo_v8_19930129_20241231_e8fc0357410ce499da8f67e09b4c9908232e18a55445f38969e77fa712aaaa56.csv @ ed199bd",
+  "latest_permitted_feature_date": "2022-12-20",
+  "latest_permitted_event_entry_date": "2022-12-21",
+  "row_count_verified": true,
+  "asset_counts_verified": true,
+  "observed_frozen_hashes": {
+    "data/raw/pullback_spy_base_301_trades_2000_2022.csv": "b7817e0e7a02dad44923eae462c1454ab67b8fbc73539b36b81e043d8dcc2d06",
+    "data/raw/pullback_phase3b_spy_trades_2005_2022.csv": "1d8a7b77389835a7231d6ca0742e39d963cf4dc03f822b0111039b5c19383621",
+    "data/raw/pullback_phase3b_efa_trades_2005_2022.csv": "275af7e00f28a2a72d948228964c7a4658444f0030ac048e8a2851bc3313de82",
+    "data/raw/pullback_phase3b_eem_trades_2005_2022.csv": "56cf8e5fe88f5230ebb8e2881f4df1e0ff633819d588764d9e9e57bbdebb6916",
+    "data/raw/pullback_phase3b_gld_trades_2005_2022.csv": "0de7bf6dd981be8d8091a382a6dc0af594a59fa8d87f459305ad25f9dc21d1e3",
+    "data/raw/pullback_phase3b_tlt_trades_2005_2022.csv": "037ea4178bd071e426d7cce30eeaffb554ae31d7998c8d00d5e2ba36a7388abc"
+  },
+  "indeterminate_count": 0,
+  "methodological_status": "ok",
+  "timestamp_utc": "20260517_201553",
+  "rvol_std_ddof": 1,
+  "exploratory_atlas_only": true,
+  "verdict_language_allowed": false,
+  "confirmation_claim_allowed": false,
+  "post_2022_rows_used_in_computation": false,
+  "post_2022_note": "No post-2022 rows were used in any atlas computation. The SPY auxiliary frame was filtered to the maximum permitted feature date before feature construction.",
+  "lane2_attention_spike_study_included": false,
+  "no_oos_analysis": true,
+  "grids_emitted": [
+    "grid1_count.csv",
+    "grid2_long_pct.csv",
+    "grid3_median_r.csv",
+    "grid4_state_pss.csv",
+    "grid5_asset_phase_state.csv",
+    "grid6_long_only_count.csv",
+    "grid6_long_only_long_pct.csv",
+    "grid6_long_only_median_r.csv",
+    "grid6_short_only_count.csv",
+    "grid6_short_only_long_pct.csv",
+    "grid6_short_only_median_r.csv",
+    "grid7_sparsity_report.csv",
+    "grid8_base10_count.csv",
+    "grid8_base10_long_pct.csv",
+    "grid8_base10_median_r.csv",
+    "grid8_base10_state_pss.csv"
+  ],
+  "heatmaps_emitted": [
+    "grid1_count_base12.png",
+    "grid2_long_pct_base12.png",
+    "grid3_median_r_base12.png",
+    "grid8_count_base10.png",
+    "grid8_long_pct_base10.png"
+  ],
+  "preflight_details": {
+    "row_count": 1282,
+    "indeterminate_count": 0,
+    "indeterminate_reasons": []
+  },
+  "candidate_hypotheses_generated": [],
+  "candidate_hypotheses_note": "No candidate hypotheses authored in this run. Hypothesis formation is a separately reviewed step; low-data (n<20) and indeterminate-state cells are excluded from any future formation. Candidate H0 (no coherent joint structure) remains a valid equal-weight outcome."
+}

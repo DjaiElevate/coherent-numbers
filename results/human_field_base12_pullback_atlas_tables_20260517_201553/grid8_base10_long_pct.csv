@@ -1,0 +1,51 @@
+base10_phase,state,value,n,low_data,marker
+1,calm bull,75.0,84,false,
+1,manic / unstable rally,42.857142857142854,7,true,LOW_DATA
+1,panic / crisis,43.47826086956522,23,false,
+1,quiet bearish / exhaustion,61.111111111111114,18,true,LOW_DATA
+1,indeterminate-state,NA,0,true,LOW_DATA
+2,calm bull,60.526315789473685,76,false,
+2,manic / unstable rally,50.0,10,true,LOW_DATA
+2,panic / crisis,11.538461538461538,26,false,
+2,quiet bearish / exhaustion,32.142857142857146,28,false,
+2,indeterminate-state,NA,0,true,LOW_DATA
+3,calm bull,59.09090909090909,66,false,
+3,manic / unstable rally,66.66666666666667,6,true,LOW_DATA
+3,panic / crisis,13.636363636363637,22,false,
+3,quiet bearish / exhaustion,21.428571428571427,28,false,
+3,indeterminate-state,NA,0,true,LOW_DATA
+4,calm bull,78.57142857142857,84,false,
+4,manic / unstable rally,57.142857142857146,14,true,LOW_DATA
+4,panic / crisis,0.0,7,true,LOW_DATA
+4,quiet bearish / exhaustion,43.75,16,true,LOW_DATA
+4,indeterminate-state,NA,0,true,LOW_DATA
+5,calm bull,61.40350877192982,57,false,
+5,manic / unstable rally,80.0,5,true,LOW_DATA
+5,panic / crisis,40.54054054054054,37,false,
+5,quiet bearish / exhaustion,50.0,16,true,LOW_DATA
+5,indeterminate-state,NA,0,true,LOW_DATA
+6,calm bull,77.52808988764045,89,false,
+6,manic / unstable rally,80.0,5,true,LOW_DATA
+6,panic / crisis,13.333333333333334,45,false,
+6,quiet bearish / exhaustion,18.42105263157895,38,false,
+6,indeterminate-state,NA,0,true,LOW_DATA
+7,calm bull,81.08108108108108,74,false,
+7,manic / unstable rally,66.66666666666667,6,true,LOW_DATA
+7,panic / crisis,27.272727272727273,22,false,
+7,quiet bearish / exhaustion,22.22222222222222,9,true,LOW_DATA
+7,indeterminate-state,NA,0,true,LOW_DATA
+8,calm bull,71.25,80,false,
+8,manic / unstable rally,30.76923076923077,13,true,LOW_DATA
+8,panic / crisis,45.45454545454545,11,true,LOW_DATA
+8,quiet bearish / exhaustion,0.0,3,true,LOW_DATA
+8,indeterminate-state,NA,0,true,LOW_DATA
+9,calm bull,77.89473684210526,95,false,
+9,manic / unstable rally,75.0,8,true,LOW_DATA
+9,panic / crisis,54.54545454545455,22,false,
+9,quiet bearish / exhaustion,44.44444444444444,18,true,LOW_DATA
+9,indeterminate-state,NA,0,true,LOW_DATA
+10,calm bull,68.65671641791045,67,false,
+10,manic / unstable rally,58.333333333333336,12,true,LOW_DATA
+10,panic / crisis,27.272727272727273,22,false,
+10,quiet bearish / exhaustion,38.46153846153846,13,true,LOW_DATA
+10,indeterminate-state,NA,0,true,LOW_DATA

@@ -1,0 +1,51 @@
+base10_phase,state,value,n,low_data,marker
+1,calm bull,84.0,84,false,
+1,manic / unstable rally,7.0,7,true,LOW_DATA
+1,panic / crisis,23.0,23,false,
+1,quiet bearish / exhaustion,18.0,18,true,LOW_DATA
+1,indeterminate-state,0.0,0,true,LOW_DATA
+2,calm bull,76.0,76,false,
+2,manic / unstable rally,10.0,10,true,LOW_DATA
+2,panic / crisis,26.0,26,false,
+2,quiet bearish / exhaustion,28.0,28,false,
+2,indeterminate-state,0.0,0,true,LOW_DATA
+3,calm bull,66.0,66,false,
+3,manic / unstable rally,6.0,6,true,LOW_DATA
+3,panic / crisis,22.0,22,false,
+3,quiet bearish / exhaustion,28.0,28,false,
+3,indeterminate-state,0.0,0,true,LOW_DATA
+4,calm bull,84.0,84,false,
+4,manic / unstable rally,14.0,14,true,LOW_DATA
+4,panic / crisis,7.0,7,true,LOW_DATA
+4,quiet bearish / exhaustion,16.0,16,true,LOW_DATA
+4,indeterminate-state,0.0,0,true,LOW_DATA
+5,calm bull,57.0,57,false,
+5,manic / unstable rally,5.0,5,true,LOW_DATA
+5,panic / crisis,37.0,37,false,
+5,quiet bearish / exhaustion,16.0,16,true,LOW_DATA
+5,indeterminate-state,0.0,0,true,LOW_DATA
+6,calm bull,89.0,89,false,
+6,manic / unstable rally,5.0,5,true,LOW_DATA
+6,panic / crisis,45.0,45,false,
+6,quiet bearish / exhaustion,38.0,38,false,
+6,indeterminate-state,0.0,0,true,LOW_DATA
+7,calm bull,74.0,74,false,
+7,manic / unstable rally,6.0,6,true,LOW_DATA
+7,panic / crisis,22.0,22,false,
+7,quiet bearish / exhaustion,9.0,9,true,LOW_DATA
+7,indeterminate-state,0.0,0,true,LOW_DATA
+8,calm bull,80.0,80,false,
+8,manic / unstable rally,13.0,13,true,LOW_DATA
+8,panic / crisis,11.0,11,true,LOW_DATA
+8,quiet bearish / exhaustion,3.0,3,true,LOW_DATA
+8,indeterminate-state,0.0,0,true,LOW_DATA
+9,calm bull,95.0,95,false,
+9,manic / unstable rally,8.0,8,true,LOW_DATA
+9,panic / crisis,22.0,22,false,
+9,quiet bearish / exhaustion,18.0,18,true,LOW_DATA
+9,indeterminate-state,0.0,0,true,LOW_DATA
+10,calm bull,67.0,67,false,
+10,manic / unstable rally,12.0,12,true,LOW_DATA
+10,panic / crisis,22.0,22,false,
+10,quiet bearish / exhaustion,13.0,13,true,LOW_DATA
+10,indeterminate-state,0.0,0,true,LOW_DATA

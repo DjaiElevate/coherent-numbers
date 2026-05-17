@@ -1,0 +1,61 @@
+base12_phase,state,value,n,low_data,marker
+1,calm bull,0.2837723705537496,52,false,
+1,manic / unstable rally,-0.4837442003708017,2,true,LOW_DATA
+1,panic / crisis,-0.05436656012510575,8,true,LOW_DATA
+1,quiet bearish / exhaustion,0.5505678287238617,8,true,LOW_DATA
+1,indeterminate-state,NA,0,true,LOW_DATA
+2,calm bull,0.1162887496601626,43,false,
+2,manic / unstable rally,-0.1676313627637542,5,true,LOW_DATA
+2,panic / crisis,0.1525716575546023,5,true,LOW_DATA
+2,quiet bearish / exhaustion,0.020402149593280502,10,true,LOW_DATA
+2,indeterminate-state,NA,0,true,LOW_DATA
+3,calm bull,-0.0204072773551424,33,false,
+3,manic / unstable rally,0.186479348739999,3,true,LOW_DATA
+3,panic / crisis,-0.5538730995878375,2,true,LOW_DATA
+3,quiet bearish / exhaustion,0.9987966365139404,7,true,LOW_DATA
+3,indeterminate-state,NA,0,true,LOW_DATA
+4,calm bull,0.04971179539422535,42,false,
+4,manic / unstable rally,0.0659911165649124,10,true,LOW_DATA
+4,panic / crisis,-0.3672504752429352,1,true,LOW_DATA
+4,quiet bearish / exhaustion,-0.8361836630174563,6,true,LOW_DATA
+4,indeterminate-state,NA,0,true,LOW_DATA
+5,calm bull,0.170769657929854,51,false,
+5,manic / unstable rally,NA,0,true,LOW_DATA
+5,panic / crisis,0.7753365473479115,2,true,LOW_DATA
+5,quiet bearish / exhaustion,0.6514433401050967,3,true,LOW_DATA
+5,indeterminate-state,NA,0,true,LOW_DATA
+6,calm bull,0.2467191954364376,28,false,
+6,manic / unstable rally,-0.5220737387820852,4,true,LOW_DATA
+6,panic / crisis,0.4236581515293744,13,true,LOW_DATA
+6,quiet bearish / exhaustion,-0.2899867582569359,7,true,LOW_DATA
+6,indeterminate-state,NA,0,true,LOW_DATA
+7,calm bull,-0.09462749652344635,52,false,
+7,manic / unstable rally,-0.13400952538547983,4,true,LOW_DATA
+7,panic / crisis,0.1855500621917437,5,true,LOW_DATA
+7,quiet bearish / exhaustion,-0.0750407190711206,7,true,LOW_DATA
+7,indeterminate-state,NA,0,true,LOW_DATA
+8,calm bull,0.1531291778781461,59,false,
+8,manic / unstable rally,0.05959793393888606,4,true,LOW_DATA
+8,panic / crisis,-0.2798784201814959,7,true,LOW_DATA
+8,quiet bearish / exhaustion,-0.7225853738715367,2,true,LOW_DATA
+8,indeterminate-state,NA,0,true,LOW_DATA
+9,calm bull,0.3733390450213631,49,false,
+9,manic / unstable rally,0.28698384087396744,2,true,LOW_DATA
+9,panic / crisis,0.7846601987729395,3,true,LOW_DATA
+9,quiet bearish / exhaustion,NA,0,true,LOW_DATA
+9,indeterminate-state,NA,0,true,LOW_DATA
+10,calm bull,0.5033854282996428,52,false,
+10,manic / unstable rally,0.06072314522303146,2,true,LOW_DATA
+10,panic / crisis,0.4235295708727791,7,true,LOW_DATA
+10,quiet bearish / exhaustion,0.8741376625319128,1,true,LOW_DATA
+10,indeterminate-state,NA,0,true,LOW_DATA
+11,calm bull,0.4500528731259739,55,false,
+11,manic / unstable rally,-0.9542633452026115,6,true,LOW_DATA
+11,panic / crisis,0.4985232932240214,9,true,LOW_DATA
+11,quiet bearish / exhaustion,0.0027282038896369,9,true,LOW_DATA
+11,indeterminate-state,NA,0,true,LOW_DATA
+12,calm bull,-0.3191257856545327,39,false,
+12,manic / unstable rally,0.2982588737456325,7,true,LOW_DATA
+12,panic / crisis,-0.8385928868217357,4,true,LOW_DATA
+12,quiet bearish / exhaustion,-0.4552960953822235,3,true,LOW_DATA
+12,indeterminate-state,NA,0,true,LOW_DATA
