@@ -701,33 +701,125 @@ def download_one(
     raise RuntimeError("download failed after retries: {}".format(last_err))
 
 
+LAYOUT_FEASIBILITY_NOTE = (
+    "This is a coverage/layout feasibility issue, not hypothesis evidence."
+)
+
+
+def parse_gdelt1_unit_key(key: str) -> Tuple[date, str]:
+    """Parse a PlannedUnit-style key into (rep_date, regime).
+
+    "YYYY" -> yearly, "YYYY-MM" -> monthly, "YYYY-MM-DD" -> daily.
+    Raises ValueError if unparseable. Raises Protocol2023PlusBreach if the
+    parsed date is 2023+ (prior 2023+ guard).
+    """
+    parts = key.split("-")
+    try:
+        if len(parts) == 1 and len(parts[0]) == 4:
+            d, regime = date(int(parts[0]), 1, 1), "yearly"
+        elif len(parts) == 2:
+            d, regime = date(int(parts[0]), int(parts[1]), 1), "monthly"
+        elif len(parts) == 3:
+            d, regime = (
+                date(int(parts[0]), int(parts[1]), int(parts[2])),
+                "daily",
+            )
+        else:
+            raise ValueError("unrecognized unit-key shape: {!r}".format(key))
+    except ValueError as exc:
+        if isinstance(exc, ValueError) and "unrecognized unit-key" in str(exc):
+            raise
+        raise ValueError("unparseable unit key: {!r}".format(key))
+    if d >= SEAL_START:
+        raise Protocol2023PlusBreach(
+            "2023+ unit key encountered: {}".format(key)
+        )
+    return d, regime
+
+
+def _try_parse_unit_key(
+    key: str, key_parser: Callable[[str], Tuple[date, str]]
+) -> Optional[Tuple[date, str]]:
+    """Parse if possible; None if not a unit-shaped key. 2023+ still aborts."""
+    try:
+        return key_parser(key)
+    except Protocol2023PlusBreach:
+        raise  # prior 2023+ guard: never swallow
+    except ValueError:
+        return None
+
+
 def verify_archive_layout(
     planned: Sequence[RetrievalEntry],
     available_keys: Sequence[str],
     expected_naming: Optional[Callable[[RetrievalEntry], bool]] = None,
+    slot_actual_keys: Optional[Dict[str, str]] = None,
+    key_parser: Optional[Callable[[str], Tuple[date, str]]] = None,
 ) -> Dict[str, object]:
     """Freeze-time scaffold: compare the documented plan to a (fake, in this
-    draft) listing of what the archive actually exposes."""
+    draft) listing of what the archive actually exposes.
+
+    `slot_actual_keys` maps a planned unit key -> the actual key string the
+    archive exposes for that slot. When supplied, each is parsed and compared
+    to the planned unit's (rep_date, regime); divergence is a first-class
+    file/date-unit mismatch (not folded into missing/unexpected/naming).
+    """
+    parser = key_parser or parse_gdelt1_unit_key
+    # Prior 2023+ guards: planned units, and any parseable available/slot key.
     assert_no_2023plus([p.rep_date for p in planned], "verify_archive_layout")
+    for k in available_keys:
+        _try_parse_unit_key(k, parser)  # raises Protocol2023PlusBreach on 2023+
+    for k in (slot_actual_keys or {}).values():
+        _try_parse_unit_key(k, parser)
+
     avail = set(available_keys)
     planned_keys = [p.key for p in planned]
+    planned_by_key = {p.key: p for p in planned}
     missing = [k for k in planned_keys if k not in avail]
     unexpected = [k for k in avail if k not in set(planned_keys)]
     naming_bad = []
     if expected_naming is not None:
         naming_bad = [p.key for p in planned if not expected_naming(p)]
+
+    # Dedicated file/date-unit mismatch detection.
+    date_unit_mismatch: List[Dict[str, str]] = []
+    for planned_key, actual_key in (slot_actual_keys or {}).items():
+        p = planned_by_key.get(planned_key)
+        if p is None:
+            continue
+        parsed = _try_parse_unit_key(actual_key, parser)
+        if parsed is None:
+            # actual key not unit-shaped -> a regime/naming mismatch
+            date_unit_mismatch.append({
+                "planned_key": planned_key,
+                "actual_key": actual_key,
+                "reason": "actual key not unit-parseable",
+            })
+            continue
+        a_date, a_regime = parsed
+        if a_date != p.rep_date or a_regime != p.regime:
+            date_unit_mismatch.append({
+                "planned_key": planned_key,
+                "planned": "{} {}".format(p.regime, p.rep_date.isoformat()),
+                "actual": "{} {}".format(a_regime, a_date.isoformat()),
+            })
+
     pre = [p for p in planned if p.rep_date < REGIME_DAILY_START]
     post = [p for p in planned if p.rep_date >= REGIME_DAILY_START]
-    layout_differs = bool(missing or unexpected or naming_bad)
+    layout_differs = bool(
+        missing or unexpected or naming_bad or date_unit_mismatch
+    )
     return {
         "files_available": sorted(k for k in planned_keys if k in avail),
         "files_missing": missing,
         "files_unexpected_naming": naming_bad,
         "files_in_archive_not_planned": unexpected,
+        "files_date_unit_mismatch": date_unit_mismatch,
         "pre_2013_regime_coverage": len(pre),
         "post_2013_daily_coverage": len(post),
         "boundary_2013_04_01_handled": True,
         "actual_layout_differs_from_documented": layout_differs,
+        "note": LAYOUT_FEASIBILITY_NOTE,
     }
 
 
@@ -735,6 +827,9 @@ def layout_outcome(report: Dict[str, object]) -> Tuple[str, str]:
     """Map a layout report to a feasibility action. Differing layout -> F4
     (inconclusive) unless separately approved; never silently 'ok'."""
     if report.get("actual_layout_differs_from_documented"):
-        return "F4", ("actual archive layout differs from documented-"
-                      "overridable assumptions; separate approval required")
+        return "F4", (
+            "actual archive layout differs from documented-overridable "
+            "assumptions (missing/unexpected/naming/date-unit mismatch); "
+            "separate approval required. " + LAYOUT_FEASIBILITY_NOTE
+        )
     return "ok", "layout matches documented plan"

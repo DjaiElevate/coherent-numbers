@@ -429,3 +429,88 @@ def test_retrieval_section_adds_no_prohibited_symbols():
     for forbidden in ("car", "abnormal", "regress", "pvalue", "p_value",
                       "sharpe", "backtest", "model_fit"):
         assert not any(forbidden in n for n in names), forbidden
+
+
+# ── archive-layout: dedicated file/date-unit mismatch category ───────────────
+
+def _plan_small():
+    units = m.plan_gdelt1_files(date(2005, 1, 1), date(2013, 4, 3))
+    return units, m.build_retrieval_plan(units)
+
+
+def test_unit_key_parser_and_2023plus_guard():
+    assert m.parse_gdelt1_unit_key("2005") == (date(2005, 1, 1), "yearly")
+    assert m.parse_gdelt1_unit_key("2012-05") == (date(2012, 5, 1), "monthly")
+    assert m.parse_gdelt1_unit_key("2015-03-12") == (
+        date(2015, 3, 12), "daily")
+    with pytest.raises(m.Protocol2023PlusBreach):
+        m.parse_gdelt1_unit_key("2023-01-01")
+    with pytest.raises(ValueError):
+        m.parse_gdelt1_unit_key("GHOST")
+
+
+def test_layout_matching_slots_no_mismatch():
+    units, plan = _plan_small()
+    keys = [e.key for e in plan]
+    slot = {k: k for k in keys}  # actual == planned
+    rep = m.verify_archive_layout(plan, keys, slot_actual_keys=slot)
+    assert rep["files_date_unit_mismatch"] == []
+    assert rep["actual_layout_differs_from_documented"] is False
+    assert rep["note"] == m.LAYOUT_FEASIBILITY_NOTE
+    assert m.layout_outcome(rep)[0] == "ok"
+
+
+def test_layout_daily_monthly_yearly_mismatch_reported():
+    units, plan = _plan_small()
+    keys = [e.key for e in plan]
+    slot = {k: k for k in keys}
+    # daily mismatch
+    slot["2013-04-02"] = "2013-04-03"
+    # monthly mismatch
+    slot["2012-05"] = "2012-06"
+    # yearly mismatch
+    slot["2005"] = "2006"
+    rep = m.verify_archive_layout(plan, keys, slot_actual_keys=slot)
+    mm = {d["planned_key"] for d in rep["files_date_unit_mismatch"]}
+    assert {"2013-04-02", "2012-05", "2005"} <= mm
+    assert rep["actual_layout_differs_from_documented"] is True
+    cls, reason = m.layout_outcome(rep)
+    assert cls == "F4"
+    assert "not hypothesis evidence" in reason
+
+
+def test_layout_mismatch_when_actual_key_not_parseable():
+    units, plan = _plan_small()
+    keys = [e.key for e in plan]
+    slot = {"2005": "GHOSTKEY"}
+    rep = m.verify_archive_layout(plan, keys, slot_actual_keys=slot)
+    assert any(d["planned_key"] == "2005"
+               for d in rep["files_date_unit_mismatch"])
+    assert m.layout_outcome(rep)[0] == "F4"
+
+
+def test_layout_existing_categories_still_work():
+    units, plan = _plan_small()
+    keys = [e.key for e in plan]
+    rep = m.verify_archive_layout(plan, keys[:-1] + ["GHOST"])
+    assert rep["files_missing"] and rep["files_in_archive_not_planned"]
+    assert rep["files_date_unit_mismatch"] == []  # no slot map -> none
+    assert rep["actual_layout_differs_from_documented"] is True
+    # naming category
+    rep2 = m.verify_archive_layout(
+        plan, keys, expected_naming=lambda e: e.regime != "yearly"
+    )
+    assert rep2["files_unexpected_naming"]  # yearly flagged
+    assert rep2["actual_layout_differs_from_documented"] is True
+
+
+def test_layout_2023plus_aborts_before_classification():
+    units, plan = _plan_small()
+    keys = [e.key for e in plan]
+    # 2023+ in available listing
+    with pytest.raises(m.Protocol2023PlusBreach):
+        m.verify_archive_layout(plan, keys + ["2023-01-01"])
+    # 2023+ in slot actual key
+    with pytest.raises(m.Protocol2023PlusBreach):
+        m.verify_archive_layout(plan, keys,
+                                slot_actual_keys={"2005": "2023-06-01"})
