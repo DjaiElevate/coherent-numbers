@@ -300,3 +300,132 @@ def test_runner_guards_need_all_three(monkeypatch):
     r = _load_runner()
     monkeypatch.delenv("LANE2_COUNT_FEASIBILITY_AUTHORIZED", raising=False)
     assert r._guards_ok(True) is False
+
+
+# ── live retrieval / freeze scaffolding (synthetic; NO real network) ─────────
+
+def test_url_construction_from_templates():
+    units = m.plan_gdelt1_files(date(2005, 1, 1), date(2013, 5, 2))
+    plan = m.build_retrieval_plan(units, base_url="http://example.test/ev")
+    by_regime = {e.regime: e for e in plan}
+    assert by_regime["yearly"].filename == "2005.zip"
+    assert by_regime["monthly"].filename.endswith(".zip")
+    daily = [e for e in plan if e.regime == "daily"][0]
+    assert daily.filename == "20130401.export.CSV.zip"
+    assert all(e.url.startswith("http://example.test/ev/") for e in plan)
+    assert all(e.rep_date < m.SEAL_START for e in plan)
+
+
+def test_retrieval_plan_aborts_on_2023plus():
+    bad = [m.PlannedUnit("2023-01-01", "daily", date(2023, 1, 1))]
+    with pytest.raises(m.Protocol2023PlusBreach):
+        m.build_retrieval_plan(bad)
+
+
+def test_source_index_validation_excludes_2023plus():
+    ok = m.validate_source_index(
+        [{"date": "2010-05-01"}, {"rep_date": date(2012, 1, 1)}]
+    )
+    assert ok == [date(2010, 5, 1), date(2012, 1, 1)]
+    with pytest.raises(m.Protocol2023PlusBreach):
+        m.validate_source_index([{"date": "2023-02-01"}])
+    with pytest.raises(ValueError):
+        m.validate_source_index([{"nope": 1}])
+
+
+def test_download_one_refuses_without_authorization(tmp_path):
+    # default draft: not authorized -> RetrievalNotAuthorized, no network
+    with pytest.raises(m.RetrievalNotAuthorized):
+        m.download_one("http://x/y.zip", str(tmp_path / "f.zip"),
+                       date(2015, 3, 12))
+
+
+def test_download_one_refuses_2023plus_before_anything(tmp_path):
+    with pytest.raises(m.Protocol2023PlusBreach):
+        m.download_one("http://x/2023.zip", str(tmp_path / "f.zip"),
+                       date(2023, 1, 1), network_authorized=True)
+
+
+def test_download_one_temp_then_atomic_with_fake_opener(tmp_path, monkeypatch):
+    # enable retrieval ONLY within this test; inject a fake opener (no network)
+    monkeypatch.setattr(m, "REAL_RETRIEVAL_ENABLED", True)
+
+    class _Resp:
+        def __init__(self, data):
+            self._d = data
+
+        def read(self):
+            return self._d
+
+    seen = {}
+
+    def fake_opener(url, timeout=None):
+        seen["url"] = url
+        seen["timeout"] = timeout
+        return _Resp(b"FAKE-GDELT-BYTES")
+
+    dest = tmp_path / "sub" / "20150312.export.CSV.zip"
+    res = m.download_one(
+        "http://example.test/ev/20150312.export.CSV.zip", str(dest),
+        date(2015, 3, 12), timeout=12.0, retries=3,
+        network_authorized=True, opener=fake_opener,
+    )
+    assert dest.exists()
+    assert dest.read_bytes() == b"FAKE-GDELT-BYTES"
+    assert res["size_bytes"] == len(b"FAKE-GDELT-BYTES")
+    import hashlib as _h
+    assert res["sha256"] == _h.sha256(b"FAKE-GDELT-BYTES").hexdigest()
+    assert seen["timeout"] == 12.0
+    # no leftover .part temp files
+    assert not any(p.suffix == ".part" for p in (tmp_path / "sub").iterdir())
+
+
+def test_freeze_manifest_includes_retrieval_fields():
+    units = m.plan_gdelt1_files(date(2013, 4, 1), date(2013, 4, 2))
+    plan = m.build_retrieval_plan(units)
+    man = m.build_freeze_manifest(
+        date(2013, 4, 1), date(2013, 4, 2), units,
+        file_hashes={"2013-04-01": "abc"},
+        urls_per_unit={e.key: e.url for e in plan},
+        file_sizes={"2013-04-01": 123},
+        aggregate_content_hash="agg",
+        row_counts={"2013-04-01": 10},
+        access_timestamp="20260518T000000Z",
+        gdelt_normalization_files_status="deferred",
+        min_event_floor=40, option_c_threshold=125.0,
+    )
+    for k in ("urls_per_unit", "file_sizes", "sha256_per_file",
+              "aggregate_content_hash", "access_timestamp",
+              "no_2023plus_downloaded_or_counted",
+              "gdelt_2013_regime_boundary_handled",
+              "gdelt_normalization_files_status", "min_event_floor",
+              "option_c_threshold", "url_template_default"):
+        assert k in man
+    assert man["min_event_floor"] == 40
+    assert man["gdelt_normalization_files_status"] == "deferred"
+    with pytest.raises(ValueError):
+        m.build_freeze_manifest(date(2013, 4, 1), date(2013, 4, 2), units,
+                                gdelt_normalization_files_status="bogus")
+
+
+def test_archive_layout_verification_and_outcome():
+    units = m.plan_gdelt1_files(date(2005, 1, 1), date(2013, 4, 3))
+    plan = m.build_retrieval_plan(units)
+    keys = [e.key for e in plan]
+    # full match -> ok
+    rep_ok = m.verify_archive_layout(plan, keys)
+    assert rep_ok["actual_layout_differs_from_documented"] is False
+    assert m.layout_outcome(rep_ok)[0] == "ok"
+    # missing + unexpected -> differs -> F4
+    rep_bad = m.verify_archive_layout(plan, keys[:-1] + ["GHOST"])
+    assert rep_bad["files_missing"] and rep_bad["files_in_archive_not_planned"]
+    assert rep_bad["actual_layout_differs_from_documented"] is True
+    assert m.layout_outcome(rep_bad)[0] == "F4"
+    assert rep_ok["boundary_2013_04_01_handled"] is True
+
+
+def test_retrieval_section_adds_no_prohibited_symbols():
+    names = [n.lower() for n in dir(m)]
+    for forbidden in ("car", "abnormal", "regress", "pvalue", "p_value",
+                      "sharpe", "backtest", "model_fit"):
+        assert not any(forbidden in n for n in names), forbidden

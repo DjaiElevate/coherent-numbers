@@ -22,12 +22,14 @@ deferred to a future, separately authorized run via the (inert) runner.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
+import tempfile
 import zipfile
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 # ── Governance constants ──────────────────────────────────────────────────────
 
@@ -143,25 +145,53 @@ def build_freeze_manifest(
     planned_units: Sequence[PlannedUnit],
     file_hashes: Optional[Dict[str, str]] = None,
     endpoint_attempted_2023plus: bool = False,
+    urls_per_unit: Optional[Dict[str, str]] = None,
+    file_sizes: Optional[Dict[str, int]] = None,
+    aggregate_content_hash: Optional[str] = None,
+    row_counts: Optional[Dict[str, int]] = None,
+    access_timestamp: Optional[str] = None,
+    gdelt_2013_regime_boundary_handled: bool = True,
+    gdelt_normalization_files_status: str = "deferred",
+    min_event_floor: Optional[int] = None,
+    option_c_threshold: Optional[float] = None,
 ) -> Dict[str, object]:
     if coverage_end >= SEAL_START:
         raise Protocol2023PlusBreach("manifest coverage_end is 2023+")
+    if gdelt_normalization_files_status not in NORMALIZATION_STATUS_VALUES:
+        raise ValueError(
+            "gdelt_normalization_files_status must be one of {}".format(
+                NORMALIZATION_STATUS_VALUES
+            )
+        )
+    assert_no_2023plus([u.rep_date for u in planned_units],
+                       "build_freeze_manifest")
     return {
         "source_product": SELECTED_SOURCE,
         "retrieval_method": "GDELT 1.0 static archive (per-unit files); "
                             "no download performed in this draft",
+        "url_template_default": DEFAULT_GDELT1_BASE_URL,
+        "urls_per_unit": dict(urls_per_unit or {}),
         "coverage_start": coverage_start.isoformat(),
         "coverage_end": coverage_end.isoformat(),
         "date_restriction_excluding_2023plus": "units strictly < {}".format(
             SEAL_START.isoformat()
         ),
+        "access_timestamp": access_timestamp,
         "file_list": [u.key for u in planned_units],
         "file_count": len(planned_units),
-        "row_counts": {},  # filled by a future real run only
+        "file_sizes": dict(file_sizes or {}),
+        "row_counts": dict(row_counts or {}),  # filled by a future real run
         "sha256_per_file": dict(file_hashes or {}),
-        "aggregate_content_hash": None,
+        "aggregate_content_hash": aggregate_content_hash,
         "endpoint_attempted_2023plus": bool(endpoint_attempted_2023plus),
+        "no_2023plus_downloaded_or_counted": True,
         "confirm_no_2023plus_downloaded_stored_sampled_counted_inspected": True,
+        "gdelt_2013_regime_boundary_handled": bool(
+            gdelt_2013_regime_boundary_handled
+        ),
+        "gdelt_normalization_files_status": gdelt_normalization_files_status,
+        "min_event_floor": min_event_floor,
+        "option_c_threshold": option_c_threshold,
         "governing_protocol_commit": GOVERNING_PROTOCOL_COMMIT,
         "authorization_commit": AUTHORIZATION_COMMIT,
     }
@@ -517,3 +547,194 @@ def build_metadata(
             "default is allowed."
         ),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live retrieval / freeze scaffolding (draft).
+#
+# NOTHING here performs a real network download. download_one() fails closed
+# unless explicitly network-authorized AND given an opener; the runner never
+# enables that. Tests inject a fake opener / local fixtures only. Still
+# count-only: no returns, CAR, market data, models, p-values, Step 2, 2023+.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Visible (not hidden) documentation-level GDELT 1.0 base URL. The exact
+# remote layout MUST be verified at freeze time; this is overridable.
+DEFAULT_GDELT1_BASE_URL = "http://data.gdeltproject.org/events/"
+
+# Documentation-level filename templates per regime (overridable; verify at
+# freeze). Keys: yearly -> "YYYY", monthly -> "YYYYMM", daily -> "YYYYMMDD".
+DEFAULT_GDELT1_FILENAME_TEMPLATES = {
+    "yearly": "{yyyy}.zip",
+    "monthly": "{yyyy}{mm}.zip",
+    "daily": "{yyyy}{mm}{dd}.export.CSV.zip",
+}
+
+# Real retrieval is NOT enabled in this draft. A future, separately reviewed
+# change flips this; download_one() also requires an explicit opener.
+REAL_RETRIEVAL_ENABLED = False
+
+
+class RetrievalNotAuthorized(RuntimeError):
+    """Raised when a download is attempted without explicit authorization."""
+
+
+@dataclass(frozen=True)
+class RetrievalEntry:
+    key: str
+    regime: str
+    rep_date: date
+    filename: str
+    url: str
+
+
+def build_unit_filename(
+    unit: PlannedUnit,
+    templates: Optional[Dict[str, str]] = None,
+) -> str:
+    tpl = (templates or DEFAULT_GDELT1_FILENAME_TEMPLATES)[unit.regime]
+    d = unit.rep_date
+    return tpl.format(
+        yyyy="{:04d}".format(d.year),
+        mm="{:02d}".format(d.month),
+        dd="{:02d}".format(d.day),
+    )
+
+
+def build_retrieval_plan(
+    units: Sequence[PlannedUnit],
+    base_url: str = DEFAULT_GDELT1_BASE_URL,
+    templates: Optional[Dict[str, str]] = None,
+) -> List[RetrievalEntry]:
+    """Attach URL/filename to each planned unit. Pre-2023 enforced."""
+    assert_no_2023plus([u.rep_date for u in units], "build_retrieval_plan")
+    base = base_url if base_url.endswith("/") else base_url + "/"
+    out: List[RetrievalEntry] = []
+    for u in units:
+        fn = build_unit_filename(u, templates)
+        out.append(RetrievalEntry(u.key, u.regime, u.rep_date, fn, base + fn))
+    return out
+
+
+def validate_source_index(
+    index_entries: Sequence[Dict[str, object]],
+) -> List[date]:
+    """Validate an externally supplied source index/list.
+
+    Each entry must carry a parseable pre-2023 date under key 'date'
+    (YYYY-MM-DD) or 'rep_date' (datetime.date). Aborts on any 2023+ entry or
+    missing date. Returns the validated, sorted date list.
+    """
+    dates: List[date] = []
+    for e in index_entries:
+        if "rep_date" in e and isinstance(e["rep_date"], date):
+            d = e["rep_date"]
+        elif "date" in e and isinstance(e["date"], str):
+            d = date.fromisoformat(e["date"])
+        else:
+            raise ValueError("source-index entry lacks a usable date: "
+                             "{!r}".format(e))
+        dates.append(d)
+    assert_no_2023plus(dates, "validate_source_index")
+    return sorted(dates)
+
+
+def download_one(
+    url: str,
+    dest_path: str,
+    expected_pre2023_date: date,
+    timeout: float = 30.0,
+    retries: int = 2,
+    network_authorized: bool = False,
+    opener: Optional[Callable] = None,
+) -> Dict[str, object]:
+    """Download one planned file: temp write -> fsync -> atomic move; sha256
+    + size. Fails closed.
+
+    Does NOT perform a real download in this draft: requires BOTH
+    REAL_RETRIEVAL_ENABLED and network_authorized AND an explicit `opener`.
+    Tests pass a fake opener (no real network). The runner never authorizes
+    this.
+    """
+    if expected_pre2023_date >= SEAL_START:
+        raise Protocol2023PlusBreach(
+            "refusing download for 2023+ unit: {}".format(expected_pre2023_date)
+        )
+    if not (REAL_RETRIEVAL_ENABLED and network_authorized):
+        raise RetrievalNotAuthorized(
+            "real retrieval is not authorized in this draft "
+            "(REAL_RETRIEVAL_ENABLED={}, network_authorized={})".format(
+                REAL_RETRIEVAL_ENABLED, network_authorized
+            )
+        )
+    if opener is None:
+        raise RetrievalNotAuthorized(
+            "no opener provided; refusing to construct a live network client"
+        )
+
+    last_err: Optional[Exception] = None
+    for _ in range(max(1, retries)):
+        try:
+            resp = opener(url, timeout=timeout)
+            data = resp.read()
+            dest_dir = os.path.dirname(os.path.abspath(dest_path)) or "."
+            os.makedirs(dest_dir, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=dest_dir, suffix=".part")
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, dest_path)  # atomic
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            return {
+                "url": url,
+                "dest_path": dest_path,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "size_bytes": len(data),
+                "expected_pre2023_date": expected_pre2023_date.isoformat(),
+            }
+        except Exception as exc:  # fail closed; retry
+            last_err = exc
+    raise RuntimeError("download failed after retries: {}".format(last_err))
+
+
+def verify_archive_layout(
+    planned: Sequence[RetrievalEntry],
+    available_keys: Sequence[str],
+    expected_naming: Optional[Callable[[RetrievalEntry], bool]] = None,
+) -> Dict[str, object]:
+    """Freeze-time scaffold: compare the documented plan to a (fake, in this
+    draft) listing of what the archive actually exposes."""
+    assert_no_2023plus([p.rep_date for p in planned], "verify_archive_layout")
+    avail = set(available_keys)
+    planned_keys = [p.key for p in planned]
+    missing = [k for k in planned_keys if k not in avail]
+    unexpected = [k for k in avail if k not in set(planned_keys)]
+    naming_bad = []
+    if expected_naming is not None:
+        naming_bad = [p.key for p in planned if not expected_naming(p)]
+    pre = [p for p in planned if p.rep_date < REGIME_DAILY_START]
+    post = [p for p in planned if p.rep_date >= REGIME_DAILY_START]
+    layout_differs = bool(missing or unexpected or naming_bad)
+    return {
+        "files_available": sorted(k for k in planned_keys if k in avail),
+        "files_missing": missing,
+        "files_unexpected_naming": naming_bad,
+        "files_in_archive_not_planned": unexpected,
+        "pre_2013_regime_coverage": len(pre),
+        "post_2013_daily_coverage": len(post),
+        "boundary_2013_04_01_handled": True,
+        "actual_layout_differs_from_documented": layout_differs,
+    }
+
+
+def layout_outcome(report: Dict[str, object]) -> Tuple[str, str]:
+    """Map a layout report to a feasibility action. Differing layout -> F4
+    (inconclusive) unless separately approved; never silently 'ok'."""
+    if report.get("actual_layout_differs_from_documented"):
+        return "F4", ("actual archive layout differs from documented-"
+                      "overridable assumptions; separate approval required")
+    return "ok", "layout matches documented plan"
