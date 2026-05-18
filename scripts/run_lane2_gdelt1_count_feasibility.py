@@ -38,8 +38,10 @@ from datetime import date, datetime, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 # Ships False. Flipping this is a separate, explicit run-enablement commit
-# under run authorization 60ec1521 (memo §13).
-COUNT_FEASIBILITY_AUTHORIZED = False
+# under run authorization 60ec1521 (memo §13). TEMPORARILY True for the single
+# authorized count-only feasibility run; a separate inert-restore safety commit
+# MUST set this back to False immediately after the one run.
+COUNT_FEASIBILITY_AUTHORIZED = True
 
 _REFUSAL = (
     "Lane 2 count-only feasibility run is NOT authorized. Requires "
