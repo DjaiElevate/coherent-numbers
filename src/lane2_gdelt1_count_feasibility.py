@@ -618,9 +618,21 @@ def build_metadata(
 # count-only: no returns, CAR, market data, models, p-values, Step 2, 2023+.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Visible (not hidden) documentation-level GDELT 1.0 base URL. The exact
+# Visible (not hidden) documentation-level GDELT 1.0 base URL. This is the
+# per-FILE download base (base + "<YYYYMMDD>.export.CSV.zip"). The exact
 # remote layout MUST be verified at freeze time; this is overridable.
+# R1 (Gate 4A, authorization 745af67) does NOT change this constant — per-file
+# URLs must keep resolving under the directory path.
 DEFAULT_GDELT1_BASE_URL = "http://data.gdeltproject.org/events/"
+
+# R1 (Gate 4A offline patch, authorized by docs/lane2_gdelt1_gate4A_r1_
+# offline_patch_authorization_v0.1.md = 745af67; evidence: Substep 1 doc-fetch
+# 10b80c7 names this resource, Substep 2A HEAD 9a8fb7b confirmed it returns
+# 200/non-empty/text/html). The INDEX/LISTING target is the documented
+# index.html resource, NOT the bare directory path. This corrects the
+# request-target defect identified through the diagnostic chain. It does NOT
+# perform any request, flip any guard, or alter the Gate 2 parser.
+DEFAULT_GDELT1_INDEX_URL = "http://data.gdeltproject.org/events/index.html"
 
 # Documentation-level filename templates per regime (overridable; verify at
 # freeze). Keys: yearly -> "YYYY", monthly -> "YYYYMM", daily -> "YYYYMMDD".
@@ -1130,7 +1142,7 @@ def extract_index_units(
 
 def fetch_archive_index(
     opener: Callable,
-    index_url: str = DEFAULT_GDELT1_BASE_URL,
+    index_url: str = DEFAULT_GDELT1_INDEX_URL,
     timeout: float = 30.0,
     return_detail: bool = False,
 ):
@@ -1140,9 +1152,15 @@ def fetch_archive_index(
     Returns `(available_unit_keys, slot_actual_keys)` by default (unchanged
     signature for the runner/orchestrator); returns the full `IndexExtraction`
     when `return_detail=True`. No default network client is ever constructed:
-    `opener` is required. R1 (which URL is requested) is unchanged here and
-    out of scope for Gate 2. 2023+ hard-fails inside `extract_index_units`
-    before any keys are returned.
+    `opener` is required.
+
+    R1 (Gate 4A, authorization 745af67): the default `index_url` is the
+    documented index/listing resource `DEFAULT_GDELT1_INDEX_URL`
+    (`…/events/index.html`), NOT the bare directory path
+    `DEFAULT_GDELT1_BASE_URL` (`…/events/`). This is the only behavioral
+    change; no request is performed here (the injected `opener` is the sole
+    request path) and no guard is flipped. 2023+ hard-fails inside
+    `extract_index_units` before any keys are returned.
     """
     if opener is None:
         raise RetrievalNotAuthorized(

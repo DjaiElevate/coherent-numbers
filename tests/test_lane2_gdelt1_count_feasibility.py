@@ -559,7 +559,9 @@ def _make_fake_opener(start, end, rows_per_day=3, calls=None):
     def opener(url, timeout=None):
         if calls is not None:
             calls.append(url)
-        if url.rstrip("/").endswith("events"):
+        # R1 (Gate 4A): the index/listing target is now …/events/index.html;
+        # still also accept the bare …/events sentinel used by Gate 2 tests.
+        if url.endswith("index.html") or url.rstrip("/").endswith("events"):
             return _Resp(index_txt.encode("utf-8"))
         stem = url.rsplit("/", 1)[-1].split(".")[0]
         dd = date(int(stem[:4]), int(stem[4:6]), int(stem[6:8]))
@@ -989,3 +991,66 @@ def test_no_network_symbols_in_extractor_path():
     for bad in ("urllib", "requests", "socket", "http://", "https://",
                 "urlopen", ".get(", "opener("):
         assert bad not in src, bad
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Gate 4A R1 offline URL-target patch (authorized by 745af67). Synthetic
+# URL-construction only. No real opener / network / GET / HEAD.
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_r1_default_index_target_is_index_html():
+    # The dedicated index/listing constant points at the documented resource.
+    assert m.DEFAULT_GDELT1_INDEX_URL == \
+        "http://data.gdeltproject.org/events/index.html"
+    # fetch_archive_index defaults to it (capture the URL via a fake opener).
+    seen = {}
+
+    def fake_opener(url, timeout=None):
+        seen["url"] = url
+        return _Resp(_HTML_INDEX_FIXTURE.encode("utf-8"))
+
+    keys, slots = m.fetch_archive_index(fake_opener)  # default index_url
+    assert seen["url"] == "http://data.gdeltproject.org/events/index.html"
+    assert keys == _EXPECTED_IN_WINDOW            # Gate 2 parser intact
+
+
+def test_r1_regression_bare_events_dir_not_used_as_index_target():
+    # Regression: the bare directory path must NOT be the listing target.
+    assert m.DEFAULT_GDELT1_INDEX_URL != "http://data.gdeltproject.org/events/"
+    assert m.DEFAULT_GDELT1_INDEX_URL != m.DEFAULT_GDELT1_BASE_URL
+    assert m.DEFAULT_GDELT1_INDEX_URL.endswith("/events/index.html")
+    # per-file download base is unchanged (still the directory path)
+    assert m.DEFAULT_GDELT1_BASE_URL == "http://data.gdeltproject.org/events/"
+    seen = {}
+
+    def fake_opener(url, timeout=None):
+        seen["url"] = url
+        return _Resp(_HTML_INDEX_FIXTURE.encode("utf-8"))
+
+    m.fetch_archive_index(fake_opener)
+    assert seen["url"].rstrip("/") != "http://data.gdeltproject.org/events"
+    assert seen["url"] != "http://data.gdeltproject.org/events/"
+
+
+def test_r1_explicit_index_url_override_still_honored():
+    # R1 changes only the default; an explicit index_url is still used as-is
+    # (back-compat for Gate 2 tests / future overrides).
+    seen = {}
+
+    def fake_opener(url, timeout=None):
+        seen["url"] = url
+        return _Resp(_HTML_INDEX_FIXTURE.encode("utf-8"))
+
+    m.fetch_archive_index(fake_opener, index_url="http://x/events")
+    assert seen["url"] == "http://x/events"
+
+
+def test_r1_guards_remain_inert_and_no_network_in_patch():
+    import inspect
+    src = inspect.getsource(m.fetch_archive_index)
+    for bad in ("urllib", "requests", "socket", "urlopen", "http://",
+                "https://", ".get("):
+        assert bad not in src, bad
+    assert m.REAL_RETRIEVAL_ENABLED is False
+    r = _load_runner()
+    assert r.COUNT_FEASIBILITY_AUTHORIZED is False
