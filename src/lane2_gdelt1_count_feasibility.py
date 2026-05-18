@@ -35,7 +35,38 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 GOVERNING_PROTOCOL_COMMIT = "147c0d40568636ba0cf24ca00cc39c330e77ea03"
 AUTHORIZATION_COMMIT = "8fef80db0e103d2c22e36d589fe041abd1fb4c78"
+RUN_AUTHORIZATION_COMMIT = "60ec1521106e6a980f6450cb21a1ef510b4c37d5"
+RUN_AUTHORIZATION_MEMO_PATH = (
+    "docs/lane2_gdelt1_count_feasibility_run_authorization_v0.1.md"
+)
 SELECTED_SOURCE = "GDELT 1.0 Event database"
+
+# Run-authorization memo (60ec152) pinned parameters. These are the ONLY
+# values the one authorized count-only run may use; they are not hypothesis
+# choices and not market results.
+PINNED_COVERAGE_START = date(2005, 1, 1)
+PINNED_COVERAGE_END = date(2022, 12, 31)
+PINNED_MIN_EVENT_FLOOR = 100
+PINNED_NORMALIZATION_STATUS = "not_used"
+PINNED_OPTION_C_THRESHOLD = None        # Option C disabled for this run
+PINNED_OPTION_C_ENABLED = False
+PINNED_CLUSTERING_DAYS = (5, 10, 20)
+PINNED_PRIMARY_CLUSTER_DAYS = 10        # primary feasibility floor window
+
+# Controlled vocabulary for the archive_layout_status metadata field
+# (run-authorization memo §17 requires this field in run metadata).
+ARCHIVE_LAYOUT_STATUS_VALUES = (
+    "ok",
+    "mismatch",
+    "missing",
+    "unexpected",
+    "f4_layout_issue",
+    "not_checked",
+    # Layout verification was entered but aborted on a protocol breach
+    # (e.g. a 2023+ key surfaced during the layout check) -> F5. Distinct
+    # from "not_checked" (breach occurred before layout was attempted).
+    "breach_during_check",
+)
 
 # Hard seal. Nothing on/after this date may be planned, parsed, counted, or
 # referenced. 2023+ is sealed.
@@ -499,6 +530,10 @@ def build_metadata(
     gdelt_normalization_files_status: str = "deferred",
     min_event_floor: Optional[int] = None,
     option_c_threshold: Optional[float] = None,
+    archive_layout_status: str = "not_checked",
+    option_c_enabled: bool = False,
+    run_authorization_memo: str = RUN_AUTHORIZATION_MEMO_PATH,
+    post_run_safety_reset_required: bool = False,
 ) -> Dict[str, object]:
     if coverage_end >= SEAL_START:
         raise Protocol2023PlusBreach("metadata coverage_end is 2023+")
@@ -506,6 +541,12 @@ def build_metadata(
         raise ValueError(
             "gdelt_normalization_files_status must be one of {}; got {!r}".format(
                 NORMALIZATION_STATUS_VALUES, gdelt_normalization_files_status
+            )
+        )
+    if archive_layout_status not in ARCHIVE_LAYOUT_STATUS_VALUES:
+        raise ValueError(
+            "archive_layout_status must be one of {}; got {!r}".format(
+                ARCHIVE_LAYOUT_STATUS_VALUES, archive_layout_status
             )
         )
     return {
@@ -516,6 +557,9 @@ def build_metadata(
             coverage_start.isoformat(), coverage_end.isoformat()
         ),
         "no_2023_plus": True,
+        # Run-authorization memo §17 spells this key without an underscore;
+        # both are emitted so neither the memo nor prior tests drift.
+        "no_2023plus": True,
         "outcomes_computed": False,
         "returns_computed": False,
         "models_fit": False,
@@ -528,6 +572,21 @@ def build_metadata(
         "state_count_feasibility_status": state_status,
         "feasibility_class": feasibility_class,
         "feasibility_class_note": F_NOTES.get(feasibility_class, ""),
+        # Run-authorization memo §17: archive-layout status (controlled vocab).
+        # For the real run this must reflect verify_archive_layout /
+        # layout_outcome (see archive_layout_status_token / orchestrator).
+        "archive_layout_status": archive_layout_status,
+        "option_c_enabled": bool(option_c_enabled),
+        "run_authorization_commit": RUN_AUTHORIZATION_COMMIT,
+        "run_authorization_memo": run_authorization_memo,
+        # True only if a run left REAL_RETRIEVAL_ENABLED / the runner constant
+        # permissive; a separate inert-restore safety commit is then required.
+        "post_run_safety_reset_required": bool(post_run_safety_reset_required),
+        "post_run_safety_reset_note": (
+            "If the run enabled retrieval by leaving REAL_RETRIEVAL_ENABLED "
+            "or COUNT_FEASIBILITY_AUTHORIZED permissive in source, a separate "
+            "inert-restore safety commit is required (memo §13)."
+        ),
         # Authorization-memo requirement: record normalization-file choice.
         "gdelt_normalization_files_status": gdelt_normalization_files_status,
         "gdelt_normalization_files_note": (
@@ -833,3 +892,472 @@ def layout_outcome(report: Dict[str, object]) -> Tuple[str, str]:
             "separate approval required. " + LAYOUT_FEASIBILITY_NOTE
         )
     return "ok", "layout matches documented plan"
+
+
+def archive_layout_status_token(
+    report: Optional[Dict[str, object]],
+) -> str:
+    """Reduce a verify_archive_layout report to one ARCHIVE_LAYOUT_STATUS_VALUES
+    token for run metadata (memo §17).
+
+    None -> "not_checked"; clean -> "ok". Otherwise a single, deterministic
+    token by priority: file/date-unit mismatch -> "mismatch"; else missing
+    files -> "missing"; else unexpected/naming -> "unexpected"; else any other
+    documented divergence -> "f4_layout_issue".
+    """
+    if report is None:
+        return "not_checked"
+    if not report.get("actual_layout_differs_from_documented"):
+        return "ok"
+    if report.get("files_date_unit_mismatch"):
+        return "mismatch"
+    if report.get("files_missing"):
+        return "missing"
+    if report.get("files_in_archive_not_planned") or report.get(
+        "files_unexpected_naming"
+    ):
+        return "unexpected"
+    return "f4_layout_issue"
+
+
+# ── Drift / concentration feasibility flags (descriptive, unthresholded) ──────
+
+def concentration_flags(
+    daily_counts: Dict[date, int],
+    spike_dates: Sequence[date],
+    clustered_spike_dates: Sequence[date],
+    regime_daily_start: date = REGIME_DAILY_START,
+) -> Dict[str, object]:
+    """Count-only drift/concentration flags (memo §12).
+
+    Reports by-year daily-observation counts, by-year raw and clustered spike
+    counts, and the post-2013-04-01 / later-half *fractions*. The
+    run-authorization memo pins NO thresholds, so no spike/non-spike verdict
+    is rendered: interpretation is explicitly descriptive/unthresholded and
+    is NOT hypothesis evidence.
+    """
+    assert_no_2023plus(list(daily_counts.keys()), "concentration_flags")
+    assert_no_2023plus(list(spike_dates), "concentration_flags")
+    assert_no_2023plus(list(clustered_spike_dates), "concentration_flags")
+
+    def _by_year(ds: Sequence[date]) -> Dict[int, int]:
+        out: Dict[int, int] = {}
+        for d in ds:
+            out[d.year] = out.get(d.year, 0) + 1
+        return dict(sorted(out.items()))
+
+    n_sp = len(spike_dates)
+    yrs = [d.year for d in daily_counts] or [PINNED_COVERAGE_START.year]
+    mid_year = (min(yrs) + max(yrs)) / 2.0
+    post_2013 = sum(1 for d in spike_dates if d >= regime_daily_start)
+    later_half = sum(1 for d in spike_dates if d.year >= mid_year)
+    return {
+        "daily_observation_counts_by_year": by_year_counts(daily_counts),
+        "raw_spike_counts_by_year": _by_year(spike_dates),
+        "clustered_spike_counts_by_year": _by_year(clustered_spike_dates),
+        "raw_spikes_post_2013_04_01_fraction": (
+            (post_2013 / n_sp) if n_sp else None
+        ),
+        "raw_spikes_later_half_fraction": (
+            (later_half / n_sp) if n_sp else None
+        ),
+        "concentration_interpretation": "descriptive_unthresholded",
+        "note": (
+            "Distributions only; the run-authorization memo pins no "
+            "concentration threshold. Feasibility flag, NOT hypothesis "
+            "evidence."
+        ),
+    }
+
+
+# ── Archive index fetch (injected opener only; no hidden network client) ──────
+
+def fetch_archive_index(
+    opener: Callable,
+    index_url: str = DEFAULT_GDELT1_BASE_URL,
+    timeout: float = 30.0,
+) -> Tuple[List[str], Dict[str, str]]:
+    """Fetch & parse the GDELT 1.0 file index using an INJECTED opener.
+
+    Returns (available_unit_keys, slot_actual_keys). No default network
+    client is ever constructed: `opener` is required and is the only way a
+    request can occur. Filenames are mapped back to PlannedUnit-style keys
+    ("YYYY"/"YYYY-MM"/"YYYY-MM-DD"); 2023+ aborts before anything is returned
+    (prior 2023+ guard via _parse_sqldate-style parsing of the date token).
+    """
+    if opener is None:
+        raise RetrievalNotAuthorized(
+            "fetch_archive_index requires an explicit opener; no hidden "
+            "default network client is permitted"
+        )
+    resp = opener(index_url, timeout=timeout)
+    text = resp.read()
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+
+    available: List[str] = []
+    seen: set = set()
+    for tok in text.split():
+        name = tok.strip().strip('"\'<>')
+        if "." not in name:
+            continue
+        stem = name.split(".")[0]
+        if not (stem.isdigit() and len(stem) in (4, 6, 8)):
+            continue
+        if len(stem) == 4:
+            key = stem
+            rep = date(int(stem), 1, 1)
+        elif len(stem) == 6:
+            key = "{}-{}".format(stem[:4], stem[4:6])
+            rep = date(int(stem[:4]), int(stem[4:6]), 1)
+        else:
+            key = "{}-{}-{}".format(stem[:4], stem[4:6], stem[6:8])
+            rep = date(int(stem[:4]), int(stem[4:6]), int(stem[6:8]))
+        if rep >= SEAL_START:
+            raise Protocol2023PlusBreach(
+                "2023+ entry in archive index: {}".format(name)
+            )
+        if key not in seen:
+            seen.add(key)
+            available.append(key)
+    available.sort()
+    # slot_actual_keys: identity for matched slots; the orchestrator passes
+    # this to verify_archive_layout so a real divergence surfaces as a
+    # dedicated file/date-unit mismatch rather than being silently absorbed.
+    return available, {k: k for k in available}
+
+
+# ── Output allow-list (prohibited artifacts can never be written) ────────────
+
+ALLOWED_OUTPUT_BASENAMES = (
+    "source_freeze_manifest.json",
+    "count_feasibility_metadata.json",
+    "daily_count_table.csv",
+    "missingness_table.csv",
+    "by_year_count_summary.csv",
+    "spike_counts_option_a.csv",
+    "spike_counts_option_b.csv",
+    "clustering_counts.csv",
+    "overlap_counts.csv",
+    "feasibility_summary.md",
+)
+
+_PROHIBITED_OUTPUT_MARKERS = (
+    "return", "car", "abnormal", "vix", "model", "pvalue", "p_value",
+    "p-value", "sharpe", "backtest", "feature_importance", "verdict",
+    "step2", "2023",
+)
+
+
+def _check_basename(name: str) -> None:
+    """Single source of truth for the output allow-list. Raises
+    ProtocolBreach (maps to F5) on any non-allow-listed or
+    prohibited-marker basename. Used both pre-write and post-hoc."""
+    if name not in ALLOWED_OUTPUT_BASENAMES:
+        raise ProtocolBreach(
+            "non-allow-listed output: {!r}".format(name)
+        )
+    low = name.lower()
+    for bad in _PROHIBITED_OUTPUT_MARKERS:
+        if bad in low:
+            raise ProtocolBreach(
+                "prohibited marker {!r} in output {!r}".format(bad, name)
+            )
+
+
+def _checked_path(output_dir: str, basename: str) -> str:
+    """Pre-write gate: assert `basename` is allow-listed BEFORE any write,
+    then return the full path. All artifact writes go through this so a
+    prohibited file is never created on disk in the first place."""
+    _check_basename(basename)
+    return os.path.join(output_dir, basename)
+
+
+def _assert_outputs_allowed(output_dir: str) -> None:
+    """Post-hoc tripwire (retained as defense-in-depth alongside the
+    pre-write _checked_path gate): only allow-listed count-only artifacts
+    may exist in the run output directory."""
+    for name in os.listdir(output_dir):
+        if os.path.isdir(os.path.join(output_dir, name)):
+            continue
+        _check_basename(name)
+
+
+# ── Count-only feasibility orchestrator (steps A–Q of the memo) ──────────────
+#
+# This is the wired retrieval/freeze/count flow. It performs a REAL download
+# ONLY through the injected `opener` and ONLY when download_one's own guards
+# pass (REAL_RETRIEVAL_ENABLED True at call time + network_authorized + opener).
+# The shipped module keeps REAL_RETRIEVAL_ENABLED = False; the runner flips it
+# transiently in-process inside the all-guards-passed branch only. Tests inject
+# a fake opener + synthetic frozen files — no real network, no real GDELT.
+# Count-only throughout: NO returns/CAR/outcomes/models/p-values/2023+/Step 2.
+
+def run_count_only_feasibility(
+    output_dir: str,
+    opener: Callable,
+    available_keys: Sequence[str],
+    slot_actual_keys: Optional[Dict[str, str]] = None,
+    coverage_start: date = PINNED_COVERAGE_START,
+    coverage_end: date = PINNED_COVERAGE_END,
+    min_event_floor: int = PINNED_MIN_EVENT_FLOOR,
+    base_url: str = DEFAULT_GDELT1_BASE_URL,
+    expected_naming: Optional[Callable[[RetrievalEntry], bool]] = None,
+    post_run_safety_reset_required: bool = False,
+) -> Dict[str, object]:
+    """Execute one count-only feasibility pass into a fresh `output_dir`.
+
+    Caller (runner) is responsible for guard checks and for creating the
+    fresh timestamped `output_dir` before calling this. Option C is never
+    computed. State feasibility stays unresolved (no market data loaded).
+    Returns the metadata dict; writes only allow-listed count artifacts.
+    """
+    if coverage_start < PINNED_COVERAGE_START or coverage_end > \
+            PINNED_COVERAGE_END:
+        raise ProtocolBreach(
+            "coverage window outside the pinned 2005-01-01..2022-12-31"
+        )
+    # Layout-status provenance: "not_checked" until layout verification is
+    # entered; "breach_during_check" if a breach aborts the check itself;
+    # otherwise the computed token (or, if a breach occurs AFTER a clean
+    # layout pass, the real post-check token is retained — truthful).
+    layout_status = "not_checked"
+    try:
+        # A. plan strictly-pre-2023 units. B. 2023+ asserted inside.
+        units = plan_gdelt1_files(coverage_start, coverage_end)
+        # C. URL/source plan.
+        plan = build_retrieval_plan(units, base_url=base_url)
+        # D. verify archive layout BEFORE any count computation.
+        try:
+            layout = verify_archive_layout(
+                plan, available_keys,
+                expected_naming=expected_naming,
+                slot_actual_keys=slot_actual_keys,
+            )
+        except Protocol2023PlusBreach:
+            layout_status = "breach_during_check"
+            raise
+        layout_cls, layout_reason = layout_outcome(layout)
+        layout_status = archive_layout_status_token(layout)
+
+        if layout_cls == "F4":
+            # Memo §11/§14: do NOT proceed into counts, do NOT patch-and-rerun.
+            # Counts/by-year/regime-boundary work never ran on this path, so
+            # those attestations are False (not silently True).
+            md = build_metadata(
+                coverage_start, coverage_end,
+                regime_boundary_handled=False,
+                by_year_reported=False,
+                state_status="unresolved",
+                feasibility_class="F4",
+                gdelt_normalization_files_status=PINNED_NORMALIZATION_STATUS,
+                min_event_floor=min_event_floor,
+                option_c_threshold=PINNED_OPTION_C_THRESHOLD,
+                archive_layout_status=layout_status,
+                option_c_enabled=PINNED_OPTION_C_ENABLED,
+                post_run_safety_reset_required=post_run_safety_reset_required,
+            )
+            md["layout_report"] = layout
+            md["stopped_before_count_computation"] = True
+            md["by_year_counts_status"] = "not_computed"
+            md["regime_boundary_status"] = "not_evaluated"
+            md["stop_reason"] = layout_reason
+            write_json(_checked_path(output_dir,
+                                     "count_feasibility_metadata.json"), md)
+            write_markdown(
+                _checked_path(output_dir, "feasibility_summary.md"),
+                "# Lane 2 count-only feasibility — F4 (archive layout)\n\n"
+                "Stopped before count computation. {}\n\n"
+                "F4 does not disprove the hypothesis; separate approval is "
+                "required before any rerun.\n".format(layout_reason),
+            )
+            _assert_outputs_allowed(output_dir)
+            return md
+
+        # E/F. download + hash each unit via the injected opener.
+        raw_dir = os.path.join(output_dir, "raw")
+        os.makedirs(raw_dir, exist_ok=True)
+        file_hashes: Dict[str, str] = {}
+        file_sizes: Dict[str, int] = {}
+        urls_per_unit: Dict[str, str] = {}
+        local_paths: List[str] = []
+        for e in plan:
+            dest = os.path.join(raw_dir, e.filename)
+            info = download_one(
+                e.url, dest, e.rep_date,
+                network_authorized=True, opener=opener,
+            )
+            file_hashes[e.key] = info["sha256"]
+            file_sizes[e.key] = info["size_bytes"]
+            urls_per_unit[e.key] = e.url
+            local_paths.append(dest)
+
+        # H/I. parse frozen files -> daily counts; parser aborts on any 2023+.
+        per_file = [parse_gdelt1_file_daily_counts(p) for p in local_paths]
+        daily = aggregate_daily_counts(per_file)
+
+        # G. freeze manifest.
+        manifest = build_freeze_manifest(
+            coverage_start, coverage_end, units,
+            file_hashes=file_hashes, urls_per_unit=urls_per_unit,
+            file_sizes=file_sizes,
+            gdelt_2013_regime_boundary_handled=True,
+            gdelt_normalization_files_status=PINNED_NORMALIZATION_STATUS,
+            min_event_floor=min_event_floor,
+            option_c_threshold=PINNED_OPTION_C_THRESHOLD,
+        )
+
+        # J. missingness + by-year.
+        miss = missingness_by_year(daily, coverage_start, coverage_end)
+        byyr = by_year_counts(daily)
+
+        # K/L. Option A & B spikes. M. Option C NOT computed (disabled).
+        assert PINNED_OPTION_C_THRESHOLD is None and not PINNED_OPTION_C_ENABLED
+        spikes_a = option_a_percentile_spikes(daily)
+        spikes_b = option_b_zscore_spikes(daily)
+
+        # N. clustering at 5/10/20 days for A and B.
+        clusters: Dict[str, Dict[int, List[date]]] = {"A": {}, "B": {}}
+        for sep in PINNED_CLUSTERING_DAYS:
+            clusters["A"][sep] = cluster_spikes(spikes_a, sep)
+            clusters["B"][sep] = cluster_spikes(spikes_b, sep)
+
+        # O. overlap counts (hypothetical t+1:t+5 and t+1:t+20 windows).
+        overlaps = []
+        for opt, sp in (("A", spikes_a), ("B", spikes_b)):
+            for lo, hi in ((1, 5), (1, 20)):
+                r = event_window_overlap_count(sp, lo, hi)
+                r["option"] = opt
+                overlaps.append(r)
+
+        # P. feasibility class. Primary floor = 10-day clustered count,
+        # max over Option A / Option B.
+        primary = max(
+            len(clusters["A"][PINNED_PRIMARY_CLUSTER_DAYS]),
+            len(clusters["B"][PINNED_PRIMARY_CLUSTER_DAYS]),
+        )
+        state = state_count_feasibility()  # unresolved: no market data
+        cls, _note = assign_feasibility_class(
+            source_found=True,
+            raw_spike_count=primary,
+            min_event_floor=min_event_floor,
+            state_status=state["status"],
+            reproducibility_ok=True,
+            protocol_breach=False,
+        )
+        # F3 is unreachable here: state is unresolved by construction.
+
+        conc = concentration_flags(
+            daily, spikes_a + spikes_b,
+            clusters["A"][PINNED_PRIMARY_CLUSTER_DAYS]
+            + clusters["B"][PINNED_PRIMARY_CLUSTER_DAYS],
+        )
+
+        md = build_metadata(
+            coverage_start, coverage_end, True, True,
+            state["status"], cls,
+            gdelt_normalization_files_status=PINNED_NORMALIZATION_STATUS,
+            min_event_floor=min_event_floor,
+            option_c_threshold=PINNED_OPTION_C_THRESHOLD,
+            archive_layout_status=layout_status,
+            option_c_enabled=PINNED_OPTION_C_ENABLED,
+            post_run_safety_reset_required=post_run_safety_reset_required,
+        )
+        md["primary_10d_clustered_count"] = primary
+        md["concentration_flags"] = conc
+        md["layout_report"] = layout
+
+        # Q. write ONLY allow-listed count artifacts (pre-write gated).
+        write_json(_checked_path(output_dir,
+                                 "source_freeze_manifest.json"), manifest)
+        write_json(_checked_path(output_dir,
+                                 "count_feasibility_metadata.json"), md)
+        write_csv(
+            _checked_path(output_dir, "daily_count_table.csv"),
+            ["date", "event_count"],
+            [[d.isoformat(), c] for d, c in sorted(daily.items())],
+        )
+        write_csv(
+            _checked_path(output_dir, "missingness_table.csv"),
+            ["year", "expected_days", "observed_days", "missing_days"],
+            [[y, v["expected_days"], v["observed_days"], v["missing_days"]]
+             for y, v in sorted(miss.items())],
+        )
+        write_csv(
+            _checked_path(output_dir, "by_year_count_summary.csv"),
+            ["year", "event_count"],
+            [[y, c] for y, c in byyr.items()],
+        )
+        for opt, sp in (("a", spikes_a), ("b", spikes_b)):
+            write_csv(
+                _checked_path(output_dir,
+                              "spike_counts_option_{}.csv".format(opt)),
+                ["date"], [[d.isoformat()] for d in sp],
+            )
+        crows = []
+        for opt in ("A", "B"):
+            for sep in PINNED_CLUSTERING_DAYS:
+                crows.append([opt, sep, len(clusters[opt][sep])])
+        write_csv(
+            _checked_path(output_dir, "clustering_counts.csv"),
+            ["option", "separation_days", "clustered_count"], crows,
+        )
+        write_csv(
+            _checked_path(output_dir, "overlap_counts.csv"),
+            ["option", "window", "n_events", "overlapping_events",
+             "overlap_fraction"],
+            [[r["option"], r["window"], r["n_events"],
+              r["overlapping_events"], r["overlap_fraction"]]
+             for r in overlaps],
+        )
+        write_markdown(
+            _checked_path(output_dir, "feasibility_summary.md"),
+            "# Lane 2 GDELT 1.0 count-only feasibility summary\n\n"
+            "Class: **{cls}** — {note}\n\n"
+            "Primary 10-day clustered count (max A/B): {primary} "
+            "(floor={floor}).\n\n"
+            "State-count feasibility: {state} (no market data loaded).\n\n"
+            "F3 does not confirm the hypothesis; F0/F1/F2/F4/F5 do not "
+            "disprove it. Counts, availability, and clustering only — no "
+            "returns, CAR, outcomes, models, p-values, or 2023+.\n".format(
+                cls=cls, note=F_NOTES.get(cls, ""), primary=primary,
+                floor=min_event_floor, state=state["status"],
+            ),
+        )
+        _assert_outputs_allowed(output_dir)
+        return md
+
+    except Protocol2023PlusBreach as exc:
+        # Any 2023+ breach -> F5 (protocol breach). Memo §10/§16. Counts/
+        # by-year/regime work never completed on this path, so those
+        # attestations are False. archive_layout_status carries provenance:
+        # "not_checked" (breach before layout), "breach_during_check"
+        # (breach aborted the layout check), or the real post-check token
+        # (breach occurred after a clean layout pass).
+        md = build_metadata(
+            coverage_start, coverage_end,
+            regime_boundary_handled=False,
+            by_year_reported=False,
+            state_status="unresolved",
+            feasibility_class="F5",
+            gdelt_normalization_files_status=PINNED_NORMALIZATION_STATUS,
+            min_event_floor=min_event_floor,
+            option_c_threshold=PINNED_OPTION_C_THRESHOLD,
+            archive_layout_status=layout_status,
+            option_c_enabled=PINNED_OPTION_C_ENABLED,
+            post_run_safety_reset_required=post_run_safety_reset_required,
+        )
+        md["protocol_breach"] = str(exc)
+        md["stopped_before_count_computation"] = True
+        md["by_year_counts_status"] = "not_computed"
+        md["regime_boundary_status"] = "not_evaluated"
+        write_json(_checked_path(output_dir,
+                                 "count_feasibility_metadata.json"), md)
+        write_markdown(
+            _checked_path(output_dir, "feasibility_summary.md"),
+            "# Lane 2 count-only feasibility — F5 (protocol breach)\n\n"
+            "{}\n\nF5 does not disprove the hypothesis. No rerun without a "
+            "new authorization (memo §14).\n".format(exc),
+        )
+        _assert_outputs_allowed(output_dir)
+        raise

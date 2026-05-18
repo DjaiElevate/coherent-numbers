@@ -514,3 +514,352 @@ def test_layout_2023plus_aborts_before_classification():
     with pytest.raises(m.Protocol2023PlusBreach):
         m.verify_archive_layout(plan, keys,
                                 slot_actual_keys={"2005": "2023-06-01"})
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Retrieval-wiring patch — synthetic fixtures, fake openers, NO real network,
+# NO real GDELT, NO 2023+, NO market data, NO outcomes.
+# ════════════════════════════════════════════════════════════════════════════
+
+import io
+from datetime import timedelta
+
+
+def _zip_bytes(rows):
+    """Build in-memory .zip bytes with one inner TSV (GLOBALEVENTID, SQLDATE)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("inner.csv",
+                    "\n".join("{}\t{}\tX".format(i, sd)
+                              for i, sd in enumerate(rows)))
+    return buf.getvalue()
+
+
+class _Resp:
+    def __init__(self, data):
+        self._d = data
+
+    def read(self):
+        return self._d
+
+
+def _make_fake_opener(start, end, rows_per_day=3, calls=None):
+    """Fake opener: index URL -> filename listing; file URL -> zip bytes.
+    Records calls; performs NO network."""
+    days = []
+    d = start
+    while d <= end:
+        days.append(d)
+        d += timedelta(days=1)
+    index_txt = " ".join(
+        "{:04d}{:02d}{:02d}.export.CSV.zip".format(x.year, x.month, x.day)
+        for x in days
+    )
+
+    def opener(url, timeout=None):
+        if calls is not None:
+            calls.append(url)
+        if url.rstrip("/").endswith("events"):
+            return _Resp(index_txt.encode("utf-8"))
+        stem = url.rsplit("/", 1)[-1].split(".")[0]
+        dd = date(int(stem[:4]), int(stem[4:6]), int(stem[6:8]))
+        return _Resp(_zip_bytes(["{:04d}{:02d}{:02d}".format(
+            dd.year, dd.month, dd.day)] * rows_per_day))
+
+    return opener
+
+
+# ── archive_layout_status: controlled vocabulary + metadata field ────────────
+
+def test_archive_layout_status_controlled_vocab_in_metadata():
+    for s in m.ARCHIVE_LAYOUT_STATUS_VALUES:
+        md = m.build_metadata(date(2005, 1, 1), date(2022, 12, 31), True, True,
+                              "unresolved", "F2", archive_layout_status=s)
+        assert md["archive_layout_status"] == s
+    with pytest.raises(ValueError):
+        m.build_metadata(date(2005, 1, 1), date(2022, 12, 31), True, True,
+                         "unresolved", "F2",
+                         archive_layout_status="totally-bogus")
+    # default present and valid
+    md = m.build_metadata(date(2005, 1, 1), date(2022, 12, 31), True, True,
+                          "unresolved", "F2")
+    assert md["archive_layout_status"] == "not_checked"
+
+
+def test_metadata_run_authorization_and_pinned_echoes():
+    md = m.build_metadata(
+        date(2005, 1, 1), date(2022, 12, 31), True, True, "unresolved", "F2",
+        gdelt_normalization_files_status=m.PINNED_NORMALIZATION_STATUS,
+        min_event_floor=m.PINNED_MIN_EVENT_FLOOR,
+        option_c_threshold=m.PINNED_OPTION_C_THRESHOLD,
+        option_c_enabled=m.PINNED_OPTION_C_ENABLED,
+        archive_layout_status="ok",
+        post_run_safety_reset_required=True,
+    )
+    assert md["gdelt_normalization_files_status"] == "not_used"
+    assert md["min_event_floor"] == 100
+    assert md["option_c_threshold"] is None
+    assert md["option_c_enabled"] is False
+    assert md["no_2023plus"] is True and md["no_2023_plus"] is True
+    assert md["run_authorization_memo"].endswith(
+        "lane2_gdelt1_count_feasibility_run_authorization_v0.1.md")
+    assert md["run_authorization_commit"] == m.RUN_AUTHORIZATION_COMMIT
+    assert md["post_run_safety_reset_required"] is True
+    # prohibited computations are negatively attested, not present as results
+    assert md["returns_computed"] is False
+    assert md["outcomes_computed"] is False
+    assert md["models_fit"] is False
+    assert md["p_values_computed"] is False
+    assert md["hypothesis_verdict"] is False
+    assert md["step2_lock_drafted"] is False
+    # no value in metadata is a numeric market result
+    for bad in ("car", "abnormal", "vix", "sharpe", "feature_importance"):
+        assert not any(bad in k.lower() for k in md), bad
+
+
+def test_archive_layout_status_token_mapping():
+    units = m.plan_gdelt1_files(date(2005, 1, 1), date(2013, 4, 3))
+    plan = m.build_retrieval_plan(units)
+    keys = [e.key for e in plan]
+    assert m.archive_layout_status_token(None) == "not_checked"
+    assert m.archive_layout_status_token(
+        m.verify_archive_layout(plan, keys)) == "ok"
+    assert m.archive_layout_status_token(
+        m.verify_archive_layout(plan, keys[:-1])) == "missing"
+    rep_mm = m.verify_archive_layout(
+        plan, keys, slot_actual_keys={**{k: k for k in keys}, "2005": "2006"})
+    assert m.archive_layout_status_token(rep_mm) == "mismatch"
+    rep_unx = m.verify_archive_layout(plan, keys + ["1999"])
+    assert m.archive_layout_status_token(rep_unx) == "unexpected"
+
+
+# ── concentration flags: descriptive, unthresholded, no hypothesis verdict ───
+
+def test_concentration_flags_unthresholded_and_pre2023():
+    daily = {date(2010, 1, 1): 5, date(2015, 6, 1): 9}
+    flags = m.concentration_flags(daily, [date(2015, 6, 1)],
+                                  [date(2015, 6, 1)])
+    assert flags["concentration_interpretation"] == "descriptive_unthresholded"
+    assert "NOT hypothesis evidence" in flags["note"]
+    assert flags["raw_spikes_post_2013_04_01_fraction"] == 1.0
+    with pytest.raises(m.Protocol2023PlusBreach):
+        m.concentration_flags({date(2023, 1, 1): 1}, [], [])
+
+
+# ── archive index fetch: injected opener only; aborts on 2023+ ───────────────
+
+def test_fetch_archive_index_requires_opener():
+    with pytest.raises(m.RetrievalNotAuthorized):
+        m.fetch_archive_index(None)
+
+
+def test_fetch_archive_index_parses_and_blocks_2023plus():
+    op = _make_fake_opener(date(2013, 4, 1), date(2013, 4, 3))
+    avail, slots = m.fetch_archive_index(op, index_url="http://x/events")
+    assert avail == ["2013-04-01", "2013-04-02", "2013-04-03"]
+    assert slots == {k: k for k in avail}
+
+    def bad_opener(url, timeout=None):
+        return _Resp(b"20230101.export.CSV.zip")
+    with pytest.raises(m.Protocol2023PlusBreach):
+        m.fetch_archive_index(bad_opener, index_url="http://x/events")
+
+
+# ── orchestrator: F-classes, output allow-list, Option C never computed ──────
+
+def test_orchestrator_f1_below_floor_writes_only_allowed(tmp_path,
+                                                         monkeypatch):
+    # enable retrieval ONLY within this test; fake opener, no real network
+    monkeypatch.setattr(m, "REAL_RETRIEVAL_ENABLED", True)
+    op = _make_fake_opener(date(2013, 4, 1), date(2013, 4, 5))
+    avail = ["2013-04-0{}".format(i) for i in range(1, 6)]
+    md = m.run_count_only_feasibility(
+        str(tmp_path), opener=op, available_keys=avail,
+        slot_actual_keys={k: k for k in avail},
+        coverage_start=date(2013, 4, 1), coverage_end=date(2013, 4, 5),
+    )
+    assert md["feasibility_class"] == "F1"  # 0 clustered < 100
+    assert md["min_event_floor"] == 100
+    assert md["option_c_threshold"] is None
+    assert md["option_c_enabled"] is False
+    assert md["gdelt_normalization_files_status"] == "not_used"
+    assert md["archive_layout_status"] == "ok"
+    written = sorted(p.name for p in tmp_path.iterdir() if p.is_file())
+    assert set(written) <= set(m.ALLOWED_OUTPUT_BASENAMES)
+    assert "count_feasibility_metadata.json" in written
+    assert not any("option_c" in w for w in written)
+    assert not any(("return" in w or "car" in w or "model" in w
+                    or "pvalue" in w or "2023" in w) for w in written)
+
+
+def test_orchestrator_f2_when_counts_adequate_state_unresolved(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "REAL_RETRIEVAL_ENABLED", True)
+    op = _make_fake_opener(date(2013, 4, 1), date(2013, 4, 3))
+    avail = ["2013-04-0{}".format(i) for i in range(1, 4)]
+    big = [date(2013, 4, 1) + timedelta(days=i) for i in range(150)]
+    monkeypatch.setattr(m, "option_a_percentile_spikes", lambda c: list(big))
+    monkeypatch.setattr(m, "option_b_zscore_spikes", lambda c: [])
+    monkeypatch.setattr(m, "cluster_spikes", lambda ds, sep: list(ds))
+    md = m.run_count_only_feasibility(
+        str(tmp_path), opener=op, available_keys=avail,
+        slot_actual_keys={k: k for k in avail},
+        coverage_start=date(2013, 4, 1), coverage_end=date(2013, 4, 3),
+    )
+    assert md["feasibility_class"] == "F2"
+    assert md["state_count_feasibility_status"] == "unresolved"
+    assert md["primary_10d_clustered_count"] >= 100
+
+
+def test_orchestrator_f3_unreachable_without_state():
+    # state always unresolved in the run -> never F3 even with huge counts
+    assert m.assign_feasibility_class(
+        True, 10_000_000, 100, "unresolved", True, False)[0] == "F2"
+
+
+def test_orchestrator_f4_layout_mismatch_stops_before_counts(tmp_path):
+    calls = []
+    op = _make_fake_opener(date(2013, 4, 1), date(2013, 4, 3), calls=calls)
+    avail = ["2013-04-0{}".format(i) for i in range(1, 4)]
+    slots = {k: k for k in avail}
+    slots["2013-04-02"] = "2013-04-03"  # date-unit mismatch
+    md = m.run_count_only_feasibility(
+        str(tmp_path), opener=op, available_keys=avail,
+        slot_actual_keys=slots,
+        coverage_start=date(2013, 4, 1), coverage_end=date(2013, 4, 3),
+    )
+    assert md["feasibility_class"] == "F4"
+    assert md["archive_layout_status"] == "mismatch"
+    assert md["stopped_before_count_computation"] is True
+    # truthfulness: by-year / regime work did NOT run on the F4 short-circuit
+    assert md["by_year_counts_reported"] is False
+    assert md["gdelt_2013_regime_boundary_handled"] is False
+    assert md["by_year_counts_status"] == "not_computed"
+    assert md["regime_boundary_status"] == "not_evaluated"
+    assert calls == []  # opener NEVER called: no retrieval before layout pass
+    written = sorted(p.name for p in tmp_path.iterdir() if p.is_file())
+    assert set(written) <= set(m.ALLOWED_OUTPUT_BASENAMES)
+
+
+def test_orchestrator_f5_on_2023plus_protocol_breach(tmp_path):
+    op = _make_fake_opener(date(2013, 4, 1), date(2013, 4, 3))
+    avail = ["2013-04-0{}".format(i) for i in range(1, 4)]
+    slots = {k: k for k in avail}
+    slots["2013-04-01"] = "2023-01-01"  # 2023+ slot -> breach
+    with pytest.raises(m.Protocol2023PlusBreach):
+        m.run_count_only_feasibility(
+            str(tmp_path), opener=op, available_keys=avail,
+            slot_actual_keys=slots,
+            coverage_start=date(2013, 4, 1), coverage_end=date(2013, 4, 3),
+        )
+    md_path = tmp_path / "count_feasibility_metadata.json"
+    assert md_path.exists()
+    import json as _j
+    rec = _j.loads(md_path.read_text())
+    assert rec["feasibility_class"] == "F5"
+    # provenance: breach aborted the layout check itself
+    assert rec["archive_layout_status"] == "breach_during_check"
+    assert rec["by_year_counts_reported"] is False
+    assert rec["gdelt_2013_regime_boundary_handled"] is False
+    assert rec["by_year_counts_status"] == "not_computed"
+
+
+def test_f5_breach_after_clean_layout_keeps_real_token(tmp_path,
+                                                       monkeypatch):
+    # layout passes cleanly, then a 2023+ row in a frozen file -> F5.
+    # archive_layout_status must keep the truthful post-check token ("ok"),
+    # NOT be overwritten to not_checked/breach_during_check.
+    monkeypatch.setattr(m, "REAL_RETRIEVAL_ENABLED", True)
+    avail = ["2013-04-0{}".format(i) for i in range(1, 4)]
+
+    def opener(url, timeout=None):
+        if url.rstrip("/").endswith("events"):
+            return _Resp(
+                b"20130401.export.CSV.zip 20130402.export.CSV.zip "
+                b"20130403.export.CSV.zip")
+        # frozen file content carries a synthetic 2023+ SQLDATE row
+        return _Resp(_zip_bytes(["20230101"]))
+
+    with pytest.raises(m.Protocol2023PlusBreach):
+        m.run_count_only_feasibility(
+            str(tmp_path), opener=opener, available_keys=avail,
+            slot_actual_keys={k: k for k in avail},
+            coverage_start=date(2013, 4, 1), coverage_end=date(2013, 4, 3),
+        )
+    import json as _j
+    rec = _j.loads(
+        (tmp_path / "count_feasibility_metadata.json").read_text())
+    assert rec["feasibility_class"] == "F5"
+    assert rec["archive_layout_status"] == "ok"  # truthful: layout WAS clean
+
+
+def test_checked_path_pre_write_gate():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        # allow-listed basename passes and returns a joined path
+        p = m._checked_path(d, "count_feasibility_metadata.json")
+        assert p.endswith("count_feasibility_metadata.json")
+        # non-allow-listed basename is rejected BEFORE any write
+        for bad in ("spy_returns.csv", "model_fit.json", "car_table.csv",
+                    "step2_lock.md", "counts_2023.csv", "anything.txt"):
+            with pytest.raises(m.ProtocolBreach):
+                m._checked_path(d, bad)
+        # nothing was created by the rejected calls
+        assert os.listdir(d) == []
+        # post-hoc tripwire still present and consistent
+        m._assert_outputs_allowed(d)  # empty dir -> no raise
+
+
+def test_orchestrator_rejects_window_outside_pinned(tmp_path):
+    op = _make_fake_opener(date(2004, 1, 1), date(2004, 1, 2))
+    with pytest.raises(m.ProtocolBreach):
+        m.run_count_only_feasibility(
+            str(tmp_path), opener=op, available_keys=["2004"],
+            coverage_start=date(2004, 1, 1), coverage_end=date(2004, 1, 2),
+        )
+
+
+# ── runner: refuses before any data access / dir; wired path under guards ────
+
+def test_runner_refuses_without_guards_and_creates_no_dir(tmp_path,
+                                                          monkeypatch):
+    r = _load_runner()
+    monkeypatch.delenv("LANE2_COUNT_FEASIBILITY_AUTHORIZED", raising=False)
+    with pytest.raises(SystemExit):
+        r.run_count_feasibility(str(tmp_path), cli_flag=True)
+    assert not (tmp_path / "results").exists()  # no directory created
+
+
+def test_runner_wired_path_writes_only_count_outputs(tmp_path, monkeypatch):
+    r = _load_runner()
+    import lane2_gdelt1_count_feasibility as src
+    monkeypatch.setattr(r, "COUNT_FEASIBILITY_AUTHORIZED", True)
+    monkeypatch.setenv("LANE2_COUNT_FEASIBILITY_AUTHORIZED", "1")
+    op = _make_fake_opener(date(2013, 4, 1), date(2013, 4, 3))
+    assert src.REAL_RETRIEVAL_ENABLED is False  # source ships inert
+    out = r.run_count_feasibility(
+        str(tmp_path), cli_flag=True, opener=op,
+        coverage_start=date(2013, 4, 1), coverage_end=date(2013, 4, 3),
+    )
+    # fresh timestamped dir under results/lane2_gdelt1_count_feasibility/
+    assert os.path.isdir(out)
+    assert "lane2_gdelt1_count_feasibility" in out
+    files = sorted(f for f in os.listdir(out)
+                   if os.path.isfile(os.path.join(out, f)))
+    assert set(files) <= set(src.ALLOWED_OUTPUT_BASENAMES)
+    import json as _j
+    with open(os.path.join(out, "count_feasibility_metadata.json")) as fh:
+        md = _j.load(fh)
+    assert md["post_run_safety_reset_required"] is True
+    assert "post_run_safety_reset_note" in md
+    assert md["archive_layout_status"] == "ok"
+    # in-process flag restored; source constant remains inert
+    assert src.REAL_RETRIEVAL_ENABLED is False
+
+
+def test_runner_main_refusal_path_no_data(capsys, monkeypatch):
+    r = _load_runner()
+    monkeypatch.setattr(r, "COUNT_FEASIBILITY_AUTHORIZED", False)
+    monkeypatch.setattr("sys.argv", ["prog"])
+    r.main()
+    assert "NOT authorized" in capsys.readouterr().out
