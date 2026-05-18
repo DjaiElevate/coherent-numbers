@@ -25,6 +25,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -970,20 +971,178 @@ def concentration_flags(
     }
 
 
+# ── Robust index/listing extractor (Gate 2 offline remediation) ──────────────
+#
+# Authorized by docs/lane2_gdelt1_remediation_patch_authorization_v0.1.md
+# (be2a7df), bounded by the design memo (12ae078). OFFLINE PARSER/DISCOVERY
+# logic only — operates on already-supplied listing text (HTML or plain). It
+# does NOT change which resource is fetched (R1 is OUT OF SCOPE / deferred to
+# Gate 4), performs no network/GET/HEAD, and adds no live path.
+#
+#   R2 — HTML/listing-robust filename extraction (regex over the whole text;
+#        survives anchor tags, quotes, angle brackets, attributes).
+#   R4 — instrumentation: recognized / ignored_out_of_window /
+#        rejected_2023plus / unrecognized counts (no silent token drops).
+#   R5 — immediate 2005–2022 extraction filter (pinned window) at extraction.
+#   R6 — hard-fail (Protocol2023PlusBreach) on ANY 2023+ GDELT-form filename
+#        BEFORE any keys are returned or any downstream planning/count logic.
+
+# GDELT 1.0 filename forms: yearly "YYYY.zip", monthly "YYYYMM.zip",
+# daily "YYYYMMDD.export.CSV.zip". Matched anywhere in arbitrary HTML/text.
+_GDELT1_FILE_RE = re.compile(
+    r"(?<![0-9])(\d{4}|\d{6}|\d{8})(\.export\.CSV)?\.zip\b",
+    re.IGNORECASE,
+)
+# Any file-like token, for unrecognized-token instrumentation (R4).
+_FILELIKE_RE = re.compile(r"[A-Za-z0-9_.\-]+\.(?:zip|html?|txt|csv)\b",
+                          re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class IndexExtraction:
+    """Result of robust listing extraction.
+
+    `keys`/`slot_actual_keys` are the in-window (2005–2022) recognized unit
+    keys (PlannedUnit-style). `instrumentation` records counts so a future F4
+    is self-diagnosing (no silent drops). 2023+ never reaches here: it
+    hard-fails earlier (R6).
+    """
+
+    keys: List[str]
+    slot_actual_keys: Dict[str, str]
+    instrumentation: Dict[str, int]
+
+
+def _legacy_whitespace_index_tokens(text: str) -> List[str]:
+    """The PRE-remediation whitespace tokenizer, preserved ONLY so the failure
+    mode is representable in a synthetic regression test. Not used by the
+    pipeline. No network, no 2023+ raising (pure demonstration helper)."""
+    out: List[str] = []
+    for tok in text.split():
+        name = tok.strip().strip('"\'<>')
+        if "." not in name:
+            continue
+        stem = name.split(".")[0]
+        if not (stem.isdigit() and len(stem) in (4, 6, 8)):
+            continue
+        out.append(stem)
+    return out
+
+
+def _classify_gdelt1_filename(
+    stem: str, is_export: bool
+) -> Optional[Tuple[str, date]]:
+    """Map a matched (stem, is_export) to (unit_key, rep_date), or None if the
+    form is malformed/ambiguous (counted as unrecognized, never silently
+    dropped)."""
+    try:
+        if len(stem) == 4 and not is_export:
+            return stem, date(int(stem), 1, 1)
+        if len(stem) == 6 and not is_export:
+            return ("{}-{}".format(stem[:4], stem[4:6]),
+                    date(int(stem[:4]), int(stem[4:6]), 1))
+        if len(stem) == 8 and is_export:
+            return ("{}-{}-{}".format(stem[:4], stem[4:6], stem[6:8]),
+                    date(int(stem[:4]), int(stem[4:6]), int(stem[6:8])))
+    except ValueError:
+        return None  # impossible calendar date -> unrecognized
+    return None  # e.g. 8-digit w/o .export.CSV, 6-digit w/ .export.CSV
+
+
+def extract_index_units(
+    text: str,
+    window_start: date = PINNED_COVERAGE_START,
+    window_end: date = PINNED_COVERAGE_END,
+) -> IndexExtraction:
+    """Robustly extract GDELT 1.0 unit keys from listing `text` (HTML or
+    plain). R2+R4+R5+R6. Fails closed on 2023+ (R6) BEFORE returning any keys.
+
+    All counts are computed first so the rejection is fully instrumented; the
+    Protocol2023PlusBreach is then raised (with `.instrumentation` and
+    `.rejected_examples` attached) before any keys/downstream logic.
+    """
+    recognized: List[str] = []
+    seen: set = set()
+    seen_files: set = set()   # dedupe by distinct filename (href vs link text)
+    n_ignored = 0          # distinct GDELT-form file, parseable, pre-2023, <2005
+    rejected: List[str] = []   # distinct 2023+ GDELT-form filenames (R6)
+    n_malformed = 0        # distinct GDELT-ish .zip, ambiguous/invalid form
+
+    for mt in _GDELT1_FILE_RE.finditer(text):
+        fname = mt.group(0).lower()
+        if fname in seen_files:          # same file in href + text -> once
+            continue
+        seen_files.add(fname)
+        stem = mt.group(1)
+        is_export = mt.group(2) is not None
+        classified = _classify_gdelt1_filename(stem, is_export)
+        if classified is None:
+            n_malformed += 1
+            continue
+        key, rep = classified
+        if rep >= SEAL_START:                       # R6: 2023+ -> reject
+            rejected.append(mt.group(0))
+            continue
+        if rep < window_start or rep > window_end:  # R5: out-of-window
+            n_ignored += 1
+            continue
+        if key not in seen:                         # in-window recognized
+            seen.add(key)
+            recognized.append(key)
+
+    # Unrecognized non-GDELT file-like tokens (R4: never silently dropped),
+    # deduped by distinct filename.
+    gdelt_files = {f for f in seen_files}
+    n_unrecognized = len({
+        fm.group(0).lower()
+        for fm in _FILELIKE_RE.finditer(text)
+        if fm.group(0).lower() not in gdelt_files
+    })
+
+    instrumentation = {
+        "recognized_in_window": len(recognized),
+        "ignored_out_of_window": n_ignored,
+        "rejected_2023plus": len(rejected),
+        "unrecognized_tokens": n_unrecognized,
+        "malformed_gdelt_tokens": n_malformed,
+    }
+
+    if rejected:  # R6: fail closed BEFORE returning keys / downstream logic
+        exc = Protocol2023PlusBreach(
+            "2023+ filename(s) in index listing (hard-fail before "
+            "planning/count): e.g. {} (rejected_2023plus={})".format(
+                rejected[:3], len(rejected)
+            )
+        )
+        exc.instrumentation = instrumentation        # type: ignore[attr-defined]
+        exc.rejected_examples = rejected[:10]         # type: ignore[attr-defined]
+        raise exc
+
+    recognized.sort()
+    return IndexExtraction(
+        keys=recognized,
+        slot_actual_keys={k: k for k in recognized},
+        instrumentation=instrumentation,
+    )
+
+
 # ── Archive index fetch (injected opener only; no hidden network client) ──────
 
 def fetch_archive_index(
     opener: Callable,
     index_url: str = DEFAULT_GDELT1_BASE_URL,
     timeout: float = 30.0,
-) -> Tuple[List[str], Dict[str, str]]:
-    """Fetch & parse the GDELT 1.0 file index using an INJECTED opener.
+    return_detail: bool = False,
+):
+    """Fetch the GDELT 1.0 listing using an INJECTED opener, then extract via
+    the robust offline extractor (`extract_index_units`).
 
-    Returns (available_unit_keys, slot_actual_keys). No default network
-    client is ever constructed: `opener` is required and is the only way a
-    request can occur. Filenames are mapped back to PlannedUnit-style keys
-    ("YYYY"/"YYYY-MM"/"YYYY-MM-DD"); 2023+ aborts before anything is returned
-    (prior 2023+ guard via _parse_sqldate-style parsing of the date token).
+    Returns `(available_unit_keys, slot_actual_keys)` by default (unchanged
+    signature for the runner/orchestrator); returns the full `IndexExtraction`
+    when `return_detail=True`. No default network client is ever constructed:
+    `opener` is required. R1 (which URL is requested) is unchanged here and
+    out of scope for Gate 2. 2023+ hard-fails inside `extract_index_units`
+    before any keys are returned.
     """
     if opener is None:
         raise RetrievalNotAuthorized(
@@ -994,37 +1153,10 @@ def fetch_archive_index(
     text = resp.read()
     if isinstance(text, bytes):
         text = text.decode("utf-8", "replace")
-
-    available: List[str] = []
-    seen: set = set()
-    for tok in text.split():
-        name = tok.strip().strip('"\'<>')
-        if "." not in name:
-            continue
-        stem = name.split(".")[0]
-        if not (stem.isdigit() and len(stem) in (4, 6, 8)):
-            continue
-        if len(stem) == 4:
-            key = stem
-            rep = date(int(stem), 1, 1)
-        elif len(stem) == 6:
-            key = "{}-{}".format(stem[:4], stem[4:6])
-            rep = date(int(stem[:4]), int(stem[4:6]), 1)
-        else:
-            key = "{}-{}-{}".format(stem[:4], stem[4:6], stem[6:8])
-            rep = date(int(stem[:4]), int(stem[4:6]), int(stem[6:8]))
-        if rep >= SEAL_START:
-            raise Protocol2023PlusBreach(
-                "2023+ entry in archive index: {}".format(name)
-            )
-        if key not in seen:
-            seen.add(key)
-            available.append(key)
-    available.sort()
-    # slot_actual_keys: identity for matched slots; the orchestrator passes
-    # this to verify_archive_layout so a real divergence surfaces as a
-    # dedicated file/date-unit mismatch rather than being silently absorbed.
-    return available, {k: k for k in available}
+    detail = extract_index_units(text)
+    if return_detail:
+        return detail
+    return detail.keys, detail.slot_actual_keys
 
 
 # ── Output allow-list (prohibited artifacts can never be written) ────────────

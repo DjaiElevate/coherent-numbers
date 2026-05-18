@@ -863,3 +863,129 @@ def test_runner_main_refusal_path_no_data(capsys, monkeypatch):
     monkeypatch.setattr("sys.argv", ["prog"])
     r.main()
     assert "NOT authorized" in capsys.readouterr().out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Gate 2 offline remediation (authorized by be2a7df; bounded by 12ae078).
+# R2/R4/R5/R6 robust HTML/listing extractor. Synthetic fixtures + in-memory
+# fake openers ONLY. No real opener / urllib / requests / socket / network.
+# R1 (request-target change) is OUT OF SCOPE and not exercised here.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Representative synthetic GDELT 1.0 HTML index listing (fabricated; NOT real).
+_HTML_INDEX_FIXTURE = (
+    "<html><body><h1>Index of /events</h1>\n"
+    '<a href="index.html">index.html</a>\n'
+    '<a href="masterfilelist.txt">masterfilelist.txt</a>\n'
+    '<a href="2004.zip">2004.zip</a>\n'              # pre-2005 -> ignored
+    '<a href="2005.zip">2005.zip</a>\n'              # yearly in-window
+    '<a href="200601.zip">200601.zip</a>\n'          # monthly in-window
+    '<a href="201303.zip">201303.zip</a>\n'          # monthly in-window
+    '<a href="20130401.export.CSV.zip">20130401.export.CSV.zip</a>\n'
+    '<a href="20151231.export.CSV.zip">20151231.export.CSV.zip</a>\n'
+    "</body></html>\n"
+)
+_EXPECTED_IN_WINDOW = ["2005", "2006-01", "2013-03",
+                       "2013-04-01", "2015-12-31"]
+
+
+def test_legacy_whitespace_tokenizer_failure_mode_regression():
+    # PRE-remediation behavior: whitespace tokenizer cannot extract any
+    # GDELT filename from an HTML index -> empty -> would cause F4-missing.
+    legacy = m._legacy_whitespace_index_tokens(_HTML_INDEX_FIXTURE)
+    assert legacy == []  # documents the consumed-F4 root failure mode
+    # POST-remediation: robust extractor recovers the in-window units.
+    det = m.extract_index_units(_HTML_INDEX_FIXTURE)
+    assert det.keys == _EXPECTED_IN_WINDOW
+
+
+def test_r2_extractor_recognizes_documented_forms_from_html():
+    det = m.extract_index_units(_HTML_INDEX_FIXTURE)
+    assert "2005" in det.keys                 # yearly form
+    assert "2006-01" in det.keys              # monthly form
+    assert "2013-04-01" in det.keys           # daily export form
+    assert det.keys == sorted(det.keys)
+    assert det.slot_actual_keys == {k: k for k in det.keys}
+
+
+def test_r5_immediate_2005_2022_window_filter():
+    det = m.extract_index_units(_HTML_INDEX_FIXTURE)
+    assert "2004" not in det.keys                          # pre-2005 dropped
+    assert det.instrumentation["ignored_out_of_window"] == 1
+    assert det.instrumentation["recognized_in_window"] == 5
+
+
+def test_r4_instrumentation_counts_recorded_no_silent_drops():
+    det = m.extract_index_units(_HTML_INDEX_FIXTURE)
+    instr = det.instrumentation
+    assert instr["recognized_in_window"] == 5
+    assert instr["ignored_out_of_window"] == 1
+    assert instr["rejected_2023plus"] == 0
+    # index.html + masterfilelist.txt are surfaced, not silently dropped
+    assert instr["unrecognized_tokens"] == 2
+    assert instr["malformed_gdelt_tokens"] == 0
+    assert set(instr) == {
+        "recognized_in_window", "ignored_out_of_window",
+        "rejected_2023plus", "unrecognized_tokens",
+        "malformed_gdelt_tokens",
+    }
+
+
+def test_r6_hard_fail_on_2023plus_before_returning_keys():
+    fixture_2023 = _HTML_INDEX_FIXTURE.replace(
+        "</body></html>",
+        '<a href="20230101.export.CSV.zip">x</a>\n'
+        '<a href="20240715.export.CSV.zip">y</a>\n</body></html>',
+    )
+    with pytest.raises(m.Protocol2023PlusBreach) as ei:
+        m.extract_index_units(fixture_2023)
+    exc = ei.value
+    # full instrumentation computed before the fail-closed raise
+    assert exc.instrumentation["rejected_2023plus"] == 2
+    assert exc.instrumentation["recognized_in_window"] == 5
+    assert any("2023" in r or "2024" in r for r in exc.rejected_examples)
+
+
+def test_r6_hardfail_blocks_downstream_via_fetch_archive_index():
+    # 2023+ in listing must abort fetch_archive_index (no keys returned ->
+    # nothing reaches planning/count).
+    def html_2023_opener(url, timeout=None):
+        return _Resp(
+            (_HTML_INDEX_FIXTURE.replace(
+                "</body></html>",
+                '<a href="20230101.export.CSV.zip">z</a>\n</body></html>"',
+            )).encode("utf-8"))
+    with pytest.raises(m.Protocol2023PlusBreach):
+        m.fetch_archive_index(html_2023_opener, index_url="http://x/events")
+
+
+def test_fetch_archive_index_uses_robust_extractor_on_html():
+    def html_opener(url, timeout=None):
+        assert url == "http://x/events"          # injected; no real network
+        return _Resp(_HTML_INDEX_FIXTURE.encode("utf-8"))
+    keys, slots = m.fetch_archive_index(html_opener, index_url="http://x/events")
+    assert keys == _EXPECTED_IN_WINDOW
+    assert slots == {k: k for k in _EXPECTED_IN_WINDOW}
+    det = m.fetch_archive_index(html_opener, index_url="http://x/events",
+                                return_detail=True)
+    assert isinstance(det, m.IndexExtraction)
+    assert det.instrumentation["recognized_in_window"] == 5
+
+
+def test_malformed_gdelt_tokens_counted_not_dropped_silently():
+    # 8-digit without .export.CSV and 6-digit WITH .export.CSV are ambiguous
+    text = ('<a href="20150312.zip">a</a> '
+            '<a href="201503.export.CSV.zip">b</a> '
+            '<a href="2009.zip">c</a>')
+    det = m.extract_index_units(text)
+    assert det.keys == ["2009"]
+    assert det.instrumentation["malformed_gdelt_tokens"] == 2
+
+
+def test_no_network_symbols_in_extractor_path():
+    import inspect
+    src = inspect.getsource(m.extract_index_units) + inspect.getsource(
+        m._classify_gdelt1_filename)
+    for bad in ("urllib", "requests", "socket", "http://", "https://",
+                "urlopen", ".get(", "opener("):
+        assert bad not in src, bad
