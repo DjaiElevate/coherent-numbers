@@ -1138,6 +1138,140 @@ def extract_index_units(
     )
 
 
+# ── Gate 4C: Strategy II live-path-safe firewall / redaction (54fb16a) ────────
+#
+# Authorized by Gate 4C authorization memo (54fb16a). Design route (i):
+# redaction/aggregation layered over the existing Gate 2 extractor logic.
+# extract_index_units R6 hard-fail is PRESERVED for synthetic/offline use.
+# This parallel live-path counterpart applies ONLY under Strategy II.
+#
+# Binding constraint (Gate 4C §3): no real post-2022 filename appears in any
+# field of LiveSafeExtraction, any exception message, .rejected_examples, log,
+# JSON, markdown, stdout, test, report, or persisted artifact. Only the
+# aggregate count (rejected_2023plus=N) and non-identifying form-class labels
+# are retained. No guard is flipped; no run is authorized; no network path is
+# added here. REAL_RETRIEVAL_ENABLED=False, COUNT_FEASIBILITY_AUTHORIZED=False.
+
+
+@dataclass(frozen=True)
+class LiveSafeExtraction:
+    """Live-path-safe extraction result (Strategy II, Gate 4C, 54fb16a).
+
+    No exact post-2022 filename in any field. In-window (pre-2023) keys are
+    returned; post-2022 tokens are aggregated to count + non-identifying
+    form-class labels only (no filename, no post-2022 date digits).
+    Gate 2 (extract_index_units) is not modified and retains its hard-fail.
+    """
+
+    keys: List[str]
+    slot_actual_keys: Dict[str, str]
+    instrumentation: Dict[str, int]
+    post2022_form_classes: List[str]   # e.g. ["daily_export"] — no date digits
+
+
+def extract_index_units_live_safe(
+    text: str,
+    window_start: date = PINNED_COVERAGE_START,
+    window_end: date = PINNED_COVERAGE_END,
+) -> LiveSafeExtraction:
+    """Strategy II live-path-safe index extraction (Gate 4C firewall, 54fb16a).
+
+    Mirrors extract_index_units R2/R4/R5 logic for in-window tokens.
+    R6 hard-fail is replaced by silent aggregation: post-2022 tokens increment
+    rejected_2023plus, record a non-identifying form-class label, and are
+    discarded — the exact filename is never placed in any return field,
+    exception message, or emitted value.
+
+    extract_index_units is NOT modified; Gate 2 synthetic/offline hard-fail
+    behavior is fully preserved. This function is a parallel live-path
+    counterpart only and does not wire any request or flip any guard.
+    """
+    recognized: List[str] = []
+    seen: set = set()
+    seen_files: set = set()
+    n_ignored = 0
+    n_rejected_2023plus = 0
+    n_malformed = 0
+    _post2022_form_classes_seen: set = set()
+
+    for mt in _GDELT1_FILE_RE.finditer(text):
+        fname = mt.group(0).lower()
+        if fname in seen_files:          # dedupe href vs link text
+            continue
+        seen_files.add(fname)
+        stem = mt.group(1)
+        is_export = mt.group(2) is not None
+        classified = _classify_gdelt1_filename(stem, is_export)
+        if classified is None:
+            n_malformed += 1
+            continue
+        key, rep = classified
+        if rep >= SEAL_START:
+            # Strategy II: aggregate only — exact filename dropped immediately,
+            # no post-2022 date digits emitted anywhere.
+            n_rejected_2023plus += 1
+            if len(stem) == 8 and is_export:
+                _post2022_form_classes_seen.add("daily_export")
+            elif len(stem) == 6:
+                _post2022_form_classes_seen.add("monthly")
+            elif len(stem) == 4:
+                _post2022_form_classes_seen.add("yearly")
+            continue
+        if rep < window_start or rep > window_end:
+            n_ignored += 1
+            continue
+        if key not in seen:
+            seen.add(key)
+            recognized.append(key)
+
+    gdelt_files = set(seen_files)
+    n_unrecognized = len({
+        fm.group(0).lower()
+        for fm in _FILELIKE_RE.finditer(text)
+        if fm.group(0).lower() not in gdelt_files
+    })
+
+    instrumentation = {
+        "recognized_in_window": len(recognized),
+        "ignored_out_of_window": n_ignored,
+        "rejected_2023plus": n_rejected_2023plus,
+        "unrecognized_tokens": n_unrecognized,
+        "malformed_gdelt_tokens": n_malformed,
+    }
+
+    recognized.sort()
+    return LiveSafeExtraction(
+        keys=recognized,
+        slot_actual_keys={k: k for k in recognized},
+        instrumentation=instrumentation,
+        post2022_form_classes=sorted(_post2022_form_classes_seen),
+    )
+
+
+def fetch_archive_index_live_safe(
+    opener: Callable,
+    index_url: str = DEFAULT_GDELT1_INDEX_URL,
+    timeout: float = 30.0,
+) -> LiveSafeExtraction:
+    """Live-path-safe archive index fetch (Strategy II, Gate 4C, 54fb16a).
+
+    Uses extract_index_units_live_safe instead of extract_index_units.
+    No default network client; requires an injected opener. Post-2022 tokens
+    are redacted/aggregated — no exact filename surfaces. Guards remain inert;
+    no run is authorized by the presence of this function.
+    """
+    if opener is None:
+        raise RetrievalNotAuthorized(
+            "fetch_archive_index_live_safe requires an explicit opener; "
+            "no hidden default network client is permitted"
+        )
+    resp = opener(index_url, timeout=timeout)
+    text = resp.read()
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    return extract_index_units_live_safe(text)
+
+
 # ── Archive index fetch (injected opener only; no hidden network client) ──────
 
 def fetch_archive_index(

@@ -1054,3 +1054,269 @@ def test_r1_guards_remain_inert_and_no_network_in_patch():
     assert m.REAL_RETRIEVAL_ENABLED is False
     r = _load_runner()
     assert r.COUNT_FEASIBILITY_AUTHORIZED is False
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Gate 4C — Strategy II live-path-safe firewall / redaction (54fb16a).
+# Authorized by Gate 4C memo (54fb16a). Design route (i): redaction/
+# aggregation layered over the existing Gate 2 extractor logic.
+# Synthetic adversarial fixtures only. Fabricated 2023+/2024+ filenames.
+# No real opener / urllib / requests / socket / network / GET / HEAD.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Fabricated 2023+ / 2024+ only listing (T1/T2 base fixture).
+_GATE4C_POST2022_FIXTURE = (
+    '<a href="20230101.export.CSV.zip">20230101.export.CSV.zip</a>\n'
+    '<a href="20240715.export.CSV.zip">20240715.export.CSV.zip</a>\n'
+    '<a href="20231231.export.CSV.zip">20231231.export.CSV.zip</a>\n'
+)
+
+# Pre-2023 and post-2022 interleaved (T5 base fixture).
+_GATE4C_MIXED_FIXTURE = (
+    '<a href="20221201.export.CSV.zip">20221201.export.CSV.zip</a>\n'
+    '<a href="20230101.export.CSV.zip">20230101.export.CSV.zip</a>\n'
+    '<a href="20211015.export.CSV.zip">20211015.export.CSV.zip</a>\n'
+    '<a href="20240715.export.CSV.zip">20240715.export.CSV.zip</a>\n'
+    '<a href="20180601.export.CSV.zip">20180601.export.CSV.zip</a>\n'
+)
+
+# Exact year-boundary pair (T3 fixture).
+_GATE4C_BOUNDARY_FIXTURE = (
+    '<a href="20221231.export.CSV.zip">20221231.export.CSV.zip</a>\n'
+    '<a href="20230101.export.CSV.zip">20230101.export.CSV.zip</a>\n'
+)
+
+
+def test_gate4c_t1_t2_no_post2022_filename_in_return_value():
+    """T1/T2: fabricated 2023+/2024+ filenames absent from all return fields."""
+    result = m.extract_index_units_live_safe(_GATE4C_POST2022_FIXTURE)
+    assert isinstance(result, m.LiveSafeExtraction)
+    # keys — no post-2022 date tokens
+    for key in result.keys:
+        assert not key.startswith("2023") and not key.startswith("2024"), key
+    # slot_actual_keys — no post-2022 tokens as keys or values
+    for k, v in result.slot_actual_keys.items():
+        assert not k.startswith("2023") and not k.startswith("2024")
+        assert not v.startswith("2023") and not v.startswith("2024")
+    # post2022_form_classes — structural labels only (no date digits)
+    for fc in result.post2022_form_classes:
+        assert fc in ("daily_export", "monthly", "yearly"), fc
+        assert not any(c.isdigit() for c in fc)
+    # aggregate count captured; post-2022-only listing -> zero in-window keys
+    assert result.instrumentation["rejected_2023plus"] == 3
+    assert result.keys == []
+    assert result.slot_actual_keys == {}
+
+
+def test_gate4c_t1_t2_live_safe_never_raises_protocol_breach():
+    """T1/T2: live_safe does not raise Protocol2023PlusBreach (Strategy II).
+    Gate 2 extract_index_units STILL raises for the same input (T7 verified
+    separately); the segregation is confirmed here."""
+    # Must NOT raise — that is the Strategy II contract
+    result = m.extract_index_units_live_safe(_GATE4C_POST2022_FIXTURE)
+    assert result.instrumentation["rejected_2023plus"] == 3
+    # Gate 2 still raises (segregation intact)
+    with pytest.raises(m.Protocol2023PlusBreach):
+        m.extract_index_units(_GATE4C_POST2022_FIXTURE)
+
+
+def test_gate4c_t3_year_boundary_20221231_retained_20230101_redacted():
+    """T3: 20221231.export.CSV.zip retained; 20230101.export.CSV.zip redacted."""
+    result = m.extract_index_units_live_safe(_GATE4C_BOUNDARY_FIXTURE)
+    assert "2022-12-31" in result.keys, "last pre-2023 daily must be retained"
+    assert "2023-01-01" not in result.keys, "first post-2022 daily must be redacted"
+    assert result.instrumentation["rejected_2023plus"] == 1
+    assert result.instrumentation["recognized_in_window"] == 1
+    for k in result.keys:
+        assert not k.startswith("2023") and not k.startswith("2024")
+
+
+def test_gate4c_t3_plain_boundary_filenames():
+    """T3: bare filename strings (no HTML markup) at the exact boundary."""
+    txt = "20221231.export.CSV.zip\n20230101.export.CSV.zip\n"
+    result = m.extract_index_units_live_safe(txt)
+    assert "2022-12-31" in result.keys
+    assert "2023-01-01" not in result.keys
+    assert result.instrumentation["rejected_2023plus"] == 1
+    assert result.instrumentation["recognized_in_window"] == 1
+
+
+def test_gate4c_t4_aggregate_count_no_exact_filename_or_date_digits():
+    """T4: rejected_2023plus count + form-class retained; no exact filename or
+    post-2022 date digits in any instrumentation value or form-class label."""
+    result = m.extract_index_units_live_safe(_GATE4C_POST2022_FIXTURE)
+    assert result.instrumentation["rejected_2023plus"] == 3
+    # All instrumentation values are plain ints (never filename strings)
+    for k, v in result.instrumentation.items():
+        assert isinstance(v, int), k
+    # form-class labels contain no digits
+    for fc in result.post2022_form_classes:
+        assert not any(c.isdigit() for c in fc)
+    # daily_export form-class is recorded for these daily files
+    assert "daily_export" in result.post2022_form_classes
+
+
+def test_gate4c_t5_pre2023_filenames_retained():
+    """T5: pre-2023 in-window recognized filenames still recognized/retained."""
+    result = m.extract_index_units_live_safe(_GATE4C_MIXED_FIXTURE)
+    assert "2022-12-01" in result.keys
+    assert "2021-10-15" in result.keys
+    assert "2018-06-01" in result.keys
+    assert "2023-01-01" not in result.keys
+    assert "2024-07-15" not in result.keys
+    assert result.instrumentation["rejected_2023plus"] == 2
+    assert result.instrumentation["recognized_in_window"] == 3
+
+
+def test_gate4c_t6_malformed_and_unrecognized_tokens_counted():
+    """T6: R4 instrumentation intact — malformed/unrecognized tokens counted
+    under live-path-safe mode (no silent drops)."""
+    txt = (
+        "20221231.export.CSV.zip\n"    # in-window daily -> recognized
+        "20221231.zip\n"               # 8-digit without .export.CSV -> malformed
+        "202212.export.CSV.zip\n"      # 6-digit with .export.CSV -> malformed
+        "index.html\n"                 # non-GDELT file-like -> unrecognized
+        "20230101.export.CSV.zip\n"    # post-2022 daily -> rejected/aggregated
+    )
+    result = m.extract_index_units_live_safe(txt)
+    assert result.instrumentation["recognized_in_window"] == 1
+    assert result.instrumentation["malformed_gdelt_tokens"] == 2
+    assert result.instrumentation["unrecognized_tokens"] == 1
+    assert result.instrumentation["rejected_2023plus"] == 1
+
+
+def test_gate4c_t7_gate2_extract_index_units_unchanged():
+    """T7: Gate 2 extract_index_units hard-fail unchanged for same inputs."""
+    # Hard-fail still fires; .rejected_examples still attached (Gate 2 behavior)
+    with pytest.raises(m.Protocol2023PlusBreach) as ei:
+        m.extract_index_units(_GATE4C_POST2022_FIXTURE)
+    exc = ei.value
+    assert exc.instrumentation["rejected_2023plus"] == 3
+    assert len(exc.rejected_examples) == 3
+    # rejected_examples in Gate 2 exception DO contain post-2022 filenames
+    # (this is acceptable for Gate 2 synthetic/offline-only path per §3)
+    assert any("2023" in ex or "2024" in ex for ex in exc.rejected_examples)
+    # Clean listing still works identically via Gate 2 function
+    clean = (
+        "20221231.export.CSV.zip\n"
+        "20150612.export.CSV.zip\n"
+    )
+    det = m.extract_index_units(clean)
+    assert "2022-12-31" in det.keys
+    assert "2015-06-12" in det.keys
+
+
+def test_gate4c_t8_no_network_in_live_safe_functions():
+    """T8: no urllib / requests / socket / network in the firewall code."""
+    import inspect
+    for fn in (m.extract_index_units_live_safe, m.fetch_archive_index_live_safe):
+        src = inspect.getsource(fn)
+        for bad in ("urllib", "requests", "socket", "http://", "https://",
+                    "urlopen"):
+            assert bad not in src, "{!r} in {}".format(bad, fn.__name__)
+
+
+def test_gate4c_t9_guards_remain_inert():
+    """T9: REAL_RETRIEVAL_ENABLED=False; COUNT_FEASIBILITY_AUTHORIZED=False."""
+    assert m.REAL_RETRIEVAL_ENABLED is False
+    r = _load_runner()
+    assert r.COUNT_FEASIBILITY_AUTHORIZED is False
+
+
+# ── Adversarial coverage ─────────────────────────────────────────────────────
+
+def test_gate4c_adversarial_href_vs_link_text_dedup():
+    """Adversarial: post-2022 filename in href and link text counted once."""
+    txt = '<a href="20231015.export.CSV.zip">20231015.export.CSV.zip</a>\n'
+    result = m.extract_index_units_live_safe(txt)
+    assert result.instrumentation["rejected_2023plus"] == 1  # not 2
+
+
+def test_gate4c_adversarial_mixed_case():
+    """Adversarial: mixed-case post-2022 filenames are redacted."""
+    txt = (
+        "20230101.EXPORT.CSV.ZIP\n"
+        "20240715.Export.Csv.Zip\n"
+        "20221231.export.CSV.zip\n"   # last pre-2023 daily — must be retained
+    )
+    result = m.extract_index_units_live_safe(txt)
+    assert result.instrumentation["rejected_2023plus"] == 2
+    assert "2022-12-31" in result.keys
+    for k in result.keys:
+        assert not k.startswith("2023") and not k.startswith("2024")
+
+
+def test_gate4c_adversarial_post2022_only_listing():
+    """Adversarial: listing with only post-2022 files -> empty keys, count=N."""
+    txt = (
+        "20230101.export.CSV.zip\n"
+        "20231231.export.CSV.zip\n"
+        "20241015.export.CSV.zip\n"
+    )
+    result = m.extract_index_units_live_safe(txt)
+    assert result.keys == []
+    assert result.slot_actual_keys == {}
+    assert result.instrumentation["rejected_2023plus"] == 3
+    assert result.instrumentation["recognized_in_window"] == 0
+
+
+def test_gate4c_adversarial_interleaved_pre_post():
+    """Adversarial: pre/post-2022 interleaved — pre retained, post redacted."""
+    txt = (
+        "20220601.export.CSV.zip\n"
+        "20230101.export.CSV.zip\n"
+        "20200301.export.CSV.zip\n"
+        "20240715.export.CSV.zip\n"
+        "20151231.export.CSV.zip\n"
+    )
+    result = m.extract_index_units_live_safe(txt)
+    assert set(result.keys) == {"2022-06-01", "2020-03-01", "2015-12-31"}
+    assert result.instrumentation["rejected_2023plus"] == 2
+    assert result.instrumentation["recognized_in_window"] == 3
+    for k in result.keys:
+        assert not k.startswith("2023") and not k.startswith("2024")
+
+
+def test_gate4c_adversarial_multiple_post2022_entries():
+    """Adversarial: multiple distinct post-2022 entries all aggregated."""
+    txt = "\n".join(
+        "{:04d}0101.export.CSV.zip".format(y)
+        for y in range(2023, 2027)
+    )
+    result = m.extract_index_units_live_safe(txt)
+    assert result.instrumentation["rejected_2023plus"] == 4
+    assert result.keys == []
+    # form-class daily_export only (no per-year breakdown)
+    assert result.post2022_form_classes == ["daily_export"]
+
+
+def test_gate4c_fetch_archive_index_live_safe_requires_opener():
+    """fetch_archive_index_live_safe raises without an opener."""
+    with pytest.raises(m.RetrievalNotAuthorized):
+        m.fetch_archive_index_live_safe(None)
+
+
+def test_gate4c_fetch_archive_index_live_safe_with_fake_opener():
+    """fetch_archive_index_live_safe with fake opener: post-2022 redacted,
+    pre-2023 retained; no real network call; returns LiveSafeExtraction."""
+    def fake_opener(url, timeout=None):
+        return _Resp(
+            b"20221231.export.CSV.zip 20230101.export.CSV.zip "
+            b"20150612.export.CSV.zip"
+        )
+    result = m.fetch_archive_index_live_safe(
+        fake_opener, index_url="http://fake/events"
+    )
+    assert isinstance(result, m.LiveSafeExtraction)
+    assert "2022-12-31" in result.keys
+    assert "2015-06-12" in result.keys
+    assert "2023-01-01" not in result.keys
+    assert result.instrumentation["rejected_2023plus"] == 1
+
+
+def test_gate4c_live_safe_does_not_surface_post2022_in_slot_actual_keys():
+    """Post-2022 filenames must not appear as keys or values in slot_actual_keys."""
+    result = m.extract_index_units_live_safe(_GATE4C_MIXED_FIXTURE)
+    for k, v in result.slot_actual_keys.items():
+        assert not k.startswith("2023") and not k.startswith("2024")
+        assert not v.startswith("2023") and not v.startswith("2024")
