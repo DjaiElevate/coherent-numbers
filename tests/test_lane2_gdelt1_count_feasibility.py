@@ -1320,3 +1320,160 @@ def test_gate4c_live_safe_does_not_surface_post2022_in_slot_actual_keys():
     for k, v in result.slot_actual_keys.items():
         assert not k.startswith("2023") and not k.startswith("2024")
         assert not v.startswith("2023") and not v.startswith("2024")
+
+
+# ── Gate 4D: redirect-disabled opener + one-call driver tests (a2851f4) ──────
+#
+# All tests use fake openers / in-memory fixtures only. No network, no GDELT
+# traffic, no real post-2022 filename literals beyond the Gate 4C synthetic
+# boundary fixtures already in this test module.
+
+
+def test_gate4d_redirect_blocked_is_runtime_error_subtype():
+    """`RedirectBlocked` is a RuntimeError subtype (post-4C L4 class anchor)."""
+    assert issubclass(m.RedirectBlocked, RuntimeError)
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_gate4d_redirect_handler_blocks_all_3xx_by_construction(status):
+    """Every 3xx hook on the no-follow handler raises RedirectBlocked.
+    Structural property: no http_error_30x path can silently follow."""
+    handler = m._NoFollowRedirectHandler()
+    hook = getattr(handler, "http_error_{}".format(status))
+    with pytest.raises(m.RedirectBlocked):
+        hook(None, None, status, "redirect", {})
+
+
+def test_gate4d_build_opener_does_not_fire_request_on_construction():
+    """Building the redirect-disabled opener is side-effect-free —
+    no network request occurs at factory call time."""
+    opener = m.build_redirect_disabled_opener()
+    assert callable(opener)
+
+
+def test_gate4d_driver_with_fake_opener_returns_live_safe_extraction():
+    """fetch_index_live_once with a fake opener returns LiveSafeExtraction;
+    pre-2023 retained, post-2022 redacted/aggregated; no real network."""
+    calls = []
+
+    def fake_opener(url, timeout=None):
+        calls.append((url, timeout))
+        return _Resp(
+            b"20221231.export.CSV.zip 20230101.export.CSV.zip "
+            b"20150612.export.CSV.zip"
+        )
+
+    result = m.fetch_index_live_once(opener=fake_opener)
+    assert isinstance(result, m.LiveSafeExtraction)
+    assert "2022-12-31" in result.keys
+    assert "2015-06-12" in result.keys
+    assert "2023-01-01" not in result.keys
+    assert result.instrumentation["rejected_2023plus"] == 1
+    # Exactly one call — no retry
+    assert len(calls) == 1
+    # Default URL is the documented index.html, NOT the base /events/
+    assert calls[0][0] == m.DEFAULT_GDELT1_INDEX_URL
+    assert calls[0][0] != m.DEFAULT_GDELT1_BASE_URL
+
+
+def test_gate4d_driver_calls_opener_exactly_once_no_retry():
+    """Exactly one opener invocation per driver call; no retry, no second GET."""
+    calls = []
+
+    def fake_opener(url, timeout=None):
+        calls.append(url)
+        return _Resp(b"20150612.export.CSV.zip")
+
+    m.fetch_index_live_once(opener=fake_opener)
+    assert len(calls) == 1
+
+
+def test_gate4d_driver_targets_only_index_url_not_base_or_event_file():
+    """Driver targets only DEFAULT_GDELT1_INDEX_URL — never the base /events/
+    URL, never any event-file URL (no .export.CSV.zip in the request URL)."""
+    captured = {}
+
+    def fake_opener(url, timeout=None):
+        captured["url"] = url
+        return _Resp(b"20221231.export.CSV.zip")
+
+    m.fetch_index_live_once(opener=fake_opener)
+    assert captured["url"] == m.DEFAULT_GDELT1_INDEX_URL
+    assert captured["url"] != m.DEFAULT_GDELT1_BASE_URL
+    assert ".export.CSV.zip" not in captured["url"]
+    assert ".CSV.zip" not in captured["url"]
+
+
+def test_gate4d_driver_propagates_redirect_blocked_without_retry():
+    """If the opener raises RedirectBlocked, the driver propagates it as a
+    controlled non-follow outcome; no retry, no second opener invocation."""
+    calls = []
+
+    def redirecting_opener(url, timeout=None):
+        calls.append(url)
+        raise m.RedirectBlocked("synthetic 302")
+
+    with pytest.raises(m.RedirectBlocked):
+        m.fetch_index_live_once(opener=redirecting_opener)
+    assert len(calls) == 1  # exactly one attempt, no retry
+
+
+def test_gate4d_driver_creates_no_artifacts(tmp_path, monkeypatch):
+    """The driver writes no files (no JSON, markdown, logs, or other
+    persisted artifacts) when called with a fake opener."""
+    monkeypatch.chdir(tmp_path)
+
+    def fake_opener(url, timeout=None):
+        return _Resp(b"20221231.export.CSV.zip")
+
+    before = set(os.listdir(tmp_path))
+    m.fetch_index_live_once(opener=fake_opener)
+    after = set(os.listdir(tmp_path))
+    assert before == after
+
+
+def test_gate4d_guards_remain_inert_across_driver_call():
+    """REAL_RETRIEVAL_ENABLED and runner COUNT_FEASIBILITY_AUTHORIZED stay
+    False before AND after a driver call (no guard flip occurs)."""
+    assert m.REAL_RETRIEVAL_ENABLED is False
+    r = _load_runner()
+    assert r.COUNT_FEASIBILITY_AUTHORIZED is False
+
+    def fake_opener(url, timeout=None):
+        return _Resp(b"20221231.export.CSV.zip")
+
+    m.fetch_index_live_once(opener=fake_opener)
+    assert m.REAL_RETRIEVAL_ENABLED is False
+    r2 = _load_runner()
+    assert r2.COUNT_FEASIBILITY_AUTHORIZED is False
+
+
+def test_gate4d_no_real_post2022_filename_in_returned_keys_or_slots():
+    """Post-2022 filenames must not appear in the driver's returned keys or
+    slot_actual_keys (Gate 4C 9-channel no-surfacing preserved by layering)."""
+
+    def fake_opener(url, timeout=None):
+        return _Resp(
+            b"20230101.export.CSV.zip 20240715.export.CSV.zip "
+            b"20221231.export.CSV.zip"
+        )
+
+    result = m.fetch_index_live_once(opener=fake_opener)
+    for k, v in result.slot_actual_keys.items():
+        assert not k.startswith("2023") and not k.startswith("2024")
+        assert not v.startswith("2023") and not v.startswith("2024")
+    for k in result.keys:
+        assert not k.startswith("2023") and not k.startswith("2024")
+    # Aggregate only; no per-filename surfacing
+    assert result.instrumentation["rejected_2023plus"] == 2
+
+
+def test_gate4d_existing_live_safe_function_sources_remain_network_clean():
+    """Gate 4D additions did not pollute the Gate 4C firewall function bodies:
+    `urllib`, `urlopen`, raw URLs etc. still absent from their sources."""
+    import inspect
+    for fn in (m.extract_index_units_live_safe, m.fetch_archive_index_live_safe):
+        src = inspect.getsource(fn)
+        for bad in ("urllib", "requests", "socket", "http://", "https://",
+                    "urlopen"):
+            assert bad not in src, "{!r} in {}".format(bad, fn.__name__)

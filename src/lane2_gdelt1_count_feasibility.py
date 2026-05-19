@@ -1272,6 +1272,105 @@ def fetch_archive_index_live_safe(
     return extract_index_units_live_safe(text)
 
 
+# ── Gate 4D: redirect-disabled opener + one-call driver (a2851f4) ─────────────
+#
+# Authorized by the Gate 4D live-opener implementation authorization memo
+# (a2851f4). Narrow scope only: provide a redirect-disabled HTTP opener whose
+# no-follow behavior is enforced *by construction* (the URL-opener's redirect
+# handler raises a controlled exception rather than following any 3xx), plus
+# a minimal one-call driver into fetch_archive_index_live_safe. This module
+# performs no live request on import; the opener fires a request only when its
+# returned callable is invoked. Guards remain inert; no F4 modification; no
+# event-file URL is ever constructed here; no fallback to /events/. Real
+# post-2022 filenames remain redacted/aggregated by the unchanged Gate 4C
+# extract_index_units_live_safe path; this layer never sees or stores them.
+#
+# Anchors: this opener/driver, bf4ef79 §4, 159c392, 54fb16a §3/§4, e572c76,
+# f8345c8, Turn A L0.
+
+import urllib.request as _urllib_request  # Gate 4D — scoped to this section
+
+
+class RedirectBlocked(RuntimeError):
+    """Raised by the Gate 4D redirect-disabled opener on any 3xx response.
+
+    The opener never follows a redirect. Callers must treat this as a
+    controlled non-follow outcome (post-4C memo L4 class)."""
+
+
+class _NoFollowRedirectHandler(_urllib_request.HTTPRedirectHandler):
+    """Redirect handler whose 3xx hooks raise rather than follow.
+
+    Overriding every 30x http_error_NNN hook makes the no-follow property
+    structural — every redirect status is intercepted — not a runtime
+    convention a caller could forget."""
+
+    def _block(self, req, fp, code, msg, headers):
+        raise RedirectBlocked(
+            "redirect blocked by Gate 4D opener (status {!r}); "
+            "no follow, no fallback".format(code)
+        )
+
+    http_error_301 = _block
+    http_error_302 = _block
+    http_error_303 = _block
+    http_error_307 = _block
+    http_error_308 = _block
+
+
+def build_redirect_disabled_opener(timeout: float = 30.0) -> Callable:
+    """Build a callable opener with redirect-following disabled by
+    construction.
+
+    Returns `opener(url, timeout=...)` matching the contract expected by
+    `fetch_archive_index_live_safe`. On any 3xx redirect, the underlying
+    handler raises `RedirectBlocked` — no follow-up request, no `Location`
+    fetch, no fallback URL. The factory call fires no request; a single
+    request occurs only when the returned callable is invoked. Guards are
+    not flipped (`REAL_RETRIEVAL_ENABLED`, `COUNT_FEASIBILITY_AUTHORIZED`).
+    """
+    _opener = _urllib_request.build_opener(_NoFollowRedirectHandler())
+    _default_timeout = timeout
+
+    def _redirect_disabled_opener(url, timeout=_default_timeout):
+        # Exactly one request per invocation. No retry, no second GET, no
+        # fallback. The caller (fetch_archive_index_live_safe) consumes
+        # only .read() once and never re-invokes this opener.
+        return _opener.open(url, timeout=timeout)
+
+    return _redirect_disabled_opener
+
+
+def fetch_index_live_once(
+    opener: Optional[Callable] = None,
+    timeout: float = 30.0,
+) -> LiveSafeExtraction:
+    """Gate 4D minimal one-call driver into `fetch_archive_index_live_safe`.
+
+    Performs exactly one live-safe call against `DEFAULT_GDELT1_INDEX_URL`
+    (never `DEFAULT_GDELT1_BASE_URL`, never any event-file URL). Returns the
+    aggregate `LiveSafeExtraction` form unchanged. No retry, no fallback, no
+    artifact writes, no Gate 5, no count-feasibility run, no F4 modification.
+
+    `opener`:
+      - if `None` (default), a redirect-disabled opener is built lazily via
+        `build_redirect_disabled_opener`. Import remains side-effect-free;
+        no request fires unless this function is invoked.
+      - if provided, must match the `opener(url, timeout=...)` contract;
+        tests use this path with fake openers / synthetic responses (no
+        real network).
+
+    `extract_index_units_live_safe`, `fetch_archive_index_live_safe`, and
+    `LiveSafeExtraction` are not modified or bypassed; this driver only
+    wires an opener into the existing Gate 4C Strategy II live-safe path.
+    """
+    if opener is None:
+        opener = build_redirect_disabled_opener(timeout=timeout)
+    return fetch_archive_index_live_safe(
+        opener, index_url=DEFAULT_GDELT1_INDEX_URL, timeout=timeout,
+    )
+
+
 # ── Archive index fetch (injected opener only; no hidden network client) ──────
 
 def fetch_archive_index(
