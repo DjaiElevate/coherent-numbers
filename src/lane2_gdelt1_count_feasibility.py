@@ -1371,6 +1371,265 @@ def fetch_index_live_once(
     )
 
 
+# ── §10.1 Byte-capture wrapper (cfede1b §5/§10.1) ─────────────────────────────
+#
+# Authorized by the Gate 4C re-review / Turn B byte-capture authorization memo
+# v0.1 (cfede1b). Scope: a single thin serialization wrapper that exercises
+# the unchanged Gate 4C live-safe path + Gate 4D redirect-disabled opener via
+# `fetch_index_live_once`, then writes a bounded JSON artifact + SHA-256
+# sidecar containing the recognized in-window unit identifiers and minimal
+# provenance to a caller-provided capture directory.
+#
+# No existing function is modified. No fallback URL. No retry. No event-file
+# URL. No guard flip. No F4 modification. The mandatory L5 regex scan over the
+# serialized JSON body enforces the Gate 4C 9-channel non-surfacing discipline
+# at the new write surface — any positive match aborts the write before a file
+# is created on disk.
+#
+# This file does not authorize execution. Execution is gated by the cfede1b
+# §10 envelope: §10.1 implementation (this commit) → §10.2 conformance review
+# → §10.3 approval memo → §10.4 readiness prompt → §10.5 live-execution prompt
+# (the second GET) → §10.6 capture report → §10.7 memory update.
+
+L5_POST2022_FILENAME_PATTERN = (
+    r"\b\d{8,14}\.(?:export|gkg|mentions)\.(?:CSV|csv)\.zip\b"
+)
+_L5_POST2022_FILENAME_RE = re.compile(L5_POST2022_FILENAME_PATTERN)
+
+CAPTURE_SCHEMA_VERSION = "v0.1"
+
+# Provenance commits referenced by cfede1b §5.2. These are historical anchors
+# recorded in the captured artifact for later audit; they are NOT live re-
+# authorization of any spent step. The `byte_capture_authorization_memo_commit`
+# field is filled at call time from the `authorization_commit` argument (the
+# cfede1b commit hash, when later separately initiated under §10.5).
+CAPTURE_PROVENANCE_FIXED = {
+    "gate_4c_authorization_commit": "54fb16a",
+    "gate_4c_implementation_commit": "ec1c3ec",
+    "gate_4c_conformance_commit": "e572c76",
+    "gate_4d_authorization_commit": "a2851f4",
+    "gate_4d_implementation_commit": "7f5caee",
+    "gate_4d_conformance_commit": "9dea17c",
+    "post_4c_live_execution_authorization_commit": "f8345c8",
+    "turn_a_approval_commit": "991321d",
+    "turn_b_outcome": "L1",
+    "recognized_list_remediation_decision_commit": "f10c1bc",
+}
+
+
+class CaptureArtifactExists(RuntimeError):
+    """Raised when `recognized_list.json` or `recognized_list.sha256` already
+    exists at the caller-provided capture directory (cfede1b §11 stop
+    condition: "Target capture artifact already exists unexpectedly").
+
+    The wrapper does not overwrite existing capture artifacts; collision
+    routes to a fresh capture-namespace decision, not a silent overwrite.
+    """
+
+
+class L5FirewallBreach(RuntimeError):
+    """Raised when the mandatory L5 regex scan finds >=1 match in the
+    serialized JSON body (cfede1b §6, §11 stop condition: "L5 regex scan
+    positive").
+
+    Pattern: \\b\\d{8,14}\\.(?:export|gkg|mentions)\\.(?:CSV|csv)\\.zip\\b.
+    A positive match aborts the write — no recognized_list.json or
+    recognized_list.sha256 file is left on disk.
+    """
+
+
+class RecognizedCountMismatch(RuntimeError):
+    """Raised when an explicit `expected_count` is supplied and the actual
+    `recognized_in_window` count does not match (cfede1b §11 stop conditions:
+    "Output count > 3647" / "Output count < 3647").
+
+    Default `expected_count=None` skips the check, which is required for
+    synthetic-opener tests where the fixture-derived count is small.
+    """
+
+
+def _l5_scan_count_matches(body: str) -> int:
+    """Count L5-pattern matches (post-2022 GDELT 1.0 filenames) in a string.
+
+    Returns the integer count of matches. 0 means the body is clean under the
+    Gate 4C 9-channel non-surfacing discipline as enforced at this write
+    surface (cfede1b §6).
+    """
+    return sum(1 for _ in _L5_POST2022_FILENAME_RE.finditer(body))
+
+
+def _canonical_capture_json(payload: Dict) -> str:
+    """Serialize a capture payload as canonical JSON.
+
+    Properties: sorted keys, UTF-8, indent=2, fixed separators, no NaN /
+    Infinity. The byte representation is stable enough for SHA-256 sidecar
+    verification across Python versions.
+    """
+    return json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, indent=2,
+        allow_nan=False, separators=(",", ": "),
+    )
+
+
+def capture_recognized_list_once(
+    capture_dir: str,
+    authorization_commit: str,
+    timeout: float = 30.0,
+    opener: Optional[Callable] = None,
+    expected_count: Optional[int] = None,
+) -> str:
+    """Thin serialization wrapper (cfede1b §5/§10.1).
+
+    Layers a bounded JSON write over the unchanged Gate 4C / Gate 4D live-safe
+    path:
+
+        fetch_index_live_once(opener=opener, timeout=timeout)
+          -> fetch_archive_index_live_safe(opener=<Gate 4D opener>, ...)
+          -> extract_index_units_live_safe(text)
+          -> LiveSafeExtraction
+
+    Serializes the LiveSafeExtraction's recognized in-window unit identifiers
+    plus minimal provenance to `recognized_list.json` at `capture_dir`, writes
+    a SHA-256 sidecar at `recognized_list.sha256`, runs the mandatory L5 regex
+    scan over the serialized JSON body, and aborts before any file write if
+    the scan finds >=1 match.
+
+    No existing function in this module is modified by this wrapper. No
+    fallback URL, no retry, no second GET, no event-file URL, no guard flip,
+    no F4 modification. Exactly one opener invocation per call.
+
+    Parameters
+    ----------
+    capture_dir
+        Caller-provided destination directory. `recognized_list.json` and
+        `recognized_list.sha256` must not already exist at this path; if
+        either does, `CaptureArtifactExists` is raised. The directory itself
+        is created if needed; no parent F4 path is touched.
+    authorization_commit
+        The committed Gate 4C re-review / Turn B byte-capture authorization
+        memo's commit hash (`cfede1b` at implementation time). Recorded in
+        the captured artifact's
+        `provenance.byte_capture_authorization_memo_commit` field for later
+        audit.
+    timeout
+        Per-request timeout in seconds, forwarded to the Gate 4D opener (or
+        to the synthetic opener if `opener` is provided).
+    opener
+        If `None`, the Gate 4D redirect-disabled opener is built lazily by
+        `fetch_index_live_once`. Tests inject a synthetic opener here so the
+        wrapper can be exercised without contacting the network.
+    expected_count
+        If `int`, the wrapper raises `RecognizedCountMismatch` when the
+        observed `recognized_in_window` count differs from `expected_count`
+        (the cfede1b §11 stop conditions for "Output count > 3647" and
+        "Output count < 3647"). If `None` (default), no count check is
+        enforced — useful for synthetic tests where the fixture count is
+        small.
+
+    Returns
+    -------
+    str
+        Absolute path to the written `recognized_list.json` artifact.
+
+    Raises
+    ------
+    CaptureArtifactExists
+        Pre-existing `recognized_list.json` or `recognized_list.sha256`.
+    L5FirewallBreach
+        L5 regex finds >=1 match in the serialized JSON body. No file is
+        written; the capture directory is not created if it did not already
+        exist.
+    RecognizedCountMismatch
+        `expected_count` supplied and the observed count differs.
+    """
+    capture_dir_abs = os.path.abspath(capture_dir)
+    target_json = os.path.join(capture_dir_abs, "recognized_list.json")
+    target_sha = os.path.join(capture_dir_abs, "recognized_list.sha256")
+    if os.path.exists(target_json) or os.path.exists(target_sha):
+        raise CaptureArtifactExists(
+            "capture artifact already exists at {!r}; no overwrite is "
+            "permitted (cfede1b §11 stop condition)".format(capture_dir_abs)
+        )
+
+    # Exactly one live-safe GET via the unchanged Gate 4D one-call driver.
+    # `opener=None` builds the redirect-disabled opener lazily; tests pass an
+    # explicit synthetic opener to avoid the network entirely.
+    extraction = fetch_index_live_once(opener=opener, timeout=timeout)
+    inst = extraction.instrumentation
+    recognized_units = list(extraction.keys)
+    recognized_count = inst["recognized_in_window"]
+    # Invariant from extract_index_units_live_safe: instrumentation count and
+    # keys list length agree. Surface defensively in case of future drift.
+    if recognized_count != len(recognized_units):  # pragma: no cover
+        raise RuntimeError(
+            "internal invariant: instrumentation.recognized_in_window "
+            "({}) != len(keys) ({})".format(
+                recognized_count, len(recognized_units)
+            )
+        )
+
+    if expected_count is not None and recognized_count != expected_count:
+        raise RecognizedCountMismatch(
+            "observed recognized_in_window={!r} != expected_count={!r} "
+            "(cfede1b §11 stop condition)".format(
+                recognized_count, expected_count
+            )
+        )
+
+    # Scoped import: timezone-aware UTC timestamp for the captured artifact.
+    # No top-level import change is required and no module-level side effect
+    # at import time.
+    from datetime import datetime as _datetime, timezone as _timezone
+    capture_ts = (
+        _datetime.now(_timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+
+    provenance = dict(CAPTURE_PROVENANCE_FIXED)
+    provenance["byte_capture_authorization_memo_commit"] = authorization_commit
+
+    payload = {
+        "schema_version": CAPTURE_SCHEMA_VERSION,
+        "capture_timestamp_iso8601_utc": capture_ts,
+        "index_url": DEFAULT_GDELT1_INDEX_URL,
+        "single_get_confirmation": True,
+        "recognized_in_window_units": recognized_units,
+        "recognized_in_window_count": recognized_count,
+        "ignored_out_of_window_count": inst["ignored_out_of_window"],
+        "rejected_2023plus_count": inst["rejected_2023plus"],
+        "post2022_form_classes": list(extraction.post2022_form_classes),
+        "unrecognized_tokens_count": inst["unrecognized_tokens"],
+        "malformed_gdelt_tokens_count": inst["malformed_gdelt_tokens"],
+        "l5_regex_pattern": L5_POST2022_FILENAME_PATTERN,
+        "l5_regex_matches_in_artifact_body": 0,
+        "provenance": provenance,
+    }
+    body = _canonical_capture_json(payload)
+    matches = _l5_scan_count_matches(body)
+    if matches > 0:
+        # Abort BEFORE any directory/file is created. The L5 regex pattern
+        # itself, embedded as a string in the JSON payload, contains no actual
+        # \d{8,14} digit run, so it cannot self-match.
+        raise L5FirewallBreach(
+            "L5 regex scan found {} match(es) in the serialized JSON body; "
+            "aborting write before any file is created "
+            "(cfede1b §6, §11 stop condition)".format(matches)
+        )
+
+    # Both files are written only after the L5 scan passes. No partial-write
+    # path exists. F4 is not touched: the only filesystem writes are inside
+    # `capture_dir_abs`.
+    os.makedirs(capture_dir_abs, exist_ok=True)
+    body_bytes = body.encode("utf-8")
+    sha = hashlib.sha256(body_bytes).hexdigest()
+    with open(target_json, "wb") as f:
+        f.write(body_bytes)
+    sidecar_line = "{}  recognized_list.json\n".format(sha)
+    with open(target_sha, "w", encoding="utf-8") as f:
+        f.write(sidecar_line)
+
+    return target_json
+
+
 # ── Archive index fetch (injected opener only; no hidden network client) ──────
 
 def fetch_archive_index(

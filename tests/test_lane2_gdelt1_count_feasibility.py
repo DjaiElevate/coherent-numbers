@@ -4,6 +4,7 @@ NO real GDELT data, NO market data, NO network, NO 2023+, NO outcomes.
 """
 
 import importlib.util
+import json
 import os
 import zipfile
 from datetime import date
@@ -1477,3 +1478,499 @@ def test_gate4d_existing_live_safe_function_sources_remain_network_clean():
         for bad in ("urllib", "requests", "socket", "http://", "https://",
                     "urlopen"):
             assert bad not in src, "{!r} in {}".format(bad, fn.__name__)
+
+
+# ── §10.1 capture_recognized_list_once tests (cfede1b §5/§10.1) ──────────────
+#
+# All tests use synthetic openers / monkeypatched extractions / tmp_path. No
+# network. No real GDELT post-2022 filenames in any fixture beyond the
+# adversarial L5-breach simulation (which is explicitly designed to be caught
+# by the L5 regex scan before any file is written to disk).
+
+
+def _capture_fake_opener(payload_bytes):
+    """Build a single-call fake opener that returns the given bytes once."""
+    state = {"calls": 0}
+
+    def fake_opener(url, timeout=None):
+        state["calls"] += 1
+        return _Resp(payload_bytes)
+
+    return fake_opener, state
+
+
+def test_capture_wrapper_writes_json_and_sidecar(tmp_path):
+    """Happy path: with a synthetic opener returning pre-2023 fixtures, the
+    wrapper writes recognized_list.json + recognized_list.sha256."""
+    fake_opener, _ = _capture_fake_opener(
+        b"20150612.export.CSV.zip 20180103.export.CSV.zip "
+        b"20200229.export.CSV.zip"
+    )
+    capture_dir = tmp_path / "cap"
+    out = m.capture_recognized_list_once(
+        str(capture_dir),
+        authorization_commit="cfede1b",
+        opener=fake_opener,
+    )
+    assert out == str(capture_dir / "recognized_list.json")
+    assert (capture_dir / "recognized_list.json").exists()
+    assert (capture_dir / "recognized_list.sha256").exists()
+
+
+def test_capture_wrapper_sidecar_sha_matches_json_bytes(tmp_path):
+    """recognized_list.sha256 contains the SHA-256 of recognized_list.json
+    bytes in `shasum -a 256` format ("<hex>  recognized_list.json\\n")."""
+    import hashlib as _hashlib
+
+    fake_opener, _ = _capture_fake_opener(b"20150612.export.CSV.zip")
+    capture_dir = tmp_path / "cap"
+    m.capture_recognized_list_once(
+        str(capture_dir),
+        authorization_commit="cfede1b",
+        opener=fake_opener,
+    )
+    json_bytes = (capture_dir / "recognized_list.json").read_bytes()
+    sidecar_text = (capture_dir / "recognized_list.sha256").read_text(
+        encoding="utf-8"
+    )
+    expected = _hashlib.sha256(json_bytes).hexdigest()
+    assert sidecar_text == "{}  recognized_list.json\n".format(expected)
+
+
+def test_capture_wrapper_records_recognized_count_and_units(tmp_path):
+    """recognized_in_window_count equals len(recognized_in_window_units) and
+    matches the synthetic-opener fixture count exactly."""
+    fake_opener, _ = _capture_fake_opener(
+        b"20150612.export.CSV.zip 20180103.export.CSV.zip "
+        b"20200229.export.CSV.zip"
+    )
+    capture_dir = tmp_path / "cap"
+    m.capture_recognized_list_once(
+        str(capture_dir),
+        authorization_commit="cfede1b",
+        opener=fake_opener,
+    )
+    payload = json.loads(
+        (capture_dir / "recognized_list.json").read_text(encoding="utf-8")
+    )
+    assert payload["recognized_in_window_count"] == 3
+    assert len(payload["recognized_in_window_units"]) == 3
+    assert sorted(payload["recognized_in_window_units"]) == [
+        "2015-06-12", "2018-01-03", "2020-02-29",
+    ]
+
+
+def test_capture_wrapper_json_contains_all_required_fields(tmp_path):
+    """The JSON artifact carries every required cfede1b §5.2 field."""
+    fake_opener, _ = _capture_fake_opener(b"20150612.export.CSV.zip")
+    capture_dir = tmp_path / "cap"
+    m.capture_recognized_list_once(
+        str(capture_dir),
+        authorization_commit="cfede1b",
+        opener=fake_opener,
+    )
+    payload = json.loads(
+        (capture_dir / "recognized_list.json").read_text(encoding="utf-8")
+    )
+    required = {
+        "schema_version", "capture_timestamp_iso8601_utc", "index_url",
+        "single_get_confirmation", "recognized_in_window_units",
+        "recognized_in_window_count", "ignored_out_of_window_count",
+        "rejected_2023plus_count", "post2022_form_classes",
+        "unrecognized_tokens_count", "malformed_gdelt_tokens_count",
+        "l5_regex_pattern", "l5_regex_matches_in_artifact_body",
+        "provenance",
+    }
+    assert required.issubset(set(payload.keys()))
+    assert payload["schema_version"] == m.CAPTURE_SCHEMA_VERSION
+    assert payload["index_url"] == m.DEFAULT_GDELT1_INDEX_URL
+    assert payload["single_get_confirmation"] is True
+    assert payload["l5_regex_pattern"] == m.L5_POST2022_FILENAME_PATTERN
+    assert payload["l5_regex_matches_in_artifact_body"] == 0
+
+
+def test_capture_wrapper_records_authorization_commit_in_provenance(tmp_path):
+    """`provenance.byte_capture_authorization_memo_commit` is filled from the
+    caller-supplied `authorization_commit` argument."""
+    fake_opener, _ = _capture_fake_opener(b"20150612.export.CSV.zip")
+    capture_dir = tmp_path / "cap"
+    m.capture_recognized_list_once(
+        str(capture_dir),
+        authorization_commit="cfede1b",
+        opener=fake_opener,
+    )
+    payload = json.loads(
+        (capture_dir / "recognized_list.json").read_text(encoding="utf-8")
+    )
+    assert (
+        payload["provenance"]["byte_capture_authorization_memo_commit"]
+        == "cfede1b"
+    )
+
+
+def test_capture_wrapper_provenance_includes_all_anchors(tmp_path):
+    """`provenance` carries the cfede1b §5.2 historical chain anchors plus
+    the caller-supplied authorization commit."""
+    fake_opener, _ = _capture_fake_opener(b"20150612.export.CSV.zip")
+    capture_dir = tmp_path / "cap"
+    m.capture_recognized_list_once(
+        str(capture_dir),
+        authorization_commit="cfede1b",
+        opener=fake_opener,
+    )
+    payload = json.loads(
+        (capture_dir / "recognized_list.json").read_text(encoding="utf-8")
+    )
+    prov = payload["provenance"]
+    required_anchors = {
+        "gate_4c_authorization_commit", "gate_4c_implementation_commit",
+        "gate_4c_conformance_commit", "gate_4d_authorization_commit",
+        "gate_4d_implementation_commit", "gate_4d_conformance_commit",
+        "post_4c_live_execution_authorization_commit",
+        "turn_a_approval_commit", "turn_b_outcome",
+        "recognized_list_remediation_decision_commit",
+        "byte_capture_authorization_memo_commit",
+    }
+    assert required_anchors.issubset(set(prov.keys()))
+    # Spot-check a few specific values match the cfede1b §5.2 spec
+    assert prov["gate_4c_authorization_commit"] == "54fb16a"
+    assert prov["gate_4d_conformance_commit"] == "9dea17c"
+    assert prov["recognized_list_remediation_decision_commit"] == "f10c1bc"
+    assert prov["turn_b_outcome"] == "L1"
+
+
+def test_l5_scan_helper_clean_returns_zero():
+    """The L5 scan helper returns 0 for a body with no post-2022 filename
+    pattern."""
+    body = json.dumps(
+        {"recognized_in_window_units": ["2015-06-12", "2020-02-29"]},
+        sort_keys=True,
+    )
+    assert m._l5_scan_count_matches(body) == 0
+
+
+def test_l5_scan_helper_post2022_returns_positive():
+    """The L5 scan helper detects post-2022 GDELT 1.0 filename patterns."""
+    body = "leaked: 20230101.export.CSV.zip rest of body"
+    assert m._l5_scan_count_matches(body) >= 1
+
+
+def test_l5_scan_helper_pre_2023_alone_returns_zero():
+    """The L5 scan pattern matches any 8-14 digit GDELT 1.0 filename, not just
+    post-2022. The test confirms that a pre-2023 GDELT 1.0 filename will also
+    be flagged by the L5 scan — so the wrapper must never include any raw
+    GDELT 1.0 filename in the JSON body, regardless of date. The wrapper
+    canonically encodes pre-2023 unit identifiers as dates (e.g. '2015-06-12'),
+    not as '.export.CSV.zip' filenames, so the JSON body is clean by design."""
+    body = "20150612.export.CSV.zip"  # would be flagged if included
+    assert m._l5_scan_count_matches(body) == 1
+    body_canonical_form = "2015-06-12"  # how the wrapper actually encodes it
+    assert m._l5_scan_count_matches(body_canonical_form) == 0
+
+
+def test_capture_wrapper_l5_breach_aborts_write_no_partial_files(
+    tmp_path, monkeypatch,
+):
+    """If by some pathway a post-2022 filename pattern reaches a
+    LiveSafeExtraction field, the L5 regex scan over the serialized JSON body
+    catches it and the wrapper aborts before writing any file."""
+    contaminated = m.LiveSafeExtraction(
+        keys=["2015-06-12"],
+        slot_actual_keys={"2015-06-12": "2015-06-12"},
+        instrumentation={
+            "recognized_in_window": 1,
+            "ignored_out_of_window": 0,
+            "rejected_2023plus": 1,
+            "unrecognized_tokens": 0,
+            "malformed_gdelt_tokens": 0,
+        },
+        # Simulated firewall breach: a post-2022 filename literal in
+        # post2022_form_classes. The Gate 4C firewall would normally never
+        # produce this (only aggregated form-class labels like "daily_export"),
+        # but the L5 scan must catch it regardless.
+        post2022_form_classes=["20230101.export.CSV.zip"],
+    )
+
+    def fake_fetch(opener=None, timeout=30.0):
+        return contaminated
+
+    monkeypatch.setattr(m, "fetch_index_live_once", fake_fetch)
+    capture_dir = tmp_path / "cap"
+    with pytest.raises(m.L5FirewallBreach):
+        m.capture_recognized_list_once(
+            str(capture_dir),
+            authorization_commit="cfede1b",
+        )
+    # No partial files written
+    assert not (capture_dir / "recognized_list.json").exists()
+    assert not (capture_dir / "recognized_list.sha256").exists()
+
+
+def test_capture_wrapper_pre_existing_json_raises(tmp_path):
+    """Pre-existing `recognized_list.json` at the capture directory triggers
+    CaptureArtifactExists; the wrapper does not invoke the opener and does
+    not overwrite."""
+    capture_dir = tmp_path / "cap"
+    capture_dir.mkdir()
+    (capture_dir / "recognized_list.json").write_text("placeholder")
+    state = {"calls": 0}
+
+    def fake_opener(url, timeout=None):  # pragma: no cover (must not be called)
+        state["calls"] += 1
+        return _Resp(b"20150612.export.CSV.zip")
+
+    with pytest.raises(m.CaptureArtifactExists):
+        m.capture_recognized_list_once(
+            str(capture_dir),
+            authorization_commit="cfede1b",
+            opener=fake_opener,
+        )
+    assert state["calls"] == 0
+
+
+def test_capture_wrapper_pre_existing_sidecar_raises(tmp_path):
+    """Pre-existing `recognized_list.sha256` at the capture directory also
+    triggers CaptureArtifactExists."""
+    capture_dir = tmp_path / "cap"
+    capture_dir.mkdir()
+    (capture_dir / "recognized_list.sha256").write_text("placeholder")
+    fake_opener, _ = _capture_fake_opener(b"20150612.export.CSV.zip")
+    with pytest.raises(m.CaptureArtifactExists):
+        m.capture_recognized_list_once(
+            str(capture_dir),
+            authorization_commit="cfede1b",
+            opener=fake_opener,
+        )
+
+
+def test_capture_wrapper_calls_opener_exactly_once(tmp_path):
+    """Exactly one opener invocation per wrapper call — no retry, no second
+    GET inside the wrapper."""
+    fake_opener, state = _capture_fake_opener(b"20150612.export.CSV.zip")
+    capture_dir = tmp_path / "cap"
+    m.capture_recognized_list_once(
+        str(capture_dir),
+        authorization_commit="cfede1b",
+        opener=fake_opener,
+    )
+    assert state["calls"] == 1
+
+
+def test_capture_wrapper_targets_only_index_url(tmp_path):
+    """The wrapper's single GET targets DEFAULT_GDELT1_INDEX_URL — never the
+    base /events/ URL, never any event-file URL."""
+    captured = {}
+
+    def fake_opener(url, timeout=None):
+        captured["url"] = url
+        return _Resp(b"20150612.export.CSV.zip")
+
+    capture_dir = tmp_path / "cap"
+    m.capture_recognized_list_once(
+        str(capture_dir),
+        authorization_commit="cfede1b",
+        opener=fake_opener,
+    )
+    assert captured["url"] == m.DEFAULT_GDELT1_INDEX_URL
+    assert captured["url"] != m.DEFAULT_GDELT1_BASE_URL
+    assert ".export.CSV.zip" not in captured["url"]
+
+
+def test_capture_wrapper_propagates_redirect_blocked_no_partial_write(
+    tmp_path,
+):
+    """If the opener raises RedirectBlocked, the wrapper propagates it
+    without writing any partial files (Gate 4D firewall preserved)."""
+    calls = []
+
+    def redirecting_opener(url, timeout=None):
+        calls.append(url)
+        raise m.RedirectBlocked("synthetic 302")
+
+    capture_dir = tmp_path / "cap"
+    with pytest.raises(m.RedirectBlocked):
+        m.capture_recognized_list_once(
+            str(capture_dir),
+            authorization_commit="cfede1b",
+            opener=redirecting_opener,
+        )
+    assert len(calls) == 1
+    assert not (capture_dir / "recognized_list.json").exists()
+    assert not (capture_dir / "recognized_list.sha256").exists()
+
+
+def test_capture_wrapper_does_not_flip_guards(tmp_path):
+    """REAL_RETRIEVAL_ENABLED and runner COUNT_FEASIBILITY_AUTHORIZED stay
+    False before AND after a wrapper call."""
+    assert m.REAL_RETRIEVAL_ENABLED is False
+    r = _load_runner()
+    assert r.COUNT_FEASIBILITY_AUTHORIZED is False
+
+    fake_opener, _ = _capture_fake_opener(b"20150612.export.CSV.zip")
+    capture_dir = tmp_path / "cap"
+    m.capture_recognized_list_once(
+        str(capture_dir),
+        authorization_commit="cfede1b",
+        opener=fake_opener,
+    )
+
+    assert m.REAL_RETRIEVAL_ENABLED is False
+    r2 = _load_runner()
+    assert r2.COUNT_FEASIBILITY_AUTHORIZED is False
+
+
+def test_capture_wrapper_does_not_modify_f4(tmp_path):
+    """F4 canonical SHA-256s remain stable across a wrapper call. The wrapper
+    does not read or write any path under
+    results/lane2_gdelt1_count_feasibility/."""
+    import hashlib as _hashlib
+
+    f4_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(m.__file__))),
+        "results", "lane2_gdelt1_count_feasibility",
+        "20260518T163302Z",
+    )
+    f4_meta = os.path.join(f4_dir, "count_feasibility_metadata.json")
+    f4_summ = os.path.join(f4_dir, "feasibility_summary.md")
+    if not (os.path.isfile(f4_meta) and os.path.isfile(f4_summ)):
+        pytest.skip("F4 substrate not present in this clone")
+
+    def _sha(p):
+        with open(p, "rb") as f:
+            return _hashlib.sha256(f.read()).hexdigest()
+
+    sha_meta_before = _sha(f4_meta)
+    sha_summ_before = _sha(f4_summ)
+
+    fake_opener, _ = _capture_fake_opener(b"20150612.export.CSV.zip")
+    capture_dir = tmp_path / "cap"
+    m.capture_recognized_list_once(
+        str(capture_dir),
+        authorization_commit="cfede1b",
+        opener=fake_opener,
+    )
+
+    assert _sha(f4_meta) == sha_meta_before
+    assert _sha(f4_summ) == sha_summ_before
+
+
+def test_capture_wrapper_expected_count_mismatch_raises(tmp_path):
+    """`expected_count` mismatch raises RecognizedCountMismatch and writes no
+    files."""
+    fake_opener, _ = _capture_fake_opener(b"20150612.export.CSV.zip")
+    capture_dir = tmp_path / "cap"
+    with pytest.raises(m.RecognizedCountMismatch):
+        m.capture_recognized_list_once(
+            str(capture_dir),
+            authorization_commit="cfede1b",
+            opener=fake_opener,
+            expected_count=5,
+        )
+    assert not (capture_dir / "recognized_list.json").exists()
+    assert not (capture_dir / "recognized_list.sha256").exists()
+
+
+def test_capture_wrapper_expected_count_none_skips_check(tmp_path):
+    """`expected_count=None` (default) skips the count check; useful for
+    synthetic-fixture tests where the count is small."""
+    fake_opener, _ = _capture_fake_opener(b"20150612.export.CSV.zip")
+    capture_dir = tmp_path / "cap"
+    m.capture_recognized_list_once(
+        str(capture_dir),
+        authorization_commit="cfede1b",
+        opener=fake_opener,
+        expected_count=None,
+    )
+    assert (capture_dir / "recognized_list.json").exists()
+
+
+def test_capture_wrapper_expected_count_match_succeeds(tmp_path):
+    """`expected_count` equal to the observed count passes through; the JSON
+    is still written normally."""
+    fake_opener, _ = _capture_fake_opener(
+        b"20150612.export.CSV.zip 20180103.export.CSV.zip"
+    )
+    capture_dir = tmp_path / "cap"
+    m.capture_recognized_list_once(
+        str(capture_dir),
+        authorization_commit="cfede1b",
+        opener=fake_opener,
+        expected_count=2,
+    )
+    payload = json.loads(
+        (capture_dir / "recognized_list.json").read_text(encoding="utf-8")
+    )
+    assert payload["recognized_in_window_count"] == 2
+
+
+def test_capture_wrapper_creates_capture_dir_if_missing(tmp_path):
+    """A non-existent capture_dir is created by the wrapper before writing
+    the two artifact files."""
+    capture_dir = tmp_path / "nested" / "subdir" / "20260521T000000Z"
+    assert not capture_dir.exists()
+    fake_opener, _ = _capture_fake_opener(b"20150612.export.CSV.zip")
+    m.capture_recognized_list_once(
+        str(capture_dir),
+        authorization_commit="cfede1b",
+        opener=fake_opener,
+    )
+    assert capture_dir.is_dir()
+    assert (capture_dir / "recognized_list.json").exists()
+    assert (capture_dir / "recognized_list.sha256").exists()
+
+
+def test_capture_wrapper_no_real_post2022_filename_in_written_json(tmp_path):
+    """Final-on-disk verification: even with mixed pre-2023 + post-2022 input,
+    the written JSON file is clean under the L5 regex scan."""
+    fake_opener, _ = _capture_fake_opener(
+        b"20150612.export.CSV.zip 20180103.export.CSV.zip "
+        b"20230101.export.CSV.zip 20240715.export.CSV.zip"
+    )
+    capture_dir = tmp_path / "cap"
+    m.capture_recognized_list_once(
+        str(capture_dir),
+        authorization_commit="cfede1b",
+        opener=fake_opener,
+    )
+    body = (capture_dir / "recognized_list.json").read_text(encoding="utf-8")
+    assert m._l5_scan_count_matches(body) == 0
+    payload = json.loads(body)
+    # Pre-2023 retained
+    assert "2015-06-12" in payload["recognized_in_window_units"]
+    assert "2018-01-03" in payload["recognized_in_window_units"]
+    # Post-2022 aggregated only
+    assert payload["rejected_2023plus_count"] == 2
+    assert payload["post2022_form_classes"] == ["daily_export"]
+
+
+def test_capture_wrapper_canonical_json_stable(tmp_path):
+    """The canonical JSON serializer produces byte-stable output for the
+    same payload (sort_keys + deterministic separators)."""
+    payload = {
+        "schema_version": "v0.1",
+        "recognized_in_window_count": 3,
+        "recognized_in_window_units": ["2015-06-12", "2018-01-03"],
+        "provenance": {"x": "1", "a": "0"},
+    }
+    body1 = m._canonical_capture_json(payload)
+    body2 = m._canonical_capture_json(payload)
+    assert body1 == body2
+
+
+def test_capture_wrapper_existing_function_sources_untouched():
+    """The wrapper does not modify existing Gate 4C / Gate 4D functions.
+    Spot-check their sources for sentinel substrings that would change if any
+    of those functions were rewritten."""
+    import inspect
+    # Gate 4C extraction path
+    src_ext = inspect.getsource(m.extract_index_units_live_safe)
+    assert "Strategy II live-path-safe index extraction" in src_ext
+    # Gate 4C live-safe fetch
+    src_fetch = inspect.getsource(m.fetch_archive_index_live_safe)
+    assert "Live-path-safe archive index fetch" in src_fetch
+    # Gate 4D one-call driver
+    src_driver = inspect.getsource(m.fetch_index_live_once)
+    assert "Gate 4D minimal one-call driver" in src_driver
+    # Gate 4D opener factory
+    src_opener = inspect.getsource(m.build_redirect_disabled_opener)
+    assert "Build a callable opener with redirect-following disabled" in src_opener
