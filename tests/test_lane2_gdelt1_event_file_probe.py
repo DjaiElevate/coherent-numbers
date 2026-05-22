@@ -11,6 +11,7 @@ import inspect
 import io
 import json
 import os
+import pathlib
 import re
 import urllib.error
 import urllib.request
@@ -254,6 +255,111 @@ def test_no_cli_env_or_function_override_for_recognized_list_path():
             "probe source unexpectedly references override surface {!r}"
             .format(f)
         )
+
+
+# ── 2b. _load_recognized_units parser coverage ───────────────────────────────
+#
+# These tests complement the signature check in
+# `test_no_cli_env_or_function_override_for_recognized_list_path` (which
+# is left untouched). They prove that the function correctly parses the
+# real committed §10 capture shape, raises on missing key, and raises on
+# malformed `recognized_in_window_units` shape. The smoke test against
+# the real tracked capture is read-only and uses only local filesystem
+# reads — no network, no GDELT contact, no mutation.
+
+def _write_fixture_capture(tmp_path, payload):
+    """Write `payload` (dict) as JSON to the substrate-pinned relative
+    path inside `tmp_path`, mirroring the real repo layout."""
+    p = _load_probe()
+    rel = p.RECOGNIZED_LIST_PATH
+    full = pathlib.Path(tmp_path) / rel
+    full.parent.mkdir(parents=True, exist_ok=True)
+    with open(full, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+    return full
+
+
+def test_load_recognized_units_parses_real_capture_shape(tmp_path):
+    p = _load_probe()
+    units = [
+        "2013-04-01",
+        "2014-01-22",
+        "2014-01-26",
+        "2018-02-14",
+        "2022-12-31",
+    ]
+    payload = {
+        # Mirror the real top-level shape so a future rename of any of
+        # these sibling keys won't silently leave this fixture too
+        # permissive.
+        "schema_version": "v0.1",
+        "capture_timestamp_iso8601_utc": "20260521T124853Z",
+        "index_url": "http://data.gdeltproject.org/events/index.html",
+        "single_get_confirmation": True,
+        "recognized_in_window_count": len(units),
+        "recognized_in_window_units": units,
+        "ignored_out_of_window_count": 0,
+        "rejected_2023plus_count": 0,
+        "unrecognized_tokens_count": 0,
+        "malformed_gdelt_tokens_count": 0,
+        "l5_regex_pattern": "",
+        "l5_regex_matches_in_artifact_body": 0,
+        "post2022_form_classes": {},
+        "provenance": {},
+    }
+    _write_fixture_capture(tmp_path, payload)
+    returned = p._load_recognized_units(str(tmp_path))
+    assert returned == units
+
+
+def test_load_recognized_units_raises_on_missing_key(tmp_path):
+    p = _load_probe()
+    payload = {
+        "schema_version": "v0.1",
+        "recognized_in_window_count": 0,
+        # `recognized_in_window_units` deliberately absent
+    }
+    _write_fixture_capture(tmp_path, payload)
+    with pytest.raises(p.ProbeBoundaryBreach):
+        p._load_recognized_units(str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "malformed_value",
+    [
+        {},
+        {"2013-04-01": True},  # dict not list
+        "2013-04-01",            # bare string not list
+        42,                       # int not list
+        None,                     # null
+    ],
+)
+def test_load_recognized_units_raises_on_non_list(tmp_path, malformed_value):
+    p = _load_probe()
+    payload = {
+        "schema_version": "v0.1",
+        "recognized_in_window_units": malformed_value,
+    }
+    _write_fixture_capture(tmp_path, payload)
+    with pytest.raises(p.ProbeBoundaryBreach):
+        p._load_recognized_units(str(tmp_path))
+
+
+def test_load_recognized_units_against_real_committed_capture():
+    """Smoke test against the real tracked §10 capture file. Read-only;
+    no network; no GDELT contact; no mutation. Resolves `repo_root` from
+    the test file's location so the test is cwd-independent."""
+    p = _load_probe()
+    repo_root = str(pathlib.Path(__file__).resolve().parents[1])
+    returned = p._load_recognized_units(repo_root)
+    assert isinstance(returned, list)
+    assert len(returned) == 3647
+    assert "2013-04-01" in returned
+    assert "2014-01-22" in returned
+    assert "2014-01-26" in returned
+    assert ("2018-02-14" in returned) or ("2018-02-15" in returned)
+    assert "2022-12-31" in returned
+    assert "2014-01-23" not in returned
 
 
 # ── 3. Sample selection logic ────────────────────────────────────────────────
