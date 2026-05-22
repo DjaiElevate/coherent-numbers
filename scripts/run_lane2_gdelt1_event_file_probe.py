@@ -49,7 +49,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 # `fe74255 → 9e329c2` enable-then-inert-restore pattern). A run-enablement
 # commit must be followed by a separate inert-restore commit; this constant
 # is restored to False after the single authorized probe run.
-EVENT_FILE_PROBE_AUTHORIZED = True
+EVENT_FILE_PROBE_AUTHORIZED = False
 
 
 # ── Substrate-pinned constants (no CLI / env / config override) ──────────────
