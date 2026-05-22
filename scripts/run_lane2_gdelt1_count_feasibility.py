@@ -41,7 +41,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 # under run authorization 60ec1521 (memo §13). The single authorized count-only
 # feasibility run was executed (F4 archive-layout) under commit fe742555; this
 # constant is restored to False (inert-restore safety reset).
-COUNT_FEASIBILITY_AUTHORIZED = False
+# TEMPORARILY True for the single count-only run authorized under v0.2
+# (57f42cc) per the §6 binding caveat (drop '2013' yearly identifier at
+# universe-construction; the four 2014 dailies 2014-01-23/24/25 and
+# 2014-03-19 are recorded as known substrate gaps). A separate inert-restore
+# safety commit MUST set this back to False immediately after the one run.
+COUNT_FEASIBILITY_AUTHORIZED = True
 
 _REFUSAL = (
     "Lane 2 count-only feasibility run is NOT authorized. Requires "
