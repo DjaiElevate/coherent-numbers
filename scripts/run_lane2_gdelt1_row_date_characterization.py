@@ -477,14 +477,17 @@ def parse_characterization_payload(
     nominal_pct = (nominal_count / row_count * 100.0) if row_count else 0.0
     mismatch_pct = (mismatch_count / row_count * 100.0) if row_count else 0.0
 
-    # Treat the lookback bucket near -3650 with a small tolerance because
-    # 10-year leap-year arithmetic shifts the exact value (e.g. -3650 vs
-    # -3651/-3652). Membership-by-window: any observed offset within
-    # `-3653 <= o <= -3647` is treated as the -3650 bucket; the bucket is
-    # "present" if any such offset has nonzero count.
-    def _bucket_present(target: int, tolerance: int = 0) -> bool:
+    # Exact-integer bucket presence. Memo `a2a8fd5` §7 / §10 list the
+    # locked taxonomy as bare integers `{0, -1, -7, -30, -365, -3650, +1}`
+    # with no tolerance language; any observed offset that is not exactly
+    # one of those integers is an unexpected offset and may trigger
+    # `TAXONOMY-DEVIATION-REQUIRES-REVISION`. Leap-year arithmetic that
+    # lands the 10-year lookback bucket on -3651 / -3652 / -3649 etc. is
+    # itself a substrate finding the characterization run must surface,
+    # not silently absorb.
+    def _bucket_present(target: int) -> bool:
         return any(
-            (abs(o - target) <= tolerance) and (c > 0)
+            (o == target) and (c > 0)
             for o, c in offset_counts.items()
         )
 
@@ -494,16 +497,13 @@ def parse_characterization_payload(
         "-7": _bucket_present(-7),
         "-30": _bucket_present(-30),
         "-365": _bucket_present(-365),
-        "-3650": _bucket_present(-3650, tolerance=3),
+        "-3650": _bucket_present(-3650),
         "+1": _bucket_present(1),
     }
 
     expected_set = set(EXPECTED_OFFSETS)
     unexpected_offsets = []
     for off in sorted(offset_counts):
-        # Allow -3650 ± 3 to be treated as the -3650 bucket
-        if abs(off - (-3650)) <= 3:
-            continue
         if off not in expected_set:
             unexpected_offsets.append({
                 "offset_days": off,

@@ -555,19 +555,106 @@ def test_parser_detects_unexpected_offset():
     assert any(u["offset_days"] == -100 for u in unexpected)
 
 
-def test_parser_tolerates_3650_leap_year_shift():
-    """The 10-year lookback bucket can land on -3651/-3652 due to leap
-    years; the parser must treat any offset in [-3653, -3647] as the
-    -3650 bucket and NOT as an unexpected offset."""
+def test_parser_flags_3650_near_miss_as_unexpected():
+    """Memo `a2a8fd5` §7 / §10 list the taxonomy as bare integers
+    `{0, -1, -7, -30, -365, -3650, +1}` with no tolerance language.
+    A near-miss offset like `-3652` (which could plausibly arise from
+    10-year leap-year arithmetic) is NOT silently absorbed into the
+    -3650 bucket — it surfaces as an unexpected offset, so the
+    characterization run can decide whether to revise the taxonomy.
+    """
     m = _load_runner()
     nominal = date(2018, 10, 2)
     buckets = _expected_offset_buckets_no_tplus1()
-    # Replace the -3650 bucket with -3652 to simulate leap-year arithmetic
+    # Replace the -3650 bucket with -3652
     buckets = [(o, c) if o != -3650 else (-3652, c) for o, c in buckets]
     payload = _make_payload_zip(nominal, buckets)
     out = m.parse_characterization_payload(payload, nominal_date=nominal)
-    assert out["unexpected_offsets"] == []
+    # -3650 bucket is absent — -3652 does NOT count as -3650.
+    assert out["expected_offsets_presence"]["-3650"] is False
+    # -3652 surfaces as an unexpected offset.
+    unexpected = out["unexpected_offsets"]
+    assert any(u["offset_days"] == -3652 for u in unexpected)
+
+
+def test_parser_flags_various_near_miss_offsets_as_unexpected():
+    """Near-miss offsets like -3649, -3651, and -366 are all rejected
+    as unexpected — exact integer matching applies to every locked
+    offset, not just -3650."""
+    m = _load_runner()
+    nominal = date(2020, 4, 2)
+    # Build a payload with rows at the exact -3650 and -365 buckets,
+    # plus off-by-one near-miss buckets that should NOT be absorbed.
+    buckets = [
+        (0, 100),
+        (-1, 10),
+        (-365, 20),
+        (-366, 3),     # near miss for -365
+        (-3650, 5),
+        (-3649, 2),    # near miss for -3650
+        (-3651, 2),    # near miss for -3650
+    ]
+    payload = _make_payload_zip(nominal, buckets)
+    out = m.parse_characterization_payload(payload, nominal_date=nominal)
+    unexpected_offsets = sorted(
+        u["offset_days"] for u in out["unexpected_offsets"]
+    )
+    assert -3651 in unexpected_offsets
+    assert -3649 in unexpected_offsets
+    assert -366 in unexpected_offsets
+    # The exact -3650 and -365 buckets are present and not flagged.
     assert out["expected_offsets_presence"]["-3650"] is True
+    assert out["expected_offsets_presence"]["-365"] is True
+
+
+def test_outcome_classification_triggers_deviation_on_3650_near_miss(monkeypatch, tmp_path):
+    """End-to-end: when an otherwise-clean characterization run
+    contains a single near-miss offset (here -3652 instead of -3650 in
+    one file), the verdict map flips from
+    `TAXONOMY-STABLE-WITH-TPLUS1-BOUNDARY` to
+    `TAXONOMY-DEVIATION-REQUIRES-REVISION`."""
+    m = _load_runner()
+    monkeypatch.setattr(m, "ROW_DATE_CHARACTERIZATION_AUTHORIZED", True)
+    monkeypatch.setenv("LANE2_ROW_DATE_CHARACTERIZATION_AUTHORIZED", "1")
+    monkeypatch.setattr(
+        m, "_load_recognized_units",
+        lambda repo_root: _good_recognized_units(),
+    )
+
+    # Build a fake opener that returns the usual stable-with-T+1 payloads
+    # for all 16 dates EXCEPT one file (2018-10-02), where the -3650
+    # bucket is replaced with a near-miss -3652.
+    payloads = {}
+    for d_iso in LOCKED_DATES:
+        d = date.fromisoformat(d_iso)
+        if d.year <= 2014:
+            buckets = _expected_offset_buckets()
+        else:
+            buckets = _expected_offset_buckets_no_tplus1()
+        if d_iso == "2018-10-02":
+            buckets = [
+                (o, c) if o != -3650 else (-3652, c) for o, c in buckets
+            ]
+        payloads[d_iso.replace("-", "")] = _make_payload_zip(d, buckets)
+
+    def fake_opener(url, timeout=30.0):
+        m2 = re.search(r"/events/(\d{8})\.export\.CSV\.zip$", url)
+        assert m2, "unexpected URL: {}".format(url)
+        yyyymmdd = m2.group(1)
+        if yyyymmdd in payloads:
+            return _FakeResponse(status=200, body=payloads[yyyymmdd])
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+    out_dir = str(tmp_path / "out")
+    m.run_row_date_characterization(
+        repo_root=str(tmp_path),
+        cli_flag=True,
+        opener=fake_opener,
+        output_dir=out_dir,
+    )
+    with open(os.path.join(out_dir, "characterization_metadata.json")) as fh:
+        md = json.load(fh)
+    assert md["outcome"] == "TAXONOMY-DEVIATION-REQUIRES-REVISION"
 
 
 def test_parser_detects_header_anomaly():
