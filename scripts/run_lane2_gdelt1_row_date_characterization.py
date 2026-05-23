@@ -54,7 +54,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 # under the future characterization-execution-authorization prompt.
 # Mirrors the count-feasibility runner's `COUNT_FEASIBILITY_AUTHORIZED`
 # and the event-file probe's `EVENT_FILE_PROBE_AUTHORIZED` patterns.
-ROW_DATE_CHARACTERIZATION_AUTHORIZED = False
+ROW_DATE_CHARACTERIZATION_AUTHORIZED = True
 
 
 # ── Substrate-pinned constants (no CLI / env / config override) ──────────────
