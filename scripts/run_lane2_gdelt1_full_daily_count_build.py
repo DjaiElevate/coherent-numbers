@@ -1498,14 +1498,772 @@ def run_full_daily_count_build(
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Chunked execution support (chunk-design memo `5962c20`)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Yearly fetch-file-date chunks. The full 3,558-URL fetch set is partitioned
+# into 10 disjoint per-year chunks; each chunk is a separately authorized
+# execution unit. The merge step (offline, no GDELT contact) consumes the
+# per-chunk derived artifacts and produces the canonical full-build outputs.
+#
+# Chunking does NOT change SQLDATE re-keying, the no-2023+ posture, the
+# no-retry rule, exactly-once fetch semantics, recognized-list authority,
+# the no-market-data firewall, or `c10ae74`'s coverage-domain amendment.
+
+CHUNK_IDS: Tuple[str, ...] = (
+    "chunk_2013_partial",
+    "chunk_2014",
+    "chunk_2015",
+    "chunk_2016",
+    "chunk_2017",
+    "chunk_2018",
+    "chunk_2019",
+    "chunk_2020",
+    "chunk_2021",
+    "chunk_2022",
+)
+
+EXPECTED_CHUNK_COUNTS: Dict[str, int] = {
+    "chunk_2013_partial": 275,
+    "chunk_2014": 361,
+    "chunk_2015": 365,
+    "chunk_2016": 366,
+    "chunk_2017": 365,
+    "chunk_2018": 365,
+    "chunk_2019": 365,
+    "chunk_2020": 366,
+    "chunk_2021": 365,
+    "chunk_2022": 365,
+}
+
+CHUNK_YEAR_RANGES: Dict[str, Tuple[date, date]] = {
+    "chunk_2013_partial": (date(2013, 4, 1), date(2013, 12, 31)),
+    "chunk_2014": (date(2014, 1, 1), date(2014, 12, 31)),
+    "chunk_2015": (date(2015, 1, 1), date(2015, 12, 31)),
+    "chunk_2016": (date(2016, 1, 1), date(2016, 12, 31)),
+    "chunk_2017": (date(2017, 1, 1), date(2017, 12, 31)),
+    "chunk_2018": (date(2018, 1, 1), date(2018, 12, 31)),
+    "chunk_2019": (date(2019, 1, 1), date(2019, 12, 31)),
+    "chunk_2020": (date(2020, 1, 1), date(2020, 12, 31)),
+    "chunk_2021": (date(2021, 1, 1), date(2021, 12, 31)),
+    "chunk_2022": (date(2022, 1, 1), date(2022, 12, 31)),
+}
+
+# Per-chunk derived artifact allow-list (chunk-design memo §8).
+ALLOWED_CHUNK_OUTPUT_BASENAMES: Tuple[str, ...] = (
+    "chunk_contributions.csv",
+    "chunk_metadata.json",
+    "chunk_summary.md",
+    "halt_diagnostic.json",
+)
+
+
+class ChunkManifestError(RuntimeError):
+    """Raised on chunk manifest / merge contract violations
+    (chunk-design memo §11 / §12)."""
+
+
+def validate_chunk_id(chunk_id: str) -> None:
+    """Raise ChunkManifestError if chunk_id is not one of the canonical
+    10 IDs."""
+    if chunk_id not in CHUNK_IDS:
+        raise ChunkManifestError(
+            "unknown chunk_id {!r}; valid ids are: {}".format(
+                chunk_id, list(CHUNK_IDS)
+            )
+        )
+
+
+def build_chunk_manifest(chunk_id: str, fetch_set: List[str]) -> List[str]:
+    """Filter the full recognized-list-derived `fetch_set` to ISO date
+    strings whose date lies in chunk_id's yearly range.
+
+    `fetch_set` must be the 3,558-URL set from
+    `build_reconciliation_report(units)["fetch_set"]` (= daily-in-window
+    minus the 4 known substrate gaps).
+
+    Returns sorted in-chunk ISO date strings. Hard-fails on count
+    mismatch against `EXPECTED_CHUNK_COUNTS`.
+    """
+    validate_chunk_id(chunk_id)
+    start, end = CHUNK_YEAR_RANGES[chunk_id]
+    start_iso = start.isoformat()
+    end_iso = end.isoformat()
+    out = sorted(u for u in fetch_set if start_iso <= u <= end_iso)
+    expected = EXPECTED_CHUNK_COUNTS[chunk_id]
+    if len(out) != expected:
+        raise ChunkManifestError(
+            "chunk {!r}: actual count {} != expected {}".format(
+                chunk_id, len(out), expected
+            )
+        )
+    return out
+
+
+def build_all_chunk_manifests(fetch_set: List[str]) -> Dict[str, List[str]]:
+    """Return all 10 chunk manifests as a dict {chunk_id -> [iso, ...]}."""
+    return {cid: build_chunk_manifest(cid, fetch_set) for cid in CHUNK_IDS}
+
+
+def chunk_manifest_digest(chunk_iso_dates: List[str]) -> str:
+    """Compute the deterministic SHA-256 digest of a chunk's URL list.
+
+    URLs are constructed from the sorted date list (no network);
+    each URL is ASCII-encoded and newline-terminated before hashing.
+    """
+    sorted_dates = sorted(chunk_iso_dates)
+    h = hashlib.sha256()
+    for iso in sorted_dates:
+        d = date.fromisoformat(iso)
+        url = date_to_daily_url(d)
+        h.update(url.encode("ascii"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def assert_chunk_manifests_partition(
+    manifests: Dict[str, List[str]],
+    full_fetch_set: List[str],
+) -> None:
+    """Validate chunk-manifest partition contract:
+      - exact set of 10 chunk IDs (no missing, no extra);
+      - pairwise disjoint (no URL in multiple chunks);
+      - union equals full recognized-list-derived fetch set;
+      - no 2023+ dates;
+      - no non-daily units (regex YYYY-MM-DD only).
+
+    Raises ChunkManifestError on any violation.
+    """
+    expected_ids = set(CHUNK_IDS)
+    actual_ids = set(manifests.keys())
+    if actual_ids != expected_ids:
+        raise ChunkManifestError(
+            "chunk id set mismatch: missing={}, extra={}".format(
+                sorted(expected_ids - actual_ids),
+                sorted(actual_ids - expected_ids),
+            )
+        )
+    seen: Dict[str, str] = {}
+    for cid in CHUNK_IDS:
+        urls = manifests[cid]
+        for u in urls:
+            if u in seen:
+                raise ChunkManifestError(
+                    "duplicate URL {!r} in chunks {!r} and {!r}".format(
+                        u, seen[u], cid
+                    )
+                )
+            seen[u] = cid
+            if not _DAILY_RE.match(u):
+                raise ChunkManifestError(
+                    "chunk {!r} contains non-daily unit: {!r}".format(cid, u)
+                )
+            if u >= "2023-01-01":
+                raise ChunkManifestError(
+                    "chunk {!r} contains 2023+ date: {!r}".format(cid, u)
+                )
+    union = set(seen.keys())
+    full = set(full_fetch_set)
+    missing = sorted(full - union)
+    extra = sorted(union - full)
+    if missing or extra:
+        raise ChunkManifestError(
+            "union != full fetch set: missing_from_union={}, "
+            "extra_in_union={}".format(missing, extra)
+        )
+
+
+def is_allowed_chunk_output_basename(basename: str) -> bool:
+    """Return True iff basename is on the per-chunk artifact allow-list
+    and contains no path-traversal characters."""
+    if "/" in basename or "\\" in basename or ".." in basename:
+        return False
+    return basename in ALLOWED_CHUNK_OUTPUT_BASENAMES
+
+
+def _checked_chunk_output_path(output_dir: str, basename: str) -> str:
+    """Pre-write gate for per-chunk artifacts."""
+    if not is_allowed_chunk_output_basename(basename):
+        raise FullBuildBoundaryBreach(
+            "non-allow-listed chunk output: {!r}".format(basename)
+        )
+    return os.path.join(output_dir, basename)
+
+
+def _assert_chunk_outputs_allowed(output_dir: str) -> None:
+    """Post-hoc tripwire for per-chunk output directories."""
+    for name in sorted(os.listdir(output_dir)):
+        full = os.path.join(output_dir, name)
+        if os.path.isdir(full):
+            raise FullBuildBoundaryBreach(
+                "unexpected subdirectory in chunk output dir: {!r}".format(name)
+            )
+        if not is_allowed_chunk_output_basename(name):
+            raise FullBuildBoundaryBreach(
+                "non-allow-listed file in chunk output dir: {!r}".format(name)
+            )
+
+
+def _fresh_chunk_output_dir(
+    repo_root: str, chunk_id: str, timestamp_utc: str,
+) -> str:
+    """Create `results/lane2_gdelt1_full_daily_count_build/<chunk_id>_<ts>/`.
+
+    Uses `os.makedirs(..., exist_ok=False)` so any collision is hard-fail
+    (chunk-design memo §12 "no successful chunk may be overwritten").
+    """
+    validate_chunk_id(chunk_id)
+    parent = os.path.join(
+        repo_root, "results", "lane2_gdelt1_full_daily_count_build",
+    )
+    os.makedirs(parent, exist_ok=True)
+    path = os.path.join(parent, "{}_{}".format(chunk_id, timestamp_utc))
+    os.makedirs(path, exist_ok=False)
+    return path
+
+
+_CHUNK_CONTRIBUTIONS_COLUMNS: Tuple[str, ...] = (
+    "civil_date",
+    "chunk_id",
+    "rows_from_offset_0",
+    "rows_from_offset_minus_1",
+    "rows_from_offset_minus_7",
+    "rows_from_offset_minus_30",
+    "rows_from_offset_minus_365",
+    "rows_from_offset_minus_3650",
+    "rows_from_offset_plus_1",
+    "total_rows",
+)
+
+
+def write_chunk_contributions_csv(
+    output_dir: str, chunk_id: str,
+    sqldate_offset_counts: Dict[Tuple[str, int], int],
+) -> str:
+    """Write `chunk_contributions.csv`: per-in-window-SQLDATE per-offset
+    contributions tagged with `chunk_id`.
+
+    Out-of-window SQLDATEs (e.g., the T-3650 routing per §10.2 of `7780a97`)
+    are NOT written here; they go into chunk_metadata.json's
+    out_of_window_sqldate_diagnostic section.
+    """
+    path = _checked_chunk_output_path(output_dir, "chunk_contributions.csv")
+    per_sqldate: Dict[str, Dict[int, int]] = {}
+    for (iso, offset), cnt in sqldate_offset_counts.items():
+        per_sqldate.setdefault(iso, {})[offset] = cnt
+    lines = [",".join(_CHUNK_CONTRIBUTIONS_COLUMNS)]
+    for iso in sorted(per_sqldate.keys()):
+        cells = per_sqldate[iso]
+        total = sum(cells.values())
+        row = [
+            iso, chunk_id,
+            str(cells.get(0, 0)),
+            str(cells.get(-1, 0)),
+            str(cells.get(-7, 0)),
+            str(cells.get(-30, 0)),
+            str(cells.get(-365, 0)),
+            str(cells.get(-3650, 0)),
+            str(cells.get(1, 0)),
+            str(total),
+        ]
+        lines.append(",".join(row))
+    body = "\n".join(lines) + "\n"
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    return path
+
+
+def write_chunk_metadata_json(
+    output_dir: str, metadata: Dict[str, Any],
+) -> str:
+    """Write `chunk_metadata.json` (deterministic via sort_keys)."""
+    path = _checked_chunk_output_path(output_dir, "chunk_metadata.json")
+    body = json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    return path
+
+
+def write_chunk_summary_md(output_dir: str, text: str) -> str:
+    """Write `chunk_summary.md`."""
+    path = _checked_chunk_output_path(output_dir, "chunk_summary.md")
+    if not text.endswith("\n"):
+        text = text + "\n"
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return path
+
+
+def _write_chunk_halt_diagnostic(
+    output_dir: str, diagnostic: Dict[str, Any],
+) -> None:
+    """Write per-chunk `halt_diagnostic.json` on hard-fail
+    (per `c10ae74` Decision 2A)."""
+    try:
+        path = _checked_chunk_output_path(output_dir, "halt_diagnostic.json")
+        body = json.dumps(diagnostic, indent=2, sort_keys=True) + "\n"
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+    except Exception:
+        pass
+
+
+def render_chunk_summary(
+    chunk_id: str,
+    metadata: Dict[str, Any],
+) -> str:
+    """Human-readable summary for one chunk."""
+    aggregate = metadata.get("aggregate_metrics", {})
+    parts = [
+        "# Lane 2 full daily-count build chunk summary: {}".format(chunk_id),
+        "",
+        "- chunk_id: {}".format(chunk_id),
+        "- expected_file_count: {}".format(
+            EXPECTED_CHUNK_COUNTS.get(chunk_id, "unknown")
+        ),
+        "- actual_completed_file_count: {}".format(
+            aggregate.get("actual_completed_file_count", 0)
+        ),
+        "- total_in_window_rows: {}".format(
+            aggregate.get("total_in_window_rows", 0)
+        ),
+        "- total_out_of_window_rows: {}".format(
+            aggregate.get("total_out_of_window_rows", 0)
+        ),
+        "- per_offset_total: {}".format(
+            aggregate.get("per_offset_total", {})
+        ),
+        "- chunk_manifest_digest: {}".format(
+            metadata.get("chunk_manifest_digest", "")
+        ),
+    ]
+    return "\n".join(parts)
+
+
+def run_chunk_build(
+    chunk_id: str,
+    repo_root: str,
+    cli_flag: bool = False,
+    timestamp_utc: Optional[str] = None,
+    timeout: float = DEFAULT_READ_TIMEOUT,
+    opener: Optional[Callable] = None,
+) -> Dict[str, Any]:
+    """Execute one chunk's daily fetch set.
+
+    Same three-guard discipline as `run_full_daily_count_build`. Refusal
+    fires BEFORE recognized-list load, output dir creation, opener
+    construction, URL construction, or any fetch.
+
+    Writes per-chunk derived artifacts (`chunk_contributions.csv` +
+    `chunk_metadata.json` + `chunk_summary.md`) under
+    `results/lane2_gdelt1_full_daily_count_build/<chunk_id>_<ts>/`.
+
+    Does NOT write `daily_count.csv` / `build_metadata.json` /
+    `build_summary.md` (those are merge-step outputs, not chunk-step
+    outputs).
+    """
+    # 1. chunk_id validation BEFORE guard check (the chunk_id is the
+    #    operational primary key and an unknown id is a structural
+    #    contract violation, not a guard-gated execution attempt).
+    validate_chunk_id(chunk_id)
+
+    # 2. Three-guard refusal — applies BEFORE any side effect.
+    if not _guards_ok(cli_flag):
+        print(_REFUSAL, file=sys.stderr)
+        raise SystemExit(2)
+
+    if timestamp_utc is None:
+        timestamp_utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    # 3. Load recognized list + reconciliation (mirrors full-build path).
+    capture_data, sha256, byte_size = _load_recognized_list(repo_root)
+    units = capture_data["recognized_in_window_units"]
+    reconciliation = build_reconciliation_report(units)
+    assert_reconciliation_consistent(reconciliation)
+    fetch_set_full = reconciliation["fetch_set"]
+    daily_set: Set[str] = set(fetch_set_full)
+    gaps_set: Set[str] = set(KNOWN_SUBSTRATE_GAPS)
+
+    # 4. Construct chunk manifest + digest.
+    chunk_manifest = build_chunk_manifest(chunk_id, fetch_set_full)
+    digest = chunk_manifest_digest(chunk_manifest)
+
+    # 5. Fresh chunk output dir.
+    output_dir = _fresh_chunk_output_dir(
+        repo_root, chunk_id, timestamp_utc,
+    )
+
+    # 6. Opener.
+    if opener is None:
+        opener = _build_full_build_redirect_disabled_opener(timeout=timeout)
+
+    # 7. Aggregate per-chunk.
+    sqldate_offset_counts: Dict[Tuple[str, int], int] = {}
+    per_offset_total: Dict[int, int] = {off: 0 for off in EXPECTED_OFFSETS}
+    out_of_window_row_count = 0
+    out_of_window_distribution: Dict[str, Dict[str, int]] = {}
+    total_parsed_rows = 0
+    total_malformed_short = 0
+    total_unparseable_sqldate = 0
+    per_file_manifest: List[Dict[str, Any]] = []
+    started_at = datetime.now(timezone.utc).isoformat()
+    actual_completed = 0
+
+    try:
+        for iso in chunk_manifest:
+            nominal = date.fromisoformat(iso)
+            url = date_to_daily_url(nominal)
+            payload, payload_sha = _fetch_one_payload(
+                opener, url, timeout=timeout,
+            )
+            parse_result = parse_payload(payload, nominal)
+            del payload
+            per_file_manifest.append({
+                "url": url,
+                "nominal_date": iso,
+                "http_status": 200,
+                "http_status_class": "200_OK",
+                "payload_sha256": payload_sha,
+                "row_count": parse_result["row_count"],
+                "malformed_short_rows": parse_result["malformed_short_rows"],
+                "unparseable_sqldate_rows":
+                    parse_result["unparseable_sqldate_rows"],
+                "header_anomaly_detected":
+                    parse_result["header_anomaly_detected"],
+                "out_of_window_row_count":
+                    parse_result["out_of_window_row_count"],
+                "per_offset_count": {
+                    str(k): v
+                    for k, v in parse_result["per_offset_count"].items()
+                },
+                "status": "fetched_and_parsed",
+            })
+            total_parsed_rows += parse_result["row_count"]
+            total_malformed_short += parse_result["malformed_short_rows"]
+            total_unparseable_sqldate += (
+                parse_result["unparseable_sqldate_rows"]
+            )
+            for off, cnt in parse_result["per_offset_count"].items():
+                per_offset_total[off] += cnt
+            for key, cnt in parse_result["sqldate_offset_counts"].items():
+                sqldate_offset_counts[key] = (
+                    sqldate_offset_counts.get(key, 0) + cnt
+                )
+            out_of_window_row_count += parse_result["out_of_window_row_count"]
+            for d_iso, dist in parse_result[
+                "out_of_window_sqldate_distribution"
+            ].items():
+                entry = out_of_window_distribution.setdefault(d_iso, {})
+                for ostr, cnt in dist.items():
+                    entry[ostr] = entry.get(ostr, 0) + cnt
+            actual_completed += 1
+    except (FullBuildBoundaryBreach, FetchFailure,
+            RecognizedListSchemaError, ReconciliationContradiction,
+            ChunkManifestError) as e:
+        _write_chunk_halt_diagnostic(output_dir, {
+            "halt_class": type(e).__name__,
+            "message": str(e),
+            "started_at_utc": started_at,
+            "halted_at_utc": datetime.now(timezone.utc).isoformat(),
+            "chunk_id": chunk_id,
+            "actual_completed_file_count": actual_completed,
+        })
+        raise
+
+    finished_at = datetime.now(timezone.utc).isoformat()
+
+    total_in_window_rows = sum(sqldate_offset_counts.values())
+    counted_total = (
+        total_in_window_rows
+        + out_of_window_row_count
+        + total_malformed_short
+        + total_unparseable_sqldate
+    )
+    if counted_total != total_parsed_rows:
+        raise FullBuildBoundaryBreach(
+            "chunk {!r} counting invariant violation: "
+            "in_window={} + out_of_window={} + malformed={} + "
+            "unparseable={} = {} != total_parsed={}".format(
+                chunk_id, total_in_window_rows, out_of_window_row_count,
+                total_malformed_short, total_unparseable_sqldate,
+                counted_total, total_parsed_rows,
+            )
+        )
+
+    metadata: Dict[str, Any] = {
+        "chunk_id": chunk_id,
+        "source_recognized_list_sha256": sha256,
+        "recognized_list_byte_size": byte_size,
+        "chunk_manifest_digest": digest,
+        "expected_file_count": EXPECTED_CHUNK_COUNTS[chunk_id],
+        "actual_completed_file_count": actual_completed,
+        "script_commit_anchor": "bc7b66b (+5962c20 chunk-design + this patch)",
+        "guard_state_after_run": {
+            "FULL_BUILD_AUTHORIZED_module_constant_at_completion":
+                FULL_BUILD_AUTHORIZED,
+        },
+        "started_at_utc": started_at,
+        "finished_at_utc": finished_at,
+        "no_retry_confirmation": True,
+        "boundary_declarations": _boundary_declarations(),
+        "per_file_manifest": per_file_manifest,
+        "substrate_gap_diagnostic": {
+            "known_substrate_gap_dates": list(KNOWN_SUBSTRATE_GAPS),
+            "substrate_gap_dates_not_fetched": list(KNOWN_SUBSTRATE_GAPS),
+        },
+        "out_of_window_sqldate_diagnostic": {
+            "total_out_of_window_rows": out_of_window_row_count,
+            "out_of_window_rows_excluded_from_chunk_contributions": True,
+            "per_sqldate_distribution": out_of_window_distribution,
+        },
+        "parser_anomaly_diagnostic": {
+            "total_malformed_short_rows": total_malformed_short,
+            "total_unparseable_sqldate_rows": total_unparseable_sqldate,
+        },
+        "output_allow_list": list(ALLOWED_CHUNK_OUTPUT_BASENAMES),
+        "aggregate_metrics": {
+            "total_parsed_rows": total_parsed_rows,
+            "total_in_window_rows": total_in_window_rows,
+            "total_out_of_window_rows": out_of_window_row_count,
+            "actual_completed_file_count": actual_completed,
+            "per_offset_total": {
+                str(k): v for k, v in per_offset_total.items()
+            },
+        },
+    }
+
+    csv_path = write_chunk_contributions_csv(
+        output_dir, chunk_id, sqldate_offset_counts,
+    )
+    json_path = write_chunk_metadata_json(output_dir, metadata)
+    md_path = write_chunk_summary_md(
+        output_dir, render_chunk_summary(chunk_id, metadata),
+    )
+
+    _assert_chunk_outputs_allowed(output_dir)
+
+    print(
+        "Chunk {} outputs written under: {}".format(chunk_id, output_dir),
+        file=sys.stdout,
+    )
+
+    return {
+        "chunk_id": chunk_id,
+        "output_dir": output_dir,
+        "chunk_contributions_csv_path": csv_path,
+        "chunk_metadata_json_path": json_path,
+        "chunk_summary_md_path": md_path,
+        "metadata": metadata,
+    }
+
+
+# ── Merge support (offline; no GDELT contact) ─────────────────────────────────
+
+def load_chunk_contributions(chunk_dir: str) -> Dict[Tuple[str, int], int]:
+    """Read `chunk_contributions.csv` from a chunk output dir into a
+    `(SQLDATE_iso, offset_int) -> count` dict. Raises ChunkManifestError
+    on missing file."""
+    path = os.path.join(chunk_dir, "chunk_contributions.csv")
+    if not os.path.isfile(path):
+        raise ChunkManifestError(
+            "chunk_contributions.csv missing in {}".format(chunk_dir)
+        )
+    out: Dict[Tuple[str, int], int] = {}
+    col_offset_map = {
+        "rows_from_offset_0": 0,
+        "rows_from_offset_minus_1": -1,
+        "rows_from_offset_minus_7": -7,
+        "rows_from_offset_minus_30": -30,
+        "rows_from_offset_minus_365": -365,
+        "rows_from_offset_minus_3650": -3650,
+        "rows_from_offset_plus_1": 1,
+    }
+    with open(path, "r", encoding="utf-8") as fh:
+        header = fh.readline().rstrip("\n").split(",")
+        for ln in fh:
+            row = ln.rstrip("\n").split(",")
+            if len(row) != len(header):
+                continue
+            iso = row[0]
+            for col_name, offset in col_offset_map.items():
+                if col_name not in header:
+                    continue
+                idx = header.index(col_name)
+                try:
+                    cnt = int(row[idx])
+                except ValueError:
+                    continue
+                if cnt > 0:
+                    out[(iso, offset)] = cnt
+    return out
+
+
+def load_chunk_metadata(chunk_dir: str) -> Dict[str, Any]:
+    """Read `chunk_metadata.json` from a chunk output dir.
+    Raises ChunkManifestError on missing file."""
+    path = os.path.join(chunk_dir, "chunk_metadata.json")
+    if not os.path.isfile(path):
+        raise ChunkManifestError(
+            "chunk_metadata.json missing in {}".format(chunk_dir)
+        )
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def merge_chunks(
+    chunk_dirs: Dict[str, str],
+    repo_root: str,
+) -> Dict[str, Any]:
+    """Merge per-chunk derived artifacts into the final canonical
+    aggregation. Reads the recognized-list capture from `repo_root` to
+    verify chunk-manifest digests against expected.
+
+    Returns a dict with:
+      - `daily_count_rows`: list of per-civil-date row dicts
+        (one per civil day in `[2013-04-01, 2022-12-31]`), with
+        merge-time coverage flags recomputed from the union `daily_set`
+        (preserving `c10ae74` Decision 1A's 7-entry closed flag domain).
+      - `aggregate_metrics`: totals (in-window, out-of-window, etc.).
+      - `per_chunk_summary`: per-chunk row counts.
+
+    Does NOT write canonical artifacts; the caller (merge-mode CLI
+    handler) writes them. Does NOT contact GDELT. Does NOT issue any
+    fetch.
+
+    Halts (raises ChunkManifestError) on:
+      - any required chunk missing;
+      - manifest-digest mismatch for any chunk;
+      - cross-chunk URL duplicate;
+      - union of chunks != recognized-list-derived full fetch set.
+    """
+    # Verify chunk set
+    expected = set(CHUNK_IDS)
+    actual = set(chunk_dirs.keys())
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    if missing:
+        raise ChunkManifestError(
+            "merge halt: missing chunks: {}".format(missing)
+        )
+    if extra:
+        raise ChunkManifestError(
+            "merge halt: unexpected chunk ids: {}".format(extra)
+        )
+
+    # Load recognized list (offline; no GDELT contact)
+    capture_data, _, _ = _load_recognized_list(repo_root)
+    units = capture_data["recognized_in_window_units"]
+    reconciliation = build_reconciliation_report(units)
+    assert_reconciliation_consistent(reconciliation)
+    fetch_set_full = reconciliation["fetch_set"]
+    daily_set: Set[str] = set(fetch_set_full)
+    gaps_set: Set[str] = set(KNOWN_SUBSTRATE_GAPS)
+
+    expected_manifests = build_all_chunk_manifests(fetch_set_full)
+    assert_chunk_manifests_partition(expected_manifests, fetch_set_full)
+
+    # Verify per-chunk manifest digests + cross-chunk URL uniqueness
+    seen_urls: Dict[str, str] = {}
+    per_chunk_summary: Dict[str, Dict[str, Any]] = {}
+    for cid in CHUNK_IDS:
+        md = load_chunk_metadata(chunk_dirs[cid])
+        expected_digest = chunk_manifest_digest(expected_manifests[cid])
+        actual_digest = md.get("chunk_manifest_digest")
+        if actual_digest != expected_digest:
+            raise ChunkManifestError(
+                "merge halt: chunk {!r} digest mismatch "
+                "(expected {}, got {})".format(
+                    cid, expected_digest, actual_digest,
+                )
+            )
+        for iso in expected_manifests[cid]:
+            if iso in seen_urls:
+                raise ChunkManifestError(
+                    "merge halt: duplicate URL {!r} in chunks "
+                    "{!r} and {!r}".format(iso, seen_urls[iso], cid)
+                )
+            seen_urls[iso] = cid
+        per_chunk_summary[cid] = {
+            "expected_file_count":
+                md.get("expected_file_count"),
+            "actual_completed_file_count":
+                md.get("actual_completed_file_count"),
+            "chunk_manifest_digest": actual_digest,
+        }
+
+    # Union-equals-full check (redundant given the digest+partition
+    # checks above, but explicit per chunk-design memo §9.1.5).
+    union = set(seen_urls.keys())
+    if union != daily_set:
+        raise ChunkManifestError(
+            "merge halt: union of chunks ({}) != recognized-list-derived "
+            "full daily fetch set ({})".format(len(union), len(daily_set))
+        )
+
+    # Sum SQLDATE contributions across chunks
+    merged: Dict[str, Dict[int, int]] = {}
+    for cid in CHUNK_IDS:
+        contribs = load_chunk_contributions(chunk_dirs[cid])
+        for (iso, offset), cnt in contribs.items():
+            cell = merged.setdefault(iso, {})
+            cell[offset] = cell.get(offset, 0) + cnt
+
+    # Build per-civil-date rows (restricted to [START_DATE, END_DATE])
+    rows: List[Dict[str, Any]] = []
+    for d in civil_date_domain():
+        iso = d.isoformat()
+        cells = merged.get(iso, {})
+        cov = coverage_for_date(d, daily_set, gaps_set)
+        row = {
+            "civil_date": iso,
+            "total_row_count": sum(cells.values()),
+            "rows_from_offset_0": cells.get(0, 0),
+            "rows_from_offset_minus_1": cells.get(-1, 0),
+            "rows_from_offset_minus_7": cells.get(-7, 0),
+            "rows_from_offset_minus_30": cells.get(-30, 0),
+            "rows_from_offset_minus_365": cells.get(-365, 0),
+            "rows_from_offset_minus_3650": cells.get(-3650, 0),
+            "rows_from_offset_plus_1": cells.get(1, 0),
+            "t0_file_status": t0_file_status(d, daily_set, gaps_set),
+            "expected_contributing_files_count":
+                cov["expected_contributing_files_count"],
+            "available_contributing_files_count":
+                cov["available_contributing_files_count"],
+            "coverage_quality_flag": cov["coverage_quality_flag"],
+            "coverage_completeness": cov["coverage_completeness"],
+        }
+        if not is_valid_coverage_flag(row["coverage_quality_flag"]):
+            raise FullBuildBoundaryBreach(
+                "merge halt: invalid coverage_quality_flag {!r} "
+                "for date {}".format(row["coverage_quality_flag"], iso)
+            )
+        rows.append(row)
+
+    # Aggregate metrics
+    total_in_window = sum(r["total_row_count"] for r in rows)
+
+    return {
+        "daily_count_rows": rows,
+        "aggregate_metrics": {
+            "total_in_window_rows": total_in_window,
+            "civil_days_in_output_domain": len(rows),
+            "chunks_merged": list(CHUNK_IDS),
+        },
+        "per_chunk_summary": per_chunk_summary,
+    }
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def _make_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=(
             "Lane 2 GDELT 1.0 full daily-count build runner "
-            "(design memo `7780a97`). Refuses to run unless all three "
-            "guards are satisfied."
+            "(design memo `7780a97`; chunk-design memo `5962c20`). "
+            "Refuses to run live unless all three guards are satisfied. "
+            "Supports yearly fetch-file-date chunk execution and "
+            "offline merge."
         ),
     )
     ap.add_argument(
@@ -1514,7 +2272,8 @@ def _make_argparser() -> argparse.ArgumentParser:
         help=(
             "CLI guard 2/3. Must be passed alongside the module-constant "
             "guard (FULL_BUILD_AUTHORIZED=True) AND env "
-            "LANE2_FULL_BUILD_AUTHORIZED=1 to execute the build."
+            "LANE2_FULL_BUILD_AUTHORIZED=1 to execute any live fetch "
+            "(un-chunked full build OR a single chunk)."
         ),
     )
     ap.add_argument(
@@ -1525,12 +2284,94 @@ def _make_argparser() -> argparse.ArgumentParser:
             "and the results/ output parent. Defaults to CWD."
         ),
     )
+    ap.add_argument(
+        "--chunk-id",
+        default=None,
+        choices=list(CHUNK_IDS) + [None],
+        help=(
+            "If set, executes only the named yearly fetch-file-date "
+            "chunk (under the same three-guard discipline). One of: {}. "
+            "Mutually exclusive with --merge.".format(", ".join(CHUNK_IDS))
+        ),
+    )
+    ap.add_argument(
+        "--list-chunks",
+        action="store_true",
+        help=(
+            "Print canonical chunk IDs and expected file counts and "
+            "exit. Offline; no guard / network required."
+        ),
+    )
+    ap.add_argument(
+        "--merge",
+        action="store_true",
+        help=(
+            "Run the offline merge step. Requires --merge-input flags "
+            "specifying chunk output directories. No GDELT contact; no "
+            "guard flip required. Mutually exclusive with --chunk-id."
+        ),
+    )
+    ap.add_argument(
+        "--merge-input",
+        action="append",
+        default=[],
+        metavar="CHUNK_ID=DIR",
+        help=(
+            "Repeatable. One per chunk; binds a chunk_id to its output "
+            "directory for merge."
+        ),
+    )
     return ap
+
+
+def _parse_merge_inputs(merge_inputs: List[str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for spec in merge_inputs:
+        if "=" not in spec:
+            raise ChunkManifestError(
+                "invalid --merge-input {!r}; expected CHUNK_ID=DIR".format(spec)
+            )
+        cid, _, dir_ = spec.partition("=")
+        cid = cid.strip()
+        dir_ = dir_.strip()
+        validate_chunk_id(cid)
+        if cid in out:
+            raise ChunkManifestError(
+                "duplicate --merge-input for chunk_id {!r}".format(cid)
+            )
+        out[cid] = dir_
+    return out
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _make_argparser().parse_args(argv)
+    if args.list_chunks:
+        for cid in CHUNK_IDS:
+            print("{}\t{}".format(cid, EXPECTED_CHUNK_COUNTS[cid]))
+        return 0
+    if args.chunk_id and args.merge:
+        print(
+            "HALT: --chunk-id and --merge are mutually exclusive.",
+            file=sys.stderr,
+        )
+        return 1
     try:
+        if args.merge:
+            chunk_dirs = _parse_merge_inputs(args.merge_input)
+            merge_chunks(chunk_dirs, repo_root=args.repo_root)
+            print(
+                "Merge complete (in-memory only; CLI does not "
+                "write canonical artifacts in this implementation turn).",
+                file=sys.stdout,
+            )
+            return 0
+        if args.chunk_id:
+            run_chunk_build(
+                args.chunk_id,
+                repo_root=args.repo_root,
+                cli_flag=args.authorize_full_build_run,
+            )
+            return 0
         run_full_daily_count_build(
             repo_root=args.repo_root,
             cli_flag=args.authorize_full_build_run,
@@ -1538,8 +2379,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     except SystemExit:
         raise
     except (FullBuildBoundaryBreach, FetchFailure,
-            RecognizedListSchemaError,
-            ReconciliationContradiction) as e:
+            RecognizedListSchemaError, ReconciliationContradiction,
+            ChunkManifestError) as e:
         print("HALT: {}: {}".format(type(e).__name__, e), file=sys.stderr)
         return 1
     return 0

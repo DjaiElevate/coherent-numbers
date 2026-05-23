@@ -1496,3 +1496,600 @@ def test_reconciliation_catches_real_capture_fetch_set_matches():
     # The first and last fetch_set entries should be the window boundaries
     assert report["fetch_set"][0] == "2013-04-01"
     assert report["fetch_set"][-1] == "2022-12-31"
+
+
+# ============================================================================
+# Chunk-design tests (per `5962c20` chunk-design memo)
+# ============================================================================
+
+CANONICAL_CHUNK_IDS = (
+    "chunk_2013_partial",
+    "chunk_2014",
+    "chunk_2015",
+    "chunk_2016",
+    "chunk_2017",
+    "chunk_2018",
+    "chunk_2019",
+    "chunk_2020",
+    "chunk_2021",
+    "chunk_2022",
+)
+
+CANONICAL_CHUNK_COUNTS = {
+    "chunk_2013_partial": 275,
+    "chunk_2014": 361,
+    "chunk_2015": 365,
+    "chunk_2016": 366,
+    "chunk_2017": 365,
+    "chunk_2018": 365,
+    "chunk_2019": 365,
+    "chunk_2020": 366,
+    "chunk_2021": 365,
+    "chunk_2022": 365,
+}
+
+
+def _real_fetch_set():
+    m = _load_runner()
+    data, _, _ = m._load_recognized_list(REPO_ROOT)
+    report = m.build_reconciliation_report(
+        data["recognized_in_window_units"]
+    )
+    return report["fetch_set"]
+
+
+# ── Chunk constants ──────────────────────────────────────────────────────────
+
+def test_chunk_ids_are_exactly_the_10_canonical_ids():
+    m = _load_runner()
+    assert m.CHUNK_IDS == CANONICAL_CHUNK_IDS
+    assert len(m.CHUNK_IDS) == 10
+
+
+def test_chunk_counts_match_canonical_table():
+    m = _load_runner()
+    assert dict(m.EXPECTED_CHUNK_COUNTS) == CANONICAL_CHUNK_COUNTS
+
+
+def test_chunk_count_total_is_3558():
+    m = _load_runner()
+    total = sum(m.EXPECTED_CHUNK_COUNTS.values())
+    assert total == 3558
+    assert total == m.NAIVE_EXPECTED_DAILY_URLS
+
+
+def test_chunk_year_ranges_cover_2013_04_01_to_2022_12_31():
+    m = _load_runner()
+    for cid, (start, end) in m.CHUNK_YEAR_RANGES.items():
+        assert start.year == end.year, "chunk {} crosses year boundary".format(cid)
+    # First chunk starts at window left edge
+    assert m.CHUNK_YEAR_RANGES["chunk_2013_partial"][0] == date(2013, 4, 1)
+    # Last chunk ends at window right edge
+    assert m.CHUNK_YEAR_RANGES["chunk_2022"][1] == date(2022, 12, 31)
+
+
+# ── Chunk manifest construction ──────────────────────────────────────────────
+
+def test_build_chunk_manifest_returns_correct_count_for_each_chunk():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    for cid in m.CHUNK_IDS:
+        manifest = m.build_chunk_manifest(cid, fs)
+        assert len(manifest) == CANONICAL_CHUNK_COUNTS[cid], \
+            "chunk {} count mismatch".format(cid)
+
+
+def test_build_chunk_manifest_rejects_unknown_chunk_id():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    with pytest.raises(m.ChunkManifestError):
+        m.build_chunk_manifest("chunk_2099", fs)
+    with pytest.raises(m.ChunkManifestError):
+        m.build_chunk_manifest("garbage", fs)
+
+
+def test_chunk_manifest_count_mismatch_hard_fails():
+    m = _load_runner()
+    # Pass a truncated fetch_set; the chunk filter will produce fewer
+    # entries than expected, triggering the count-mismatch hard-fail.
+    truncated = ["2013-04-01", "2013-04-02"]
+    with pytest.raises(m.ChunkManifestError):
+        m.build_chunk_manifest("chunk_2013_partial", truncated)
+
+
+def test_build_all_chunk_manifests_returns_all_10():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    manifests = m.build_all_chunk_manifests(fs)
+    assert set(manifests.keys()) == set(m.CHUNK_IDS)
+    assert sum(len(v) for v in manifests.values()) == 3558
+
+
+# ── Manifest digest ──────────────────────────────────────────────────────────
+
+def test_chunk_manifest_digest_is_deterministic():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    manifest = m.build_chunk_manifest("chunk_2015", fs)
+    d1 = m.chunk_manifest_digest(manifest)
+    d2 = m.chunk_manifest_digest(list(reversed(manifest)))
+    assert d1 == d2, "digest must be order-independent (sorts internally)"
+    assert len(d1) == 64  # SHA-256 hex
+
+
+def test_chunk_manifest_digest_differs_across_chunks():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    digests = set()
+    for cid in m.CHUNK_IDS:
+        digests.add(m.chunk_manifest_digest(m.build_chunk_manifest(cid, fs)))
+    assert len(digests) == 10
+
+
+# ── Partition validation ─────────────────────────────────────────────────────
+
+def test_chunk_manifests_are_disjoint():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    manifests = m.build_all_chunk_manifests(fs)
+    seen = set()
+    for cid, urls in manifests.items():
+        for u in urls:
+            assert u not in seen, \
+                "URL {!r} appears in {!r} and earlier chunk".format(u, cid)
+            seen.add(u)
+
+
+def test_chunk_manifests_union_equals_full_fetch_set():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    manifests = m.build_all_chunk_manifests(fs)
+    union = set(u for urls in manifests.values() for u in urls)
+    assert union == set(fs)
+
+
+def test_assert_chunk_manifests_partition_passes_for_canonical_split():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    manifests = m.build_all_chunk_manifests(fs)
+    m.assert_chunk_manifests_partition(manifests, fs)  # should not raise
+
+
+def test_assert_chunk_manifests_partition_rejects_2023_plus_dates():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    manifests = m.build_all_chunk_manifests(fs)
+    # Inject a 2023+ date into one chunk
+    manifests["chunk_2022"] = manifests["chunk_2022"] + ["2023-01-01"]
+    with pytest.raises(m.ChunkManifestError):
+        m.assert_chunk_manifests_partition(manifests, fs + ["2023-01-01"])
+
+
+def test_assert_chunk_manifests_partition_rejects_yearly_units():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    manifests = m.build_all_chunk_manifests(fs)
+    # Inject a yearly unit into one chunk
+    manifests["chunk_2015"] = manifests["chunk_2015"] + ["2015"]
+    with pytest.raises(m.ChunkManifestError):
+        m.assert_chunk_manifests_partition(manifests, fs + ["2015"])
+
+
+def test_assert_chunk_manifests_partition_rejects_monthly_units():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    manifests = m.build_all_chunk_manifests(fs)
+    manifests["chunk_2015"] = manifests["chunk_2015"] + ["2015-06"]
+    with pytest.raises(m.ChunkManifestError):
+        m.assert_chunk_manifests_partition(manifests, fs + ["2015-06"])
+
+
+def test_assert_chunk_manifests_partition_rejects_duplicate_url():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    manifests = m.build_all_chunk_manifests(fs)
+    # Move a 2015 URL into 2016 manifest as well, producing duplicate
+    dup = manifests["chunk_2015"][0]
+    manifests["chunk_2016"] = manifests["chunk_2016"] + [dup]
+    with pytest.raises(m.ChunkManifestError):
+        m.assert_chunk_manifests_partition(manifests, fs)
+
+
+def test_assert_chunk_manifests_partition_rejects_missing_chunk():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    manifests = m.build_all_chunk_manifests(fs)
+    del manifests["chunk_2015"]
+    with pytest.raises(m.ChunkManifestError):
+        m.assert_chunk_manifests_partition(manifests, fs)
+
+
+# ── 2014 substrate gaps handled as recognized-list absence ───────────────────
+
+def test_chunk_2014_excludes_known_substrate_gaps():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    manifest = m.build_chunk_manifest("chunk_2014", fs)
+    for gap in m.KNOWN_SUBSTRATE_GAPS:
+        assert gap not in manifest, \
+            "gap {!r} must not be in chunk_2014 manifest".format(gap)
+    # Count is 365 - 4 = 361
+    assert len(manifest) == 361
+
+
+# ── Allow-list and output path gating ────────────────────────────────────────
+
+def test_chunk_output_allow_list_is_four_entries():
+    m = _load_runner()
+    assert m.ALLOWED_CHUNK_OUTPUT_BASENAMES == (
+        "chunk_contributions.csv",
+        "chunk_metadata.json",
+        "chunk_summary.md",
+        "halt_diagnostic.json",
+    )
+
+
+def test_is_allowed_chunk_output_basename_rejects_payload_zip():
+    m = _load_runner()
+    assert not m.is_allowed_chunk_output_basename("payload_20180615.zip")
+
+
+def test_is_allowed_chunk_output_basename_rejects_extracted_csv():
+    m = _load_runner()
+    assert not m.is_allowed_chunk_output_basename("20180615.export.CSV")
+
+
+def test_is_allowed_chunk_output_basename_rejects_path_traversal():
+    m = _load_runner()
+    assert not m.is_allowed_chunk_output_basename("../secret")
+    assert not m.is_allowed_chunk_output_basename("/etc/passwd")
+    assert not m.is_allowed_chunk_output_basename("..\\secret")
+
+
+def test_is_allowed_chunk_output_basename_rejects_canonical_full_build_names():
+    """daily_count.csv / build_metadata.json / build_summary.md are
+    merge-step outputs, NOT chunk-step outputs."""
+    m = _load_runner()
+    assert not m.is_allowed_chunk_output_basename("daily_count.csv")
+    assert not m.is_allowed_chunk_output_basename("build_metadata.json")
+    assert not m.is_allowed_chunk_output_basename("build_summary.md")
+
+
+# ── Guard discipline for chunk execution ─────────────────────────────────────
+
+def test_run_chunk_build_refuses_when_guards_off(monkeypatch, tmp_path):
+    m = _load_runner()
+    monkeypatch.delenv("LANE2_FULL_BUILD_AUTHORIZED", raising=False)
+    # Pre-validate the chunk_id is accepted by validate_chunk_id
+    m.validate_chunk_id("chunk_2018")
+    with pytest.raises(SystemExit):
+        m.run_chunk_build(
+            "chunk_2018", str(tmp_path), cli_flag=False,
+        )
+
+
+def test_run_chunk_build_refuses_when_only_module_constant_missing(monkeypatch, tmp_path):
+    m = _load_runner()
+    monkeypatch.setattr(m, "FULL_BUILD_AUTHORIZED", False)
+    monkeypatch.setenv("LANE2_FULL_BUILD_AUTHORIZED", "1")
+    with pytest.raises(SystemExit):
+        m.run_chunk_build("chunk_2018", str(tmp_path), cli_flag=True)
+
+
+def test_run_chunk_build_refuses_unknown_chunk_id(tmp_path):
+    m = _load_runner()
+    # Should raise ChunkManifestError BEFORE guard refusal
+    # (chunk_id validation happens before guard check in run_chunk_build).
+    with pytest.raises(m.ChunkManifestError):
+        m.run_chunk_build("chunk_2099", str(tmp_path), cli_flag=False)
+
+
+def test_run_chunk_build_refuses_before_any_side_effect(tmp_path, monkeypatch):
+    m = _load_runner()
+    monkeypatch.delenv("LANE2_FULL_BUILD_AUTHORIZED", raising=False)
+    with pytest.raises(SystemExit):
+        m.run_chunk_build("chunk_2018", str(tmp_path), cli_flag=False)
+    # No chunk output dir should exist
+    assert not (tmp_path / "results" / "lane2_gdelt1_full_daily_count_build").exists()
+
+
+def test_module_constant_still_false_after_chunk_patch():
+    """The chunk-runner patch must NOT flip the module guard.
+    Verified by re-loading the module fresh."""
+    m = _load_runner()
+    assert m.FULL_BUILD_AUTHORIZED is False
+
+
+# ── Per-chunk artifact writers + halt diagnostic ────────────────────────────
+
+def test_write_chunk_contributions_csv_writes_only_to_allow_list(tmp_path):
+    m = _load_runner()
+    counts = {
+        ("2015-06-15", 0): 100,
+        ("2015-06-15", -1): 5,
+        ("2015-06-14", -1): 3,
+    }
+    path = m.write_chunk_contributions_csv(
+        str(tmp_path), "chunk_2015", counts,
+    )
+    assert os.path.basename(path) == "chunk_contributions.csv"
+    text = open(path).read()
+    assert "civil_date" in text and "chunk_id" in text
+    assert "chunk_2015" in text
+    assert "2015-06-15" in text
+
+
+def test_write_chunk_metadata_json_deterministic(tmp_path):
+    m = _load_runner()
+    md = {"chunk_id": "chunk_2018", "z_key": 1, "a_key": 2}
+    path = m.write_chunk_metadata_json(str(tmp_path), md)
+    body = open(path).read()
+    # sort_keys=True
+    assert body.index("a_key") < body.index("chunk_id") < body.index("z_key")
+
+
+def test_chunk_halt_diagnostic_only_writable_via_allow_list(tmp_path):
+    m = _load_runner()
+    # Write a halt diagnostic
+    m._write_chunk_halt_diagnostic(
+        str(tmp_path),
+        {"halt_class": "Test", "message": "test halt"},
+    )
+    assert (tmp_path / "halt_diagnostic.json").exists()
+    # Tripwire accepts the allow-listed file
+    m._assert_chunk_outputs_allowed(str(tmp_path))
+
+
+def test_assert_chunk_outputs_allowed_rejects_unexpected_file(tmp_path):
+    m = _load_runner()
+    (tmp_path / "chunk_contributions.csv").write_text("col\n")
+    (tmp_path / "payload_2015_06_15.zip").write_bytes(b"\x00")
+    with pytest.raises(m.FullBuildBoundaryBreach):
+        m._assert_chunk_outputs_allowed(str(tmp_path))
+
+
+def test_assert_chunk_outputs_allowed_rejects_subdir(tmp_path):
+    m = _load_runner()
+    (tmp_path / "tmp").mkdir()
+    with pytest.raises(m.FullBuildBoundaryBreach):
+        m._assert_chunk_outputs_allowed(str(tmp_path))
+
+
+# ── Merge step (offline, deterministic) ──────────────────────────────────────
+
+def _build_synthetic_chunk_dirs(tmp_path, monkeypatch):
+    """Build 10 synthetic chunk output dirs whose contributions and
+    metadata reflect the canonical chunk manifests + digests."""
+    m = _load_runner()
+    fs = _real_fetch_set()
+    manifests = m.build_all_chunk_manifests(fs)
+    chunk_dirs = {}
+    for cid in m.CHUNK_IDS:
+        cdir = tmp_path / "results" / "lane2_gdelt1_full_daily_count_build" / cid
+        cdir.mkdir(parents=True, exist_ok=False)
+        # Synthetic contributions: each chunk contributes 10 rows at T=0
+        # for the first 3 dates in the chunk
+        counts = {}
+        for iso in manifests[cid][:3]:
+            counts[(iso, 0)] = 10
+        m.write_chunk_contributions_csv(str(cdir), cid, counts)
+        m.write_chunk_metadata_json(str(cdir), {
+            "chunk_id": cid,
+            "chunk_manifest_digest": m.chunk_manifest_digest(manifests[cid]),
+            "expected_file_count": m.EXPECTED_CHUNK_COUNTS[cid],
+            "actual_completed_file_count": m.EXPECTED_CHUNK_COUNTS[cid],
+        })
+        chunk_dirs[cid] = str(cdir)
+    return chunk_dirs
+
+
+def test_merge_chunks_halts_on_missing_chunk(tmp_path):
+    m = _load_runner()
+    chunk_dirs = _build_synthetic_chunk_dirs(tmp_path, None)
+    del chunk_dirs["chunk_2015"]
+    with pytest.raises(m.ChunkManifestError, match="missing"):
+        m.merge_chunks(chunk_dirs, REPO_ROOT)
+
+
+def test_merge_chunks_halts_on_unexpected_chunk_id(tmp_path):
+    m = _load_runner()
+    chunk_dirs = _build_synthetic_chunk_dirs(tmp_path, None)
+    # Add a chunk_2099 entry (invalid)
+    # Since validate_chunk_id is called inside merge for the actual ids,
+    # we test via direct mutation:
+    chunk_dirs["chunk_2099_fake"] = str(tmp_path)
+    with pytest.raises(m.ChunkManifestError):
+        m.merge_chunks(chunk_dirs, REPO_ROOT)
+
+
+def test_merge_chunks_halts_on_manifest_digest_mismatch(tmp_path):
+    m = _load_runner()
+    chunk_dirs = _build_synthetic_chunk_dirs(tmp_path, None)
+    # Corrupt one chunk's metadata digest
+    cdir = chunk_dirs["chunk_2018"]
+    md = m.load_chunk_metadata(cdir)
+    md["chunk_manifest_digest"] = "0" * 64
+    m.write_chunk_metadata_json(cdir, md)
+    with pytest.raises(m.ChunkManifestError, match="digest mismatch"):
+        m.merge_chunks(chunk_dirs, REPO_ROOT)
+
+
+def test_merge_chunks_succeeds_on_canonical_inputs(tmp_path):
+    m = _load_runner()
+    chunk_dirs = _build_synthetic_chunk_dirs(tmp_path, None)
+    result = m.merge_chunks(chunk_dirs, REPO_ROOT)
+    # 3,562 civil days
+    assert len(result["daily_count_rows"]) == 3562
+    # Each chunk contributed 10 rows × 3 dates = 30
+    assert result["aggregate_metrics"]["total_in_window_rows"] == 30 * 10
+
+
+def test_merge_chunks_clips_to_civil_window():
+    m = _load_runner()
+    # merge_chunks's output is always restricted to civil_date_domain()
+    # = 3,562 days. Verified above. Also verify domain boundaries:
+    domain = m.civil_date_domain()
+    assert domain[0].isoformat() == "2013-04-01"
+    assert domain[-1].isoformat() == "2022-12-31"
+    assert len(domain) == 3562
+
+
+def test_merge_chunks_output_is_deterministic_regardless_of_chunk_order(tmp_path):
+    m = _load_runner()
+    chunk_dirs = _build_synthetic_chunk_dirs(tmp_path, None)
+    result1 = m.merge_chunks(chunk_dirs, REPO_ROOT)
+    # Reverse the dict order
+    reversed_dirs = dict(reversed(list(chunk_dirs.items())))
+    result2 = m.merge_chunks(reversed_dirs, REPO_ROOT)
+    # daily_count_rows must be identical
+    assert result1["daily_count_rows"] == result2["daily_count_rows"]
+    assert result1["aggregate_metrics"] == result2["aggregate_metrics"]
+
+
+# ── Cross-chunk coverage rule ────────────────────────────────────────────────
+
+def test_cross_chunk_coverage_computed_at_merge_time_d_2015_01_01(tmp_path):
+    """For d = 2015-01-01, the T+1 contributor f_(2014-12-31) belongs to
+    chunk_2014 while the output SQLDATE belongs to 2015. The merge step's
+    coverage_for_date must use the union daily_set so this contributor
+    is recognized."""
+    m = _load_runner()
+    daily_set = set(_real_fetch_set())
+    gaps_set = set(m.KNOWN_SUBSTRATE_GAPS)
+    cov = m.coverage_for_date(date(2015, 1, 1), daily_set, gaps_set)
+    # d = 2015-01-01 is the pre-2015 T+1 era cutoff date; expected cone
+    # size = 6 (includes T+1)
+    assert cov["expected_contributing_files_count"] == 6
+    # All 6 cone members should be in the union daily_set: T=0 (2015-01-01),
+    # T-1 (2015-01-02), T-7 (2015-01-08), T-30 (2015-01-31),
+    # T-365 (2016-01-01), T+1 (2014-12-31). All in-universe.
+    assert cov["available_contributing_files_count"] == 6
+    assert cov["coverage_quality_flag"] == "full"
+
+
+def test_coverage_domain_includes_t_minus_n_neighbor_substrate_gap():
+    m = _load_runner()
+    assert "t_minus_n_neighbor_substrate_gap" in m.COVERAGE_SINGLE_FLAGS
+
+
+def test_plus_joined_multi_cause_flag_remains_valid():
+    """`c10ae74` Decision 1A + `bc7b66b` implementation reality:
+    multi-cause coverage flags are `+`-joined ordered concatenations."""
+    m = _load_runner()
+    assert m.is_valid_coverage_flag(
+        "t0_absent_substrate_gap+t_plus_1_neighbor_substrate_gap"
+    )
+    assert m.is_valid_coverage_flag(
+        "t0_absent_substrate_gap+t_minus_n_neighbor_substrate_gap"
+    )
+
+
+# ── No raw payload preservation, no retry ────────────────────────────────────
+
+def test_runner_source_still_has_no_retry_logic_after_chunk_patch():
+    src = _runner_source()
+    forbidden = ["max_retries", "retry_count", "backoff_factor",
+                 "should_retry", "_retry_fetch"]
+    for tok in forbidden:
+        assert tok not in src, "forbidden retry token: {}".format(tok)
+
+
+def test_runner_source_still_has_no_payload_preservation_after_chunk_patch():
+    src = _runner_source()
+    # `del payload` is the per-URL discard signal
+    assert "del payload" in src
+    # No `preserve_payloads` flag should exist
+    import re
+    assert not re.search(r"\bpreserve_payloads\b", src)
+
+
+# ── No 2023+ leakage in chunk paths ──────────────────────────────────────────
+
+def test_chunk_manifests_contain_no_2023_plus_dates():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    manifests = m.build_all_chunk_manifests(fs)
+    for cid, urls in manifests.items():
+        for u in urls:
+            assert u < "2023-01-01", \
+                "chunk {} contains 2023+ date {}".format(cid, u)
+
+
+def test_chunk_manifests_contain_no_yearly_or_monthly_units():
+    m = _load_runner()
+    fs = _real_fetch_set()
+    manifests = m.build_all_chunk_manifests(fs)
+    for cid, urls in manifests.items():
+        for u in urls:
+            assert m._DAILY_RE.match(u), \
+                "chunk {} contains non-daily unit {}".format(cid, u)
+
+
+# ── List-chunks CLI mode ─────────────────────────────────────────────────────
+
+def test_list_chunks_outputs_10_lines(capsys):
+    m = _load_runner()
+    rc = m.main(["--list-chunks"])
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    lines = [ln for ln in out.strip().split("\n") if ln.strip()]
+    assert len(lines) == 10
+    for line, cid in zip(lines, m.CHUNK_IDS):
+        assert line.startswith(cid)
+
+
+# ── Merge CLI input parsing ──────────────────────────────────────────────────
+
+def test_parse_merge_inputs_accepts_valid_specs():
+    m = _load_runner()
+    parsed = m._parse_merge_inputs([
+        "chunk_2013_partial=/tmp/a",
+        "chunk_2014=/tmp/b",
+    ])
+    assert parsed == {
+        "chunk_2013_partial": "/tmp/a",
+        "chunk_2014": "/tmp/b",
+    }
+
+
+def test_parse_merge_inputs_rejects_unknown_chunk_id():
+    m = _load_runner()
+    with pytest.raises(m.ChunkManifestError):
+        m._parse_merge_inputs(["chunk_2099=/tmp/x"])
+
+
+def test_parse_merge_inputs_rejects_duplicate_chunk_id():
+    m = _load_runner()
+    with pytest.raises(m.ChunkManifestError):
+        m._parse_merge_inputs([
+            "chunk_2015=/tmp/a", "chunk_2015=/tmp/b",
+        ])
+
+
+def test_parse_merge_inputs_rejects_malformed_spec():
+    m = _load_runner()
+    with pytest.raises(m.ChunkManifestError):
+        m._parse_merge_inputs(["chunk_2015"])  # missing =DIR
+
+
+# ── Halt diagnostic content shape ────────────────────────────────────────────
+
+def test_chunk_halt_diagnostic_is_derived_only(tmp_path):
+    m = _load_runner()
+    m._write_chunk_halt_diagnostic(
+        str(tmp_path),
+        {
+            "halt_class": "FetchFailure",
+            "message": "HTTP 500 for ...",
+            "started_at_utc": "2026-05-23T10:00:00+00:00",
+            "halted_at_utc": "2026-05-23T10:00:05+00:00",
+            "chunk_id": "chunk_2018",
+            "actual_completed_file_count": 42,
+        },
+    )
+    diag = json.load(open(tmp_path / "halt_diagnostic.json"))
+    # No raw payload, no extracted CSV, no SQLDATE values
+    assert "payload" not in str(diag).lower()
+    assert "sqldate" not in str(diag).lower()
+    assert ".csv" not in str(diag).lower()
+    assert diag["halt_class"] == "FetchFailure"
