@@ -1,0 +1,1549 @@
+"""Standalone Lane 2 GDELT 1.0 full daily-count build runner.
+
+Authorization basis: full-build design memo
+`docs/lane2_gdelt1_full_daily_count_build_design_memo_v0.1.md`
+(commit `7780a97`). The design memo authorizes neither source addition
+nor execution; this implementation step (the present file + the paired
+tests file) is the authorized source-addition step. The script ships
+inert; execution requires its own separate authorization step that flips
+the guard.
+
+THIS RUNNER DOES NOT RUN BY DEFAULT AND PERFORMS NO DATA ACCESS UNLESS
+THREE INDEPENDENT GUARDS ARE ALL SATISFIED:
+
+  1. module constant FULL_BUILD_AUTHORIZED is True (ships False);
+  2. CLI flag --authorize-full-build-run is passed;
+  3. env var LANE2_FULL_BUILD_AUTHORIZED == "1".
+
+If any guard is missing, the runner prints a refusal and exits BEFORE
+any network opener construction, URL construction, output directory
+creation, or artifact write.
+
+This script is **standalone**. It does NOT import the event-file probe
+runner, the row-date characterization runner, the count-feasibility
+runner, the count-feasibility source module, or Gate 4D's index-listing
+opener. It builds its own redirect-disabled opener (mirroring the prior
+Lane 2 runner pattern with script-local names) scoped only to the daily
+event-file URLs derived from the §10 recognized-list capture at SHA
+`84ea721e…fff835fc`.
+
+Scope: substrate-side daily attention row-count over the Lane 2
+daily-regime window 2013-04-01 through 2022-12-31, keyed by event date
+(SQLDATE). No market data, no Step 2, no asset/return logic, no
+category/theme/actor/geography/tone filtering, no spike/burst
+thresholds, no return-window logic, no signal-design choices, no claim
+about market predictiveness. No payload preservation after parsing
+(per memo §15.11): each fetched payload is hashed + parsed + discarded
+before the next URL is fetched.
+
+Eleven design decisions from `7780a97` are inherited verbatim:
+
+  A: §10 recognized-list capture is the sole input authority.
+  B: Output domain = full civil calendar [2013-04-01, 2022-12-31].
+  C: Raw event rows, no dedup, no filters, no weights.
+  D: Aggregate by SQLDATE only; per-file/per-offset diagnostics retained.
+  E: Out-of-window SQLDATEs excluded from primary series; diagnostic recorded.
+  F: Right-truncated counts with coverage_quality_flag + coverage_completeness.
+  G: Known substrate gaps as expected-absent diagnostics; gap SQLDATEs eligible
+     via neighbor contributions.
+  H: Three-guard exact-once live retrieval; no retries.
+  I: Hard-fail structural violations; reportable diagnostics elsewhere.
+  J: Derived artifacts only; no raw payload preservation; default untracked.
+  K: Future runner+test paths + 12 test categories.
+
+Structural T-3650 zero (memo §10.2) is accepted: T-3650 contribution
+is structurally zero for every in-window primary-series date under the
+no-2023+ posture; future Step 2 logic may not treat T-3650 as an
+available in-window signal feature unless a later explicit revision
+memo changes the no-2023+ posture or output window.
+
+No-2023+ posture (memo §11.1) is locked: no 2023+ URL construction,
+no post-2022 publishing files, no 2023+ SQLDATE acceptance, no lifting
+of the seal to fill coverage gaps, no post-2022 leakage. Lifting
+requires a separately authorized memo.
+
+Filtering by category/theme/actor/geography/tone is Step 2 /
+instrument-construction territory (memo §8 Option C) and is forbidden
+here; availability requires a future explicit revision memo that
+retires the no-market-data firewall and explicitly authorizes
+Step 2-style instrument-construction logic.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import re
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+import zipfile
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+
+# ── Module-level authorization guard ─────────────────────────────────────────
+#
+# Ships False. Flipping this is a separate, explicit run-enablement commit
+# under the future build-execution-authorization prompt. Mirrors prior
+# Lane 2 runners' guard patterns (count-feasibility, event-file probe,
+# row-date characterization).
+FULL_BUILD_AUTHORIZED = False
+
+
+# ── Substrate-pinned constants (no CLI / env / config override) ──────────────
+
+RECOGNIZED_LIST_PATH = (
+    "results/lane2_gdelt1_turn_b_recognized_list_capture/"
+    "20260521T124853Z/recognized_list.json"
+)
+
+# Expected SHA-256 of the recognized-list capture (Gate 4C / turn-b live
+# capture committed at `4015b97`). The runner asserts this at preflight.
+RECOGNIZED_LIST_SHA256 = (
+    "84ea721e14bd0ac11ad60d7657143d38b3c2b0db0c26383abb0e38dafff835fc"
+)
+
+EVENT_FILE_BASE_URL = "http://data.gdeltproject.org/events/"
+
+# Locked daily-regime window (memo §2 / §4).
+START_DATE = date(2013, 4, 1)
+END_DATE = date(2022, 12, 31)
+SEAL_START = date(2023, 1, 1)
+
+# Exact-integer offset taxonomy (memo §4.2 / §9). No tolerance windows.
+# Order is canonical: ascending offset value.
+EXPECTED_OFFSETS: Tuple[int, ...] = (-3650, -365, -30, -7, -1, 0, 1)
+
+# Known publishing-file substrate gaps from `a8a9dd2` §2 / §10 (memo §12).
+# These dates are excluded from the recognized-list capture by construction;
+# the runner does not fetch them.
+KNOWN_SUBSTRATE_GAPS: Tuple[str, ...] = (
+    "2014-01-23",
+    "2014-01-24",
+    "2014-01-25",
+    "2014-03-19",
+)
+
+# Era cutoff for the T+1 era cone (memo §11.3). The latest publishing file
+# confirmed to emit T+1 rows is `f_(2014-12-31)` per `858b501`; its T+1
+# rows have SQLDATE = 2015-01-01. Therefore civil dates <= 2015-01-01 are
+# treated as pre-2015 T+1 era for coverage purposes; dates >= 2015-01-02
+# are treated as post-2015 era (T+1 not in expected cone).
+T_PLUS_1_ERA_CUTOFF = date(2015, 1, 1)
+
+# Timeouts (memo §13.7). Connection 30s, read 60s. The runner halts on
+# any timeout (no retries; memo §13.4).
+DEFAULT_CONNECT_TIMEOUT = 30.0
+DEFAULT_READ_TIMEOUT = 60.0
+
+# Parser constants. GDELT 1.0 .export.CSV files are TAB-separated and
+# headerless positional; SQLDATE is column index 1 (memo §9 / `e55e09a`).
+SQLDATE_COLUMN_INDEX = 1
+
+# Civil-day arithmetic invariant (memo §6.8 reconciliation table).
+CIVIL_DAYS_IN_WINDOW = (END_DATE - START_DATE).days + 1  # 3562
+
+# Naive-expected daily URL count from the reconciliation table.
+NAIVE_EXPECTED_DAILY_URLS = (
+    CIVIL_DAYS_IN_WINDOW - len(KNOWN_SUBSTRATE_GAPS)
+)  # 3558
+
+
+# ── Output allow-list (memo §15.10 / Decision I §14.1) ───────────────────────
+#
+# Final-output basenames. Raw payload zips, extracted CSVs, and temp files
+# are NOT in the allow-list and trigger a hard-fail per Decision I.
+ALLOWED_OUTPUT_BASENAMES: Tuple[str, ...] = (
+    "daily_count.csv",
+    "build_metadata.json",
+    "build_summary.md",
+    "halt_diagnostic.json",
+)
+
+
+# ── Coverage flag closed domain (memo §11.3) ─────────────────────────────────
+
+COVERAGE_SINGLE_FLAGS: Tuple[str, ...] = (
+    "full",
+    "t0_absent_substrate_gap",
+    "right_truncated_2022_seal",
+    "left_truncated_2013_edge",
+    "t_plus_1_neighbor_substrate_gap",
+    # IMPLEMENTATION EXTENSION (documented finding; surfaced in metadata):
+    # The design memo §11.3 closed-domain table does NOT include a named
+    # flag for T-1 / T-7 / T-30 / T-365 substrate-gap absences (cases
+    # where the contributing publishing file at d+n is one of the four
+    # known substrate-gap dates `2014-01-23/-24/-25/2014-03-19`).
+    # This occurs in production at ~12 in-window dates near the early-
+    # 2014 substrate-gap region. The implementation extends the closed
+    # domain by ONE entry to handle these cases without silent
+    # repair / silent design change. The extension is explicit and
+    # surfaced in metadata.coverage_diagnostic.design_memo_extensions.
+    "t_minus_n_neighbor_substrate_gap",
+)
+
+# Numeric order for joining multi-cause flags (memo §11.3 numeric order
+# with the implementation extension inserted at position 6, before
+# `multiple` which is the categorical name for multi-cause concatenation):
+# 2 t0_absent_substrate_gap
+# 3 right_truncated_2022_seal
+# 4 left_truncated_2013_edge
+# 5 t_plus_1_neighbor_substrate_gap
+# 6 t_minus_n_neighbor_substrate_gap (implementation extension)
+_COVERAGE_FLAG_ORDER: Tuple[str, ...] = (
+    "t0_absent_substrate_gap",
+    "right_truncated_2022_seal",
+    "left_truncated_2013_edge",
+    "t_plus_1_neighbor_substrate_gap",
+    "t_minus_n_neighbor_substrate_gap",
+)
+
+
+# ── Refusal message ──────────────────────────────────────────────────────────
+
+_REFUSAL = (
+    "Lane 2 full daily-count build is NOT authorized. Requires "
+    "FULL_BUILD_AUTHORIZED=True AND --authorize-full-build-run AND env "
+    "LANE2_FULL_BUILD_AUTHORIZED=1. No network, no opener, no URL, no "
+    "directory, no fetch, no artifact write."
+)
+
+
+# ── Exception classes ────────────────────────────────────────────────────────
+
+class FullBuildRedirectBlocked(RuntimeError):
+    """Raised by the full-build redirect-disabled opener on any 3xx
+    response."""
+
+
+class FullBuildBoundaryBreach(RuntimeError):
+    """Raised when a hard boundary is hit (2023+ URL/SQLDATE, disallowed
+    output, unexpected offset, non-recognized URL, etc.)."""
+
+
+class RecognizedListSchemaError(RuntimeError):
+    """Raised when the recognized-list capture JSON has an unexpected
+    schema or fails SHA verification."""
+
+
+class ReconciliationContradiction(RuntimeError):
+    """Raised when the build-universe reconciliation finds a structural
+    contradiction with the design memo's locked counts."""
+
+
+class FetchFailure(RuntimeError):
+    """Raised when a fetch fails (HTTP non-200, redirect, connection
+    error, timeout) for an in-universe URL — hard-fail per Decision I."""
+
+
+# ── Local redirect-disabled opener (full-build-scoped) ───────────────────────
+#
+# Mirrors the prior Lane 2 redirect-disabled openers with script-local
+# names. Does NOT reuse the row-date characterization opener, the
+# event-file probe opener, or the Gate 4D index-listing opener. This
+# opener is used only for daily event-file URLs constructed from the §10
+# recognized-list capture's daily-classified in-window units.
+
+class _FullBuildNoFollowRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Redirect handler whose 3xx hooks raise rather than follow.
+
+    Overriding every 30x http_error_NNN hook makes the no-follow
+    property structural — every redirect status is intercepted — not a
+    runtime convention a caller could forget."""
+
+    def _block(self, req, fp, code, msg, headers):
+        raise FullBuildRedirectBlocked(
+            "full-build opener blocked redirect (status {!r}); "
+            "no follow, no fallback".format(code)
+        )
+
+    http_error_301 = _block
+    http_error_302 = _block
+    http_error_303 = _block
+    http_error_307 = _block
+    http_error_308 = _block
+
+
+def _build_full_build_redirect_disabled_opener(
+    timeout: float = DEFAULT_READ_TIMEOUT,
+) -> Callable:
+    """Build a callable opener with redirect-following disabled by
+    construction. Used only for in-universe daily event-file URLs.
+
+    The factory call fires no request; a single request occurs only when
+    the returned callable is invoked. Guards are not flipped.
+    """
+    _opener = urllib.request.build_opener(
+        _FullBuildNoFollowRedirectHandler()
+    )
+    _default_timeout = timeout
+
+    def _full_build_opener(url, timeout=_default_timeout):
+        # Exactly-once fetch per URL per run. No retry, no second GET,
+        # no fallback. The caller (`_fetch_one_payload`) consumes
+        # `.read()` once and discards the bytes before the next URL.
+        return _opener.open(url, timeout=timeout)
+
+    return _full_build_opener
+
+
+# ── Three-guard gate ─────────────────────────────────────────────────────────
+
+def _guards_ok(cli_flag: bool) -> bool:
+    return (
+        FULL_BUILD_AUTHORIZED
+        and cli_flag
+        and os.environ.get("LANE2_FULL_BUILD_AUTHORIZED") == "1"
+    )
+
+
+# ── Recognized-list loading + classification ─────────────────────────────────
+
+_YEARLY_RE = re.compile(r"^\d{4}$")
+_MONTHLY_RE = re.compile(r"^\d{4}-\d{2}$")
+_DAILY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _hash_file_sha256(path: str) -> str:
+    """Return SHA-256 hex digest of file contents."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _load_recognized_list(repo_root: str) -> Tuple[Dict[str, Any], str, int]:
+    """Load the recognized_list.json capture read-only.
+
+    Returns (capture_dict, sha256_hex, byte_size). Verifies the SHA-256
+    against `RECOGNIZED_LIST_SHA256`; mismatch raises
+    `RecognizedListSchemaError`.
+    """
+    path = os.path.join(repo_root, RECOGNIZED_LIST_PATH)
+    if not os.path.isfile(path):
+        raise RecognizedListSchemaError(
+            "recognized-list capture missing at {}".format(path)
+        )
+    sha256 = _hash_file_sha256(path)
+    if sha256 != RECOGNIZED_LIST_SHA256:
+        raise RecognizedListSchemaError(
+            "recognized-list SHA mismatch: got {} expected {}".format(
+                sha256, RECOGNIZED_LIST_SHA256
+            )
+        )
+    byte_size = os.path.getsize(path)
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if "recognized_in_window_units" not in data:
+        raise RecognizedListSchemaError(
+            "recognized_list.json missing 'recognized_in_window_units' "
+            "key at {}".format(path)
+        )
+    units = data["recognized_in_window_units"]
+    if not isinstance(units, list):
+        raise RecognizedListSchemaError(
+            "'recognized_in_window_units' is not a list at {}".format(path)
+        )
+    return data, sha256, byte_size
+
+
+def classify_recognized_units(units: List[str]) -> Dict[str, List[str]]:
+    """Classify each unit by pattern.
+
+    Returns a dict with keys: yearly, monthly, daily_in_window,
+    daily_out_of_window, unknown, duplicates.
+
+    Pattern rules:
+      yearly:           ^\\d{4}$
+      monthly:          ^\\d{4}-\\d{2}$
+      daily_in_window:  ^\\d{4}-\\d{2}-\\d{2}$ AND date in [START_DATE, END_DATE]
+      daily_out_of_window: ^\\d{4}-\\d{2}-\\d{2}$ AND date outside window
+      unknown:          anything else
+      duplicates:       any unit appearing more than once
+    """
+    yearly: List[str] = []
+    monthly: List[str] = []
+    daily_in_window: List[str] = []
+    daily_out_of_window: List[str] = []
+    unknown: List[str] = []
+    duplicates: List[str] = []
+    seen: Set[str] = set()
+
+    for u in units:
+        if not isinstance(u, str):
+            unknown.append(repr(u))
+            continue
+        if u in seen:
+            duplicates.append(u)
+            continue
+        seen.add(u)
+        if _YEARLY_RE.match(u):
+            yearly.append(u)
+        elif _MONTHLY_RE.match(u):
+            monthly.append(u)
+        elif _DAILY_RE.match(u):
+            try:
+                d = date.fromisoformat(u)
+            except ValueError:
+                unknown.append(u)
+                continue
+            if START_DATE <= d <= END_DATE:
+                daily_in_window.append(u)
+            else:
+                daily_out_of_window.append(u)
+        else:
+            unknown.append(u)
+
+    return {
+        "yearly": sorted(yearly),
+        "monthly": sorted(monthly),
+        "daily_in_window": sorted(daily_in_window),
+        "daily_out_of_window": sorted(daily_out_of_window),
+        "unknown": sorted(unknown),
+        "duplicates": sorted(duplicates),
+    }
+
+
+def build_reconciliation_report(units: List[str]) -> Dict[str, Any]:
+    """Compute the reconciliation report comparing capture / civil-window
+    arithmetic / gaps.
+
+    The report surfaces the documented residual rather than inventing
+    explanations. Per design memo §6.8: capture has 3,647 units; civil
+    days 3,562; substrate gaps 4; naive-expected daily URLs 3,558;
+    89-unit residual.
+    """
+    classification = classify_recognized_units(units)
+
+    total_capture_units = len(units)
+    daily_in_window_count = len(classification["daily_in_window"])
+
+    daily_set = set(classification["daily_in_window"])
+    gaps_set = set(KNOWN_SUBSTRATE_GAPS)
+    gaps_present_in_capture = sorted(daily_set & gaps_set)
+    fetch_set = sorted(daily_set - gaps_set)
+    fetch_set_count = len(fetch_set)
+
+    non_daily_units = (
+        len(classification["yearly"])
+        + len(classification["monthly"])
+        + len(classification["daily_out_of_window"])
+        + len(classification["unknown"])
+        + len(classification["duplicates"])
+    )
+
+    residual = total_capture_units - daily_in_window_count
+
+    report = {
+        "total_capture_units": total_capture_units,
+        "civil_days_in_window": CIVIL_DAYS_IN_WINDOW,
+        "known_substrate_gaps": list(KNOWN_SUBSTRATE_GAPS),
+        "known_substrate_gaps_count": len(KNOWN_SUBSTRATE_GAPS),
+        "naive_expected_daily_urls": NAIVE_EXPECTED_DAILY_URLS,
+        "classification": {
+            "yearly_count": len(classification["yearly"]),
+            "monthly_count": len(classification["monthly"]),
+            "daily_in_window_count": daily_in_window_count,
+            "daily_out_of_window_count": len(
+                classification["daily_out_of_window"]
+            ),
+            "unknown_count": len(classification["unknown"]),
+            "duplicates_count": len(classification["duplicates"]),
+        },
+        "yearly_units": classification["yearly"],
+        "monthly_units": classification["monthly"],
+        "daily_out_of_window_units": classification["daily_out_of_window"],
+        "unknown_units": classification["unknown"],
+        "duplicates": classification["duplicates"],
+        "gaps_present_in_capture": gaps_present_in_capture,
+        "fetch_set_count": fetch_set_count,
+        "fetch_set": fetch_set,
+        "residual_total": residual,
+        "residual_non_daily_units": non_daily_units,
+        "fetch_set_matches_naive_expectation": (
+            fetch_set_count == NAIVE_EXPECTED_DAILY_URLS
+        ),
+    }
+    return report
+
+
+def assert_reconciliation_consistent(report: Dict[str, Any]) -> None:
+    """Hard-fail if reconciliation structure contradicts the design memo.
+
+    Surfaces concrete findings rather than inventing explanations.
+    """
+    if not report["fetch_set_matches_naive_expectation"]:
+        raise ReconciliationContradiction(
+            "fetch_set count {} != naive expectation {} ("
+            "civil_days={} − gaps={})".format(
+                report["fetch_set_count"],
+                report["naive_expected_daily_urls"],
+                report["civil_days_in_window"],
+                report["known_substrate_gaps_count"],
+            )
+        )
+    if report["gaps_present_in_capture"]:
+        raise ReconciliationContradiction(
+            "known substrate gap(s) present in recognized-list capture: "
+            "{}".format(report["gaps_present_in_capture"])
+        )
+    if report["classification"]["duplicates_count"] > 0:
+        raise ReconciliationContradiction(
+            "recognized-list capture contains duplicate unit(s): "
+            "{}".format(report["duplicates"])
+        )
+    if report["classification"]["unknown_count"] > 0:
+        raise ReconciliationContradiction(
+            "recognized-list capture contains unknown-pattern unit(s): "
+            "{}".format(report["unknown_units"])
+        )
+    if report["classification"]["daily_out_of_window_count"] > 0:
+        raise ReconciliationContradiction(
+            "recognized-list capture contains daily unit(s) outside "
+            "locked window [{}, {}]: {}".format(
+                START_DATE.isoformat(),
+                END_DATE.isoformat(),
+                report["daily_out_of_window_units"],
+            )
+        )
+
+
+# ── URL construction ─────────────────────────────────────────────────────────
+
+def date_to_daily_url(d: date) -> str:
+    """Build a daily event-file URL for a given date.
+
+    Raises `FullBuildBoundaryBreach` on:
+      - 2023+ date (no-2023+ posture; memo §11.1);
+      - pre-window or post-window date (Decision A; memo §6.5).
+    """
+    if d >= SEAL_START:
+        raise FullBuildBoundaryBreach(
+            "refusing to construct URL for 2023+ date: {}".format(
+                d.isoformat()
+            )
+        )
+    if d < START_DATE or d > END_DATE:
+        raise FullBuildBoundaryBreach(
+            "refusing to construct URL for out-of-window date: "
+            "{}".format(d.isoformat())
+        )
+    yyyymmdd = "{:04d}{:02d}{:02d}".format(d.year, d.month, d.day)
+    return "{}{}.export.CSV.zip".format(EVENT_FILE_BASE_URL, yyyymmdd)
+
+
+def construct_daily_urls(fetch_set: List[str]) -> List[str]:
+    """Construct daily URLs for all dates in fetch_set, in canonical
+    (sorted) order. Each fetch_set entry must be an ISO date string."""
+    out: List[str] = []
+    for iso in fetch_set:
+        d = date.fromisoformat(iso)
+        out.append(date_to_daily_url(d))
+    return out
+
+
+# ── Output allow-list ────────────────────────────────────────────────────────
+
+def _is_allowed_output_basename(basename: str) -> bool:
+    """Return True iff basename is on the final-output allow-list and
+    contains no path-traversal characters."""
+    if "/" in basename or "\\" in basename or ".." in basename:
+        return False
+    return basename in ALLOWED_OUTPUT_BASENAMES
+
+
+def _checked_output_path(output_dir: str, basename: str) -> str:
+    """Pre-write gate: assert basename is allow-listed BEFORE any write."""
+    if not _is_allowed_output_basename(basename):
+        raise FullBuildBoundaryBreach(
+            "non-allow-listed full-build output: {!r}".format(basename)
+        )
+    return os.path.join(output_dir, basename)
+
+
+def _assert_outputs_allowed(output_dir: str) -> None:
+    """Post-hoc tripwire: every file in output_dir must be allow-listed.
+
+    Raises `FullBuildBoundaryBreach` if any file fails the check.
+    Subdirectories are not allowed at all (no `tmp/` left behind).
+    """
+    for name in sorted(os.listdir(output_dir)):
+        full = os.path.join(output_dir, name)
+        if os.path.isdir(full):
+            raise FullBuildBoundaryBreach(
+                "unexpected subdirectory in full-build output dir: "
+                "{!r}".format(name)
+            )
+        if not _is_allowed_output_basename(name):
+            raise FullBuildBoundaryBreach(
+                "non-allow-listed file in full-build output dir: "
+                "{!r}".format(name)
+            )
+
+
+# ── Fresh output directory ───────────────────────────────────────────────────
+
+def _fresh_output_dir(repo_root: str, timestamp_utc: str) -> str:
+    """Create the timestamped output dir under
+    `results/lane2_gdelt1_full_daily_count_build/`.
+
+    Uses os.makedirs(..., exist_ok=False) so a collision is a hard
+    error. Called immediately before the network loop.
+    """
+    parent = os.path.join(
+        repo_root,
+        "results",
+        "lane2_gdelt1_full_daily_count_build",
+    )
+    os.makedirs(parent, exist_ok=True)
+    path = os.path.join(parent, timestamp_utc)
+    os.makedirs(path, exist_ok=False)
+    return path
+
+
+# ── Parser ───────────────────────────────────────────────────────────────────
+
+def parse_payload(
+    payload_bytes: bytes,
+    nominal_date: date,
+    sqldate_col: int = SQLDATE_COLUMN_INDEX,
+) -> Dict[str, Any]:
+    """Decompress + parse a GDELT 1.0 daily event-file payload.
+
+    Returns a dict with per-row aggregation results and diagnostics.
+
+    Hard-fails on:
+      - 2023+ nominal date (caller should never construct one);
+      - 2023+ SQLDATE row;
+      - unexpected offset outside `EXPECTED_OFFSETS`.
+
+    Reportable diagnostics (do not halt):
+      - malformed-short rows (column count < expected);
+      - unparseable-SQLDATE rows (value not parseable as YYYYMMDD);
+      - header anomaly on first row;
+      - out-of-window SQLDATE rows (excluded from primary series,
+        recorded in `out_of_window_sqldate_distribution`).
+    """
+    if nominal_date >= SEAL_START:
+        raise FullBuildBoundaryBreach(
+            "refusing to parse payload nominally dated 2023+: {}".format(
+                nominal_date.isoformat()
+            )
+        )
+
+    with zipfile.ZipFile(io.BytesIO(payload_bytes)) as zf:
+        names = zf.namelist()
+        if not names:
+            return _empty_parse_result(nominal_date)
+        with zf.open(names[0]) as fh:
+            text = fh.read().decode("utf-8", "replace")
+
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    row_count = len(lines)
+
+    per_offset_count: Dict[int, int] = {
+        off: 0 for off in EXPECTED_OFFSETS
+    }
+    # In-window SQLDATE -> offset -> count
+    sqldate_offset_counts: Dict[Tuple[str, int], int] = {}
+    out_of_window_count = 0
+    out_of_window_sqldate_distribution: Dict[str, Dict[str, int]] = {}
+    malformed_short = 0
+    unparseable_sqldate = 0
+    header_anomaly = False
+
+    for idx, ln in enumerate(lines):
+        parts = ln.split("\t")
+        if len(parts) <= sqldate_col:
+            malformed_short += 1
+            if idx == 0:
+                header_anomaly = True
+            continue
+        tok = parts[sqldate_col].strip()
+        if len(tok) != 8 or not tok.isdigit():
+            unparseable_sqldate += 1
+            if idx == 0:
+                header_anomaly = True
+            continue
+        try:
+            d = date(int(tok[0:4]), int(tok[4:6]), int(tok[6:8]))
+        except ValueError:
+            unparseable_sqldate += 1
+            if idx == 0:
+                header_anomaly = True
+            continue
+        if d >= SEAL_START:
+            raise FullBuildBoundaryBreach(
+                "2023+ SQLDATE row in payload nominally dated {}: "
+                "{}".format(nominal_date.isoformat(), d.isoformat())
+            )
+        offset = (d - nominal_date).days
+        if offset not in EXPECTED_OFFSETS:
+            raise FullBuildBoundaryBreach(
+                "unexpected offset {!r} in payload nominally dated {}: "
+                "SQLDATE {}".format(
+                    offset, nominal_date.isoformat(), d.isoformat()
+                )
+            )
+        # per_offset_count counts ALL observed rows at each offset
+        # regardless of in/out-of-window status, matching the
+        # `858b501` §11 aggregate-pattern (where T-3650 = 315 rows
+        # across 16 files even though all T-3650 SQLDATEs were
+        # out-of-window).
+        per_offset_count[offset] += 1
+        if START_DATE <= d <= END_DATE:
+            iso = d.isoformat()
+            key = (iso, offset)
+            sqldate_offset_counts[key] = (
+                sqldate_offset_counts.get(key, 0) + 1
+            )
+        else:
+            out_of_window_count += 1
+            iso = d.isoformat()
+            if iso not in out_of_window_sqldate_distribution:
+                out_of_window_sqldate_distribution[iso] = {}
+            ostr = str(offset)
+            out_of_window_sqldate_distribution[iso][ostr] = (
+                out_of_window_sqldate_distribution[iso].get(ostr, 0) + 1
+            )
+
+    return {
+        "nominal_date": nominal_date.isoformat(),
+        "row_count": row_count,
+        "header_anomaly_detected": header_anomaly,
+        "malformed_short_rows": malformed_short,
+        "unparseable_sqldate_rows": unparseable_sqldate,
+        "per_offset_count": per_offset_count,
+        "sqldate_offset_counts": sqldate_offset_counts,
+        "out_of_window_row_count": out_of_window_count,
+        "out_of_window_sqldate_distribution": (
+            out_of_window_sqldate_distribution
+        ),
+    }
+
+
+def _empty_parse_result(nominal_date: date) -> Dict[str, Any]:
+    return {
+        "nominal_date": nominal_date.isoformat(),
+        "row_count": 0,
+        "header_anomaly_detected": False,
+        "malformed_short_rows": 0,
+        "unparseable_sqldate_rows": 0,
+        "per_offset_count": {off: 0 for off in EXPECTED_OFFSETS},
+        "sqldate_offset_counts": {},
+        "out_of_window_row_count": 0,
+        "out_of_window_sqldate_distribution": {},
+    }
+
+
+# ── Coverage flag + completeness computation ─────────────────────────────────
+
+def expected_cone(d: date) -> Set[int]:
+    """Era-conditioned expected cone (T-3650 excluded a priori per
+    memo §10.2 / §11.3).
+
+    Pre-2015 T+1 era:  d <= 2015-01-01 → {0, -1, -7, -30, -365, +1}
+    Post-2015 era:     d >= 2015-01-02 → {0, -1, -7, -30, -365}
+    """
+    if d <= T_PLUS_1_ERA_CUTOFF:
+        return {0, -1, -7, -30, -365, 1}
+    return {0, -1, -7, -30, -365}
+
+
+def contributing_file_nominal_date(d: date, offset: int) -> date:
+    """Return the publishing-file nominal date that would contribute
+    rows at the given offset to target SQLDATE d.
+
+    Examples:
+      offset = 0:    file at nominal d           (T=0)
+      offset = -1:   file at nominal d+1         (T-1)
+      offset = -7:   file at nominal d+7         (T-7)
+      offset = -30:  file at nominal d+30        (T-30)
+      offset = -365: file at nominal d+365       (T-365)
+      offset = -3650:file at nominal d+3650      (T-3650)
+      offset = +1:   file at nominal d-1         (T+1)
+    """
+    return d + timedelta(days=-offset)
+
+
+def _classify_cone_member(
+    d: date, offset: int, daily_set: Set[str], gaps_set: Set[str],
+) -> str:
+    """Classify a cone member's availability:
+       'available' / 'substrate_gap' / 'out_of_universe_2023plus' /
+       'out_of_universe_pre_2013' / 'unknown_absent'.
+    """
+    contributing = contributing_file_nominal_date(d, offset)
+    if contributing >= SEAL_START:
+        return "out_of_universe_2023plus"
+    if contributing < START_DATE:
+        return "out_of_universe_pre_2013"
+    iso = contributing.isoformat()
+    if iso in gaps_set:
+        return "substrate_gap"
+    if iso in daily_set:
+        return "available"
+    return "unknown_absent"
+
+
+def coverage_for_date(
+    d: date, daily_set: Set[str], gaps_set: Set[str],
+) -> Dict[str, Any]:
+    """Compute coverage_quality_flag, coverage_completeness, and details
+    for civil date d.
+
+    Returns a dict with keys: coverage_quality_flag,
+    coverage_completeness, expected_contributing_files_count,
+    available_contributing_files_count, cone_status (offset -> status).
+    """
+    cone = expected_cone(d)
+    expected_count = len(cone)
+    cone_status: Dict[int, str] = {}
+    for offset in cone:
+        cone_status[offset] = _classify_cone_member(
+            d, offset, daily_set, gaps_set,
+        )
+    available_count = sum(
+        1 for st in cone_status.values() if st == "available"
+    )
+    completeness = (
+        available_count / expected_count if expected_count > 0 else 0.0
+    )
+
+    # Determine which named causes fire
+    causes: List[str] = []
+    if cone_status.get(0) == "substrate_gap":
+        causes.append("t0_absent_substrate_gap")
+    elif cone_status.get(0) == "unknown_absent":
+        # Synthetic test condition: in-window non-gap date NOT in
+        # daily_set. In production this cannot happen (daily_set ==
+        # fetch_set ⊇ all in-window non-gap dates). For tests, map to
+        # the t0-substrate-gap flag — the semantics is equivalent
+        # ("T=0 contributing file absent for whatever reason").
+        causes.append("t0_absent_substrate_gap")
+    right_truncated = any(
+        cone_status.get(off) == "out_of_universe_2023plus"
+        for off in (-1, -7, -30, -365) if off in cone
+    )
+    if right_truncated:
+        causes.append("right_truncated_2022_seal")
+    if 1 in cone:
+        st = cone_status[1]
+        if st == "out_of_universe_pre_2013":
+            causes.append("left_truncated_2013_edge")
+        elif st in ("substrate_gap", "unknown_absent"):
+            causes.append("t_plus_1_neighbor_substrate_gap")
+    # IMPLEMENTATION EXTENSION (closed-domain extension; surfaced in
+    # metadata): T-1 / T-7 / T-30 / T-365 substrate-gap absences are
+    # not covered by the design memo §11.3 closed flag domain. Map them
+    # to a new flag `t_minus_n_neighbor_substrate_gap`. Also covers the
+    # synthetic test case where daily_set is incomplete (unknown_absent).
+    t_minus_n_neighbor_absent = any(
+        cone_status.get(off) in ("substrate_gap", "unknown_absent")
+        for off in (-1, -7, -30, -365) if off in cone
+    )
+    if t_minus_n_neighbor_absent:
+        causes.append("t_minus_n_neighbor_substrate_gap")
+
+    # Build flag value
+    if available_count == expected_count:
+        flag = "full"
+    else:
+        # Order causes per _COVERAGE_FLAG_ORDER
+        ordered = [c for c in _COVERAGE_FLAG_ORDER if c in causes]
+        if not ordered:
+            # Defensive — should not happen if classification is sound.
+            # Surface as a hard-fail rather than silently emit garbage.
+            raise FullBuildBoundaryBreach(
+                "coverage classification produced no named cause for "
+                "incomplete coverage at date {} (cone_status={})".format(
+                    d.isoformat(), cone_status,
+                )
+            )
+        if len(ordered) == 1:
+            flag = ordered[0]
+        else:
+            flag = "+".join(ordered)
+
+    return {
+        "civil_date": d.isoformat(),
+        "coverage_quality_flag": flag,
+        "coverage_completeness": completeness,
+        "expected_contributing_files_count": expected_count,
+        "available_contributing_files_count": available_count,
+        "cone_status": {str(k): v for k, v in cone_status.items()},
+    }
+
+
+def is_valid_coverage_flag(flag: str) -> bool:
+    """Return True iff `flag` is in the closed value domain.
+
+    Single-cause: one of COVERAGE_SINGLE_FLAGS.
+    Multi-cause: an ordered concatenation joined by '+' of two-or-more
+    distinct causes from _COVERAGE_FLAG_ORDER, in numeric order.
+    """
+    if flag in COVERAGE_SINGLE_FLAGS:
+        return True
+    parts = flag.split("+")
+    if len(parts) < 2:
+        return False
+    if len(set(parts)) != len(parts):
+        return False
+    for p in parts:
+        if p not in _COVERAGE_FLAG_ORDER:
+            return False
+    # Order check: parts must appear in numeric order
+    indices = [_COVERAGE_FLAG_ORDER.index(p) for p in parts]
+    return indices == sorted(indices)
+
+
+# ── Per-date output domain enumeration ───────────────────────────────────────
+
+def civil_date_domain() -> List[date]:
+    """Return the canonical civil-calendar output domain
+    [START_DATE, END_DATE] in ascending order. 3,562 dates."""
+    out: List[date] = []
+    d = START_DATE
+    while d <= END_DATE:
+        out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def t0_file_status(d: date, daily_set: Set[str], gaps_set: Set[str]) -> str:
+    """Return one of 'present', 'expected_absent_per_recognized_list',
+    'out_of_universe'."""
+    iso = d.isoformat()
+    if iso in gaps_set:
+        return "expected_absent_per_recognized_list"
+    if iso in daily_set:
+        return "present"
+    return "out_of_universe"
+
+
+# ── Aggregation accumulator ──────────────────────────────────────────────────
+
+def _new_accumulator() -> Dict[str, Any]:
+    """Build an empty aggregation accumulator."""
+    return {
+        # civil_date_iso -> {offset_int -> count}
+        "per_sqldate_per_offset": {},
+        # Aggregate per-offset row totals across all in-window rows
+        "per_offset_total": {off: 0 for off in EXPECTED_OFFSETS},
+        # Aggregate out-of-window
+        "out_of_window_row_count": 0,
+        # out_of_window_sqldate_iso -> offset_str -> count
+        "out_of_window_sqldate_distribution": {},
+        # Aggregate diagnostics
+        "total_malformed_short_rows": 0,
+        "total_unparseable_sqldate_rows": 0,
+        # Per-file manifest (one entry per fetched URL)
+        "per_file_manifest": [],
+        # Aggregate parsed row count across all fetched files
+        "total_parsed_rows": 0,
+    }
+
+
+def _ingest_parse_into_accumulator(
+    accum: Dict[str, Any], parse_result: Dict[str, Any],
+) -> None:
+    """Fold a single payload's parse result into the running accumulator."""
+    accum["total_parsed_rows"] += parse_result["row_count"]
+    accum["total_malformed_short_rows"] += (
+        parse_result["malformed_short_rows"]
+    )
+    accum["total_unparseable_sqldate_rows"] += (
+        parse_result["unparseable_sqldate_rows"]
+    )
+    for off, cnt in parse_result["per_offset_count"].items():
+        accum["per_offset_total"][off] += cnt
+    for (iso, offset), cnt in parse_result["sqldate_offset_counts"].items():
+        cell = accum["per_sqldate_per_offset"].setdefault(iso, {})
+        cell[offset] = cell.get(offset, 0) + cnt
+    accum["out_of_window_row_count"] += parse_result["out_of_window_row_count"]
+    for iso, dist in parse_result[
+        "out_of_window_sqldate_distribution"
+    ].items():
+        entry = accum["out_of_window_sqldate_distribution"].setdefault(
+            iso, {}
+        )
+        for ostr, cnt in dist.items():
+            entry[ostr] = entry.get(ostr, 0) + cnt
+
+
+# ── Per-civil-date output row construction ───────────────────────────────────
+
+def build_daily_count_rows(
+    accum: Dict[str, Any], daily_set: Set[str], gaps_set: Set[str],
+) -> List[Dict[str, Any]]:
+    """Construct the primary daily_count rows: one per civil date in
+    [START_DATE, END_DATE], with total / per-offset / coverage columns."""
+    rows: List[Dict[str, Any]] = []
+    for d in civil_date_domain():
+        iso = d.isoformat()
+        per_offset_cells = accum["per_sqldate_per_offset"].get(iso, {})
+        total = sum(per_offset_cells.values())
+        cov = coverage_for_date(d, daily_set, gaps_set)
+        row = {
+            "civil_date": iso,
+            "total_row_count": total,
+            "rows_from_offset_0": per_offset_cells.get(0, 0),
+            "rows_from_offset_minus_1": per_offset_cells.get(-1, 0),
+            "rows_from_offset_minus_7": per_offset_cells.get(-7, 0),
+            "rows_from_offset_minus_30": per_offset_cells.get(-30, 0),
+            "rows_from_offset_minus_365": per_offset_cells.get(-365, 0),
+            "rows_from_offset_minus_3650": per_offset_cells.get(-3650, 0),
+            "rows_from_offset_plus_1": per_offset_cells.get(1, 0),
+            "t0_file_status": t0_file_status(d, daily_set, gaps_set),
+            "expected_contributing_files_count": cov[
+                "expected_contributing_files_count"
+            ],
+            "available_contributing_files_count": cov[
+                "available_contributing_files_count"
+            ],
+            "coverage_quality_flag": cov["coverage_quality_flag"],
+            "coverage_completeness": cov["coverage_completeness"],
+        }
+        if not is_valid_coverage_flag(row["coverage_quality_flag"]):
+            raise FullBuildBoundaryBreach(
+                "coverage_quality_flag {!r} for date {} is not in the "
+                "closed value domain".format(
+                    row["coverage_quality_flag"], iso,
+                )
+            )
+        rows.append(row)
+    return rows
+
+
+# ── Artifact writers ─────────────────────────────────────────────────────────
+
+_DAILY_COUNT_COLUMNS: Tuple[str, ...] = (
+    "civil_date",
+    "total_row_count",
+    "rows_from_offset_0",
+    "rows_from_offset_minus_1",
+    "rows_from_offset_minus_7",
+    "rows_from_offset_minus_30",
+    "rows_from_offset_minus_365",
+    "rows_from_offset_minus_3650",
+    "rows_from_offset_plus_1",
+    "t0_file_status",
+    "expected_contributing_files_count",
+    "available_contributing_files_count",
+    "coverage_quality_flag",
+    "coverage_completeness",
+)
+
+
+def write_daily_count_csv(
+    output_dir: str, rows: List[Dict[str, Any]],
+) -> str:
+    """Write daily_count.csv (allow-list gated). Returns full path."""
+    path = _checked_output_path(output_dir, "daily_count.csv")
+    lines = [",".join(_DAILY_COUNT_COLUMNS)]
+    for r in rows:
+        cells = []
+        for col in _DAILY_COUNT_COLUMNS:
+            v = r[col]
+            if isinstance(v, float):
+                cells.append("{:.6f}".format(v))
+            else:
+                cells.append(str(v))
+        lines.append(",".join(cells))
+    body = "\n".join(lines) + "\n"
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    return path
+
+
+def write_build_metadata_json(
+    output_dir: str, metadata: Dict[str, Any],
+) -> str:
+    """Write build_metadata.json (allow-list gated). Returns full path.
+
+    Metadata is serialized with sort_keys=True for deterministic output.
+    """
+    path = _checked_output_path(output_dir, "build_metadata.json")
+    body = json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    return path
+
+
+def write_build_summary_md(
+    output_dir: str, summary_text: str,
+) -> str:
+    """Write build_summary.md (allow-list gated). Returns full path."""
+    path = _checked_output_path(output_dir, "build_summary.md")
+    if not summary_text.endswith("\n"):
+        summary_text = summary_text + "\n"
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(summary_text)
+    return path
+
+
+def render_build_summary(
+    metadata: Dict[str, Any], daily_rows: List[Dict[str, Any]],
+) -> str:
+    """Render a human-readable summary from the metadata + rows."""
+    aggregate = metadata.get("aggregate_metrics", {})
+    parts = [
+        "# Lane 2 full daily-count build summary",
+        "",
+        "- output_domain: {} → {} ({} civil days)".format(
+            START_DATE.isoformat(), END_DATE.isoformat(),
+            len(daily_rows),
+        ),
+        "- total_parsed_rows: {}".format(
+            aggregate.get("total_parsed_rows", 0)
+        ),
+        "- total_in_window_rows: {}".format(
+            aggregate.get("total_in_window_rows", 0)
+        ),
+        "- total_out_of_window_rows: {}".format(
+            aggregate.get("total_out_of_window_rows", 0)
+        ),
+        "- per_offset_totals (in-window): {}".format(
+            aggregate.get("per_offset_total", {})
+        ),
+        "- fetch_set_count: {}".format(
+            metadata.get("recognized_list_capture", {}).get(
+                "fetch_set_count", 0
+            )
+        ),
+        "- coverage_flag_distribution: {}".format(
+            aggregate.get("coverage_flag_distribution", {})
+        ),
+        "- substrate_gap_dates_not_fetched: {}".format(
+            list(KNOWN_SUBSTRATE_GAPS)
+        ),
+    ]
+    return "\n".join(parts)
+
+
+# ── Boundary declarations ────────────────────────────────────────────────────
+
+def _boundary_declarations() -> Dict[str, bool]:
+    return {
+        "no_market_data": True,
+        "no_step_2": True,
+        "no_asset_or_return_logic": True,
+        "no_category_theme_actor_filtering": True,
+        "no_spike_threshold_tuning": True,
+        "no_negative_control": True,
+        "no_2023plus_access": True,
+        "no_payload_preservation_after_parsing": True,
+        "no_market_calendar_alignment": True,
+    }
+
+
+# ── Fetch one payload (with hash + parse + discard) ──────────────────────────
+
+def _fetch_one_payload(
+    opener: Callable, url: str, timeout: float = DEFAULT_READ_TIMEOUT,
+) -> Tuple[bytes, str]:
+    """Fetch a single URL, return (payload_bytes, sha256_hex).
+
+    Raises:
+      - FullBuildBoundaryBreach via the redirect-disabled opener on 3xx
+        (translated below to FetchFailure for uniform hard-fail handling);
+      - FetchFailure on HTTP non-200, urllib HTTPError/URLError, or
+        any other network exception.
+
+    The caller is responsible for discarding the returned bytes after
+    parsing (payload-discard mechanism per memo §15.11).
+    """
+    try:
+        resp = opener(url, timeout=timeout)
+    except FullBuildRedirectBlocked as e:
+        raise FetchFailure(
+            "redirect blocked for {}: {}".format(url, e)
+        )
+    except urllib.error.HTTPError as e:
+        raise FetchFailure(
+            "HTTP error {} for {}: {}".format(e.code, url, e.reason)
+        )
+    except urllib.error.URLError as e:
+        raise FetchFailure(
+            "URL error for {}: {}".format(url, e.reason)
+        )
+    except (TimeoutError, OSError) as e:
+        raise FetchFailure(
+            "connection error / timeout for {}: {!r}".format(url, e)
+        )
+    status = resp.getcode() if hasattr(resp, "getcode") else None
+    if status != 200:
+        raise FetchFailure(
+            "non-200 HTTP {} for {}".format(status, url)
+        )
+    payload = resp.read()
+    if hasattr(resp, "close"):
+        resp.close()
+    sha = hashlib.sha256(payload).hexdigest()
+    return payload, sha
+
+
+# ── Halt diagnostic writer (hard-fail path) ──────────────────────────────────
+
+def _write_halt_diagnostic(output_dir: str, diagnostic: Dict[str, Any]) -> None:
+    """Write halt_diagnostic.json on hard-fail. Allow-list gated."""
+    try:
+        path = _checked_output_path(output_dir, "halt_diagnostic.json")
+        body = json.dumps(diagnostic, indent=2, sort_keys=True) + "\n"
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+    except Exception:
+        # Best-effort; don't mask the original hard-fail.
+        pass
+
+
+# ── Main run function ────────────────────────────────────────────────────────
+
+def run_full_daily_count_build(
+    repo_root: str,
+    cli_flag: bool = False,
+    timestamp_utc: Optional[str] = None,
+    timeout: float = DEFAULT_READ_TIMEOUT,
+    opener: Optional[Callable] = None,
+) -> Dict[str, Any]:
+    """Execute the full daily-count build.
+
+    Three-guard refusal applies BEFORE any opener construction, URL
+    construction, output directory creation, or artifact write.
+
+    `opener` is optional; if not provided, the runner constructs its own
+    redirect-disabled opener. Tests may inject a fake opener.
+    """
+    if not _guards_ok(cli_flag):
+        print(_REFUSAL, file=sys.stderr)
+        raise SystemExit(2)
+
+    if timestamp_utc is None:
+        timestamp_utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    # 1. Load + verify recognized-list capture
+    capture_data, sha256, byte_size = _load_recognized_list(repo_root)
+    units = capture_data["recognized_in_window_units"]
+
+    # 2. Reconciliation
+    reconciliation = build_reconciliation_report(units)
+    assert_reconciliation_consistent(reconciliation)
+
+    fetch_set = reconciliation["fetch_set"]
+    daily_set: Set[str] = set(fetch_set)  # gaps NOT in daily_set (per Decision G)
+    gaps_set: Set[str] = set(KNOWN_SUBSTRATE_GAPS)
+
+    # 3. Fresh output dir
+    output_dir = _fresh_output_dir(repo_root, timestamp_utc)
+
+    # 4. Opener
+    if opener is None:
+        opener = _build_full_build_redirect_disabled_opener(timeout=timeout)
+
+    # 5. Aggregation
+    accum = _new_accumulator()
+    urls = construct_daily_urls(fetch_set)
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    try:
+        for iso, url in zip(fetch_set, urls):
+            nominal = date.fromisoformat(iso)
+            payload, payload_sha = _fetch_one_payload(opener, url, timeout=timeout)
+            parse_result = parse_payload(payload, nominal)
+            # Payload-discard: drop the bytes immediately after parsing.
+            del payload
+            accum["per_file_manifest"].append({
+                "url": url,
+                "nominal_date": iso,
+                "http_status": 200,
+                "http_status_class": "200_OK",
+                "payload_sha256": payload_sha,
+                "row_count": parse_result["row_count"],
+                "malformed_short_rows": parse_result["malformed_short_rows"],
+                "unparseable_sqldate_rows": parse_result[
+                    "unparseable_sqldate_rows"
+                ],
+                "header_anomaly_detected": parse_result[
+                    "header_anomaly_detected"
+                ],
+                "out_of_window_row_count": parse_result[
+                    "out_of_window_row_count"
+                ],
+                "per_offset_count": {
+                    str(k): v
+                    for k, v in parse_result["per_offset_count"].items()
+                },
+                "status": "fetched_and_parsed",
+            })
+            _ingest_parse_into_accumulator(accum, parse_result)
+        # Synthesize expected-absent entries for substrate-gap dates.
+        for gap in KNOWN_SUBSTRATE_GAPS:
+            accum["per_file_manifest"].append({
+                "url": None,
+                "nominal_date": gap,
+                "http_status": None,
+                "http_status_class": "not_requested",
+                "payload_sha256": None,
+                "row_count": 0,
+                "malformed_short_rows": 0,
+                "unparseable_sqldate_rows": 0,
+                "header_anomaly_detected": False,
+                "out_of_window_row_count": 0,
+                "per_offset_count": {
+                    str(k): 0 for k in EXPECTED_OFFSETS
+                },
+                "status": "expected_absent_per_recognized_list",
+            })
+    except (FullBuildBoundaryBreach, FetchFailure,
+            RecognizedListSchemaError, ReconciliationContradiction) as e:
+        _write_halt_diagnostic(output_dir, {
+            "halt_class": type(e).__name__,
+            "message": str(e),
+            "started_at_utc": started_at,
+            "halted_at_utc": datetime.now(timezone.utc).isoformat(),
+        })
+        raise
+
+    finished_at = datetime.now(timezone.utc).isoformat()
+
+    # 6. Build daily_count rows
+    daily_rows = build_daily_count_rows(accum, daily_set, gaps_set)
+
+    # 7. Coverage distribution diagnostic
+    coverage_flag_distribution: Dict[str, int] = {}
+    for row in daily_rows:
+        f = row["coverage_quality_flag"]
+        coverage_flag_distribution[f] = (
+            coverage_flag_distribution.get(f, 0) + 1
+        )
+
+    # 8. Build metadata
+    metadata: Dict[str, Any] = {
+        "run_anchors": {
+            "design_memo_commit": "7780a97",
+            "decision_memo_commit": "0065d10",
+            "characterization_report_commit": "858b501",
+            "recognized_list_capture_commit": "4015b97",
+            "start_date": START_DATE.isoformat(),
+            "end_date": END_DATE.isoformat(),
+            "seal_start": SEAL_START.isoformat(),
+            "no_2023plus_posture_commit": "0ddbd51",
+            "started_at_utc": started_at,
+            "finished_at_utc": finished_at,
+        },
+        "recognized_list_capture": {
+            "path": RECOGNIZED_LIST_PATH,
+            "sha256": sha256,
+            "byte_size": byte_size,
+            "total_capture_units": reconciliation["total_capture_units"],
+            "fetch_set_count": reconciliation["fetch_set_count"],
+            "reconciliation": reconciliation,
+        },
+        "per_file_manifest": accum["per_file_manifest"],
+        "substrate_gap_diagnostic": {
+            "known_substrate_gap_dates": list(KNOWN_SUBSTRATE_GAPS),
+            "substrate_gap_dates_not_fetched": list(KNOWN_SUBSTRATE_GAPS),
+        },
+        "out_of_window_sqldate_diagnostic": {
+            "total_out_of_window_rows": accum["out_of_window_row_count"],
+            "out_of_window_rows_excluded_from_primary_series": True,
+            "per_sqldate_distribution": accum[
+                "out_of_window_sqldate_distribution"
+            ],
+        },
+        "parser_anomaly_diagnostic": {
+            "total_malformed_short_rows": accum[
+                "total_malformed_short_rows"
+            ],
+            "total_unparseable_sqldate_rows": accum[
+                "total_unparseable_sqldate_rows"
+            ],
+        },
+        "coverage_diagnostic": {
+            "coverage_flag_distribution": coverage_flag_distribution,
+            "closed_value_domain_single_flags": list(
+                COVERAGE_SINGLE_FLAGS
+            ),
+            "era_cutoff": T_PLUS_1_ERA_CUTOFF.isoformat(),
+            "design_memo_extensions": {
+                "t_minus_n_neighbor_substrate_gap": (
+                    "Implementation extension to design memo §11.3 "
+                    "closed flag domain. The design memo's 6-entry "
+                    "closed domain (full / t0_absent_substrate_gap / "
+                    "right_truncated_2022_seal / "
+                    "left_truncated_2013_edge / "
+                    "t_plus_1_neighbor_substrate_gap / multiple) does "
+                    "not include a named flag for T-1 / T-7 / T-30 / "
+                    "T-365 substrate-gap absences (cases where a "
+                    "contributing publishing file at d+n is one of "
+                    "the four known substrate-gap dates "
+                    "2014-01-23/-24/-25/2014-03-19). This occurs in "
+                    "production at ~12 in-window dates near the "
+                    "early-2014 substrate-gap region. The "
+                    "implementation extends the closed domain by ONE "
+                    "entry to handle these cases without silent "
+                    "repair or silent design change. The extension is "
+                    "explicit and surfaced here. A future revision "
+                    "memo may formalize this extension or revise "
+                    "§11.3."
+                ),
+            },
+        },
+        "output_allow_list": list(ALLOWED_OUTPUT_BASENAMES),
+        "boundary_declarations": _boundary_declarations(),
+        "aggregation_invariants": {
+            "civil_days_in_output_domain": len(daily_rows),
+            "expected_civil_days": CIVIL_DAYS_IN_WINDOW,
+            "domain_matches_expected": (
+                len(daily_rows) == CIVIL_DAYS_IN_WINDOW
+            ),
+            "per_offset_total": {
+                str(k): v
+                for k, v in accum["per_offset_total"].items()
+            },
+            "t_minus_3650_in_primary_is_zero": (
+                # Structural T-3650 zero invariant (memo §10.2): every
+                # in-window date's per-SQLDATE T-3650 count is 0,
+                # because every in-window d would require f_(d+3650)
+                # in [2023-04-01, 2032-12-31], all excluded by no-2023+.
+                sum(
+                    cells.get(-3650, 0)
+                    for cells in accum["per_sqldate_per_offset"].values()
+                ) == 0
+            ),
+        },
+        "aggregate_metrics": {
+            "total_parsed_rows": accum["total_parsed_rows"],
+            "total_in_window_rows": sum(
+                sum(cells.values())
+                for cells in accum["per_sqldate_per_offset"].values()
+            ),
+            "total_out_of_window_rows": accum["out_of_window_row_count"],
+            "per_offset_total_observed_in_plus_out": {
+                str(k): v
+                for k, v in accum["per_offset_total"].items()
+            },
+            "per_offset_total": {
+                str(k): v
+                for k, v in accum["per_offset_total"].items()
+            },
+            "coverage_flag_distribution": coverage_flag_distribution,
+        },
+    }
+
+    # 9. Counting invariant assertion. Note: per_offset_total now
+    # counts ALL observed rows at each offset (in + out of window),
+    # matching the `858b501` §11 aggregate pattern. The in-window total
+    # comes from summing per_sqldate_per_offset (which is in-window
+    # only).
+    total_in_window = sum(
+        sum(cells.values())
+        for cells in accum["per_sqldate_per_offset"].values()
+    )
+    total_observed_per_offset = sum(accum["per_offset_total"].values())
+    total_out_of_window = accum["out_of_window_row_count"]
+    total_malformed = accum["total_malformed_short_rows"]
+    total_unparseable = accum["total_unparseable_sqldate_rows"]
+    # per_offset_total = in_window + out_of_window (parser-observed rows)
+    if total_observed_per_offset != total_in_window + total_out_of_window:
+        raise FullBuildBoundaryBreach(
+            "per_offset_total invariant violation: "
+            "per_offset_total={} != in_window={} + out_of_window={}".format(
+                total_observed_per_offset,
+                total_in_window,
+                total_out_of_window,
+            )
+        )
+    counted_total = (
+        total_observed_per_offset
+        + total_malformed
+        + total_unparseable
+    )
+    if counted_total != accum["total_parsed_rows"]:
+        raise FullBuildBoundaryBreach(
+            "counting invariant violation: observed_per_offset={} + "
+            "malformed={} + unparseable={} = {} != total_parsed={}".format(
+                total_observed_per_offset, total_malformed,
+                total_unparseable, counted_total,
+                accum["total_parsed_rows"],
+            )
+        )
+
+    # 10. Write artifacts
+    csv_path = write_daily_count_csv(output_dir, daily_rows)
+    md_text = render_build_summary(metadata, daily_rows)
+    md_path = write_build_summary_md(output_dir, md_text)
+    json_path = write_build_metadata_json(output_dir, metadata)
+
+    # 11. Post-hoc tripwire
+    _assert_outputs_allowed(output_dir)
+
+    print(
+        "Full daily-count build outputs written under: {}".format(output_dir),
+        file=sys.stdout,
+    )
+
+    return {
+        "output_dir": output_dir,
+        "daily_count_csv_path": csv_path,
+        "build_metadata_json_path": json_path,
+        "build_summary_md_path": md_path,
+        "metadata": metadata,
+    }
+
+
+# ── CLI ─────────────────────────────────────────────────────────────────────
+
+def _make_argparser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        description=(
+            "Lane 2 GDELT 1.0 full daily-count build runner "
+            "(design memo `7780a97`). Refuses to run unless all three "
+            "guards are satisfied."
+        ),
+    )
+    ap.add_argument(
+        "--authorize-full-build-run",
+        action="store_true",
+        help=(
+            "CLI guard 2/3. Must be passed alongside the module-constant "
+            "guard (FULL_BUILD_AUTHORIZED=True) AND env "
+            "LANE2_FULL_BUILD_AUTHORIZED=1 to execute the build."
+        ),
+    )
+    ap.add_argument(
+        "--repo-root",
+        default=os.getcwd(),
+        help=(
+            "Repository root containing the §10 recognized-list capture "
+            "and the results/ output parent. Defaults to CWD."
+        ),
+    )
+    return ap
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = _make_argparser().parse_args(argv)
+    try:
+        run_full_daily_count_build(
+            repo_root=args.repo_root,
+            cli_flag=args.authorize_full_build_run,
+        )
+    except SystemExit:
+        raise
+    except (FullBuildBoundaryBreach, FetchFailure,
+            RecognizedListSchemaError,
+            ReconciliationContradiction) as e:
+        print("HALT: {}: {}".format(type(e).__name__, e), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
