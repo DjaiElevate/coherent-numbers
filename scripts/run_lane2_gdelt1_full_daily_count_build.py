@@ -119,21 +119,43 @@ SEAL_START = date(2023, 1, 1)
 # Order is canonical: ascending offset value.
 EXPECTED_OFFSETS: Tuple[int, ...] = (-3650, -365, -30, -7, -1, 0, 1)
 
-# Sentinel SQLDATE subclass (substrate amendment memo at commit `7206e30`,
-# R3 + Option α). Rows whose parsed SQLDATE equals a value in this set
-# are recognized as placeholder-dated rather than lookback-retrocoded,
-# routed into per-sentinel diagnostics, excluded from
-# `total_in_window_rows` / `total_out_of_window_rows` under Option α, and
-# NOT subject to the `EXPECTED_OFFSETS` halt. The halt-on-other-unexpected
-# behavior is preserved verbatim for any non-sentinel SQLDATE whose offset
-# is outside `EXPECTED_OFFSETS` — the discovery-preservation property
-# remains load-bearing. Empirical basis: the 2019-12-31 daily-export file
-# contained 120 such rows with SQLDATE `1920-01-01`; archived halt
-# diagnostic at
+# Sentinel SQLDATE subclass (substrate amendment memos at commits
+# `7206e30` and `a1f2c4c`, R3 + Option α). Rows whose parsed SQLDATE
+# equals a value in this set are recognized as placeholder-dated rather
+# than lookback-retrocoded, routed into per-sentinel diagnostics,
+# excluded from `total_in_window_rows` / `total_out_of_window_rows`
+# under Option α, and NOT subject to the `EXPECTED_OFFSETS` halt. The
+# halt-on-other-unexpected behavior is preserved verbatim for any
+# non-sentinel SQLDATE whose offset is outside `EXPECTED_OFFSETS` —
+# the discovery-preservation property remains load-bearing. Empirical
+# basis: (i) `7206e30` — the 2019-12-31 daily-export file contained 120
+# rows with SQLDATE `1920-01-01` (chunk_2019 substrate amendment;
+# halt diagnostic archived under
 # `archive/halted_attempts/lane2_gdelt1_full_daily_count_build/`
-# `chunk_2019_20260525T192552Z/halt_diagnostic.json`. Set is narrow now,
-# extensible in shape — extend only on direct substrate evidence.
-SENTINEL_SQLDATES: Tuple[date, ...] = (date(1920, 1, 1),)
+# `chunk_2019_20260525T192552Z/halt_diagnostic.json`); (ii) `a1f2c4c` —
+# chunk_2020 Option B bounded-envelope research (D2 — narrow
+# early-January-1920 family under precedence `D3 ⪼ D2 ⪼ D1`; 23/23
+# inspected; 6 affected nominal file dates `2019-12-31`,
+# `2020-01-01..2020-01-05`; 6 distinct placeholder/sentinel SQLDATE
+# values `1920-01-01..1920-01-06`, contiguous, all directly observed;
+# research output memo `dc48f55`; research output directory
+# `results/lane2_gdelt1_placeholder_sqldate_research/`
+# `chunk_2020_option_b_20260526T210247Z/`). Set is **evidence-bounded
+# discrete tuple** — every member is directly observed; zero predicted
+# values; no row-count threshold (`1920-01-06` is included despite
+# being marginal at 85 rows in 1 file because it is directly
+# observed). `date(1920, 1, 7)` and any other not-yet-observed
+# placeholder-like value must still trigger halt-on-other-unexpected;
+# extend only on direct substrate evidence via a separately scoped
+# substrate amendment memo.
+SENTINEL_SQLDATES: Tuple[date, ...] = (
+    date(1920, 1, 1),
+    date(1920, 1, 2),
+    date(1920, 1, 3),
+    date(1920, 1, 4),
+    date(1920, 1, 5),
+    date(1920, 1, 6),
+)
 
 # Known publishing-file substrate gaps from `a8a9dd2` §2 / §10 (memo §12).
 # These dates are excluded from the recognized-list capture by construction;

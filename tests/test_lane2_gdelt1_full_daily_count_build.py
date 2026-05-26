@@ -2124,14 +2124,31 @@ def _make_payload_with_explicit_sqldates(nominal_date, sqldate_rows):
     return buf.getvalue()
 
 
-def test_sentinel_sqldates_constant_is_narrow_seed():
-    """SENTINEL_SQLDATES must be seeded exactly with date(1920, 1, 1),
-    narrow now and extensible in shape (per substrate amendment memo §7)."""
+def test_sentinel_sqldates_constant_is_evidence_bounded_six_value_tuple():
+    """SENTINEL_SQLDATES must be the evidence-bounded 6-value tuple
+    `(date(1920, 1, 1), date(1920, 1, 2), date(1920, 1, 3), date(1920, 1,
+    4), date(1920, 1, 5), date(1920, 1, 6))` per the chunk_2020
+    substrate amendment memo at commit `a1f2c4c`. Every member is
+    directly observed in substrate evidence; zero predicted values;
+    `date(1920, 1, 7)` is NOT included."""
     m = _load_runner()
-    assert m.SENTINEL_SQLDATES == (date(1920, 1, 1),)
+    expected = (
+        date(1920, 1, 1),
+        date(1920, 1, 2),
+        date(1920, 1, 3),
+        date(1920, 1, 4),
+        date(1920, 1, 5),
+        date(1920, 1, 6),
+    )
+    assert m.SENTINEL_SQLDATES == expected
     assert isinstance(m.SENTINEL_SQLDATES, tuple)
+    assert len(m.SENTINEL_SQLDATES) == 6
     for s in m.SENTINEL_SQLDATES:
         assert isinstance(s, date)
+    # Negative assertion: date(1920, 1, 7) must NOT be in the recognized
+    # sentinel set — it must still halt under halt-on-other-unexpected
+    # unless separately evidenced by a future substrate amendment memo.
+    assert date(1920, 1, 7) not in m.SENTINEL_SQLDATES
 
 
 def test_parser_recognizes_sentinel_sqldate_no_halt():
@@ -2233,7 +2250,9 @@ def test_parser_mixed_sentinel_and_canonical():
 def test_empty_payload_initializes_sentinel_fields():
     """Empty-parse-result fallback must initialize the new sentinel
     fields to zero/empty defaults so downstream aggregators have stable
-    types."""
+    types. Per chunk_2020 substrate amendment (`a1f2c4c`),
+    `per_sentinel_count` is initialized with one zero-entry per value
+    in the 6-value `SENTINEL_SQLDATES` tuple."""
     m = _load_runner()
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
@@ -2241,8 +2260,100 @@ def test_empty_payload_initializes_sentinel_fields():
     nom = date(2019, 12, 31)
     p = m.parse_payload(buf.getvalue(), nom)
     assert p["total_sentinel_rows"] == 0
-    assert p["per_sentinel_count"] == {"1920-01-01": 0}
+    assert p["per_sentinel_count"] == {
+        "1920-01-01": 0,
+        "1920-01-02": 0,
+        "1920-01-03": 0,
+        "1920-01-04": 0,
+        "1920-01-05": 0,
+        "1920-01-06": 0,
+    }
     assert p["sentinel_sqldate_distribution"] == {}
+
+
+def test_parser_recognizes_all_six_sentinel_sqldates_no_halt():
+    """Each of the 6 sentinel SQLDATEs (`1920-01-01..1920-01-06`) must
+    be recognized as a sentinel row, NOT raise FullBuildBoundaryBreach,
+    and be routed into per_sentinel_count / sentinel_sqldate_distribution
+    / total_sentinel_rows only (Option α: excluded from primary series).
+    Chunk_2020 substrate amendment memo (`a1f2c4c`) — directly observed
+    values across 6 affected file dates."""
+    m = _load_runner()
+    nom = date(2020, 1, 3)  # mid-cluster nominal file date
+    sentinel_rows = [
+        ("19200101", 1),
+        ("19200102", 1),
+        ("19200103", 1),
+        ("19200104", 1),
+        ("19200105", 1),
+        ("19200106", 1),
+    ]
+    payload = _make_payload_with_explicit_sqldates(nom, sentinel_rows)
+    p = m.parse_payload(payload, nom)
+    assert p["total_sentinel_rows"] == 6
+    for iso in [
+        "1920-01-01", "1920-01-02", "1920-01-03",
+        "1920-01-04", "1920-01-05", "1920-01-06",
+    ]:
+        assert p["per_sentinel_count"][iso] == 1, iso
+        assert p["sentinel_sqldate_distribution"][iso][
+            nom.isoformat()
+        ] == 1, iso
+    # Option α: sentinel rows excluded from per_offset_count, from
+    # sqldate_offset_counts, and from out_of_window diagnostics.
+    for off, cnt in p["per_offset_count"].items():
+        assert cnt == 0, (off, cnt)
+    assert p["sqldate_offset_counts"] == {}
+    assert p["out_of_window_row_count"] == 0
+    assert p["out_of_window_sqldate_distribution"] == {}
+
+
+def test_parser_halts_on_date_1920_01_07_unobserved_placeholder():
+    """`date(1920, 1, 7)` is NOT in the recommended sentinel tuple
+    because it was not directly observed in the chunk_2020 Option B
+    bounded-envelope research. The runner must continue to halt via
+    `FullBuildBoundaryBreach` on any SQLDATE outside `SENTINEL_SQLDATES`
+    whose offset is outside `EXPECTED_OFFSETS` — the
+    discovery-preservation property remains load-bearing per
+    `a1f2c4c` §6.5. Any future encounter with `1920-01-07` must
+    motivate a separately scoped substrate amendment memo, not silent
+    expansion."""
+    m = _load_runner()
+    assert date(1920, 1, 7) not in m.SENTINEL_SQLDATES
+    nom = date(2020, 1, 6)  # offset would be -36524 days
+    payload = _make_payload_with_explicit_sqldates(
+        nom, [("19200107", 1)],
+    )
+    with pytest.raises(m.FullBuildBoundaryBreach):
+        m.parse_payload(payload, nom)
+
+
+def test_parser_halts_on_other_non_sentinel_placeholder_like_value():
+    """A non-sentinel SQLDATE outside the `1920-01-XX` early-Jan cluster
+    must still halt (e.g. `1920-02-15` in a `2020-02-15` payload).
+    Discovery-preservation prevents silent absorption of out-of-cluster
+    placeholder-like values that the amendment memo §6.4 explicitly
+    flagged as overgeneralization risks for year-shift predicates."""
+    m = _load_runner()
+    nom = date(2020, 2, 15)
+    payload = _make_payload_with_explicit_sqldates(
+        nom, [("19200215", 1)],
+    )
+    with pytest.raises(m.FullBuildBoundaryBreach):
+        m.parse_payload(payload, nom)
+
+
+def test_chunk_2020_runner_anchors_unchanged_after_sentinel_amendment():
+    """The runner amendment must update `SENTINEL_SQLDATES` only; it
+    must NOT change chunk-definition anchors. chunk_2020 retains
+    `EXPECTED_CHUNK_COUNTS = 366` and date range `(2020-01-01,
+    2020-12-31)` per `a1f2c4c` §7.2."""
+    m = _load_runner()
+    assert "chunk_2020" in m.CHUNK_IDS
+    assert m.EXPECTED_CHUNK_COUNTS["chunk_2020"] == 366
+    assert m.CHUNK_YEAR_RANGES["chunk_2020"] == (
+        date(2020, 1, 1), date(2020, 12, 31),
+    )
 
 
 def test_accumulator_aggregates_sentinel_fields():
