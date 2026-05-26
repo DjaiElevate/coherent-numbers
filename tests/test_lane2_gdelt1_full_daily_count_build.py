@@ -2093,3 +2093,206 @@ def test_chunk_halt_diagnostic_is_derived_only(tmp_path):
     assert "sqldate" not in str(diag).lower()
     assert ".csv" not in str(diag).lower()
     assert diag["halt_class"] == "FetchFailure"
+
+
+# ============================================================================
+# 17. Sentinel SQLDATE subclass (substrate amendment memo at commit `7206e30`,
+#     R3 + Option α). The 2019-12-31 GDELT 1.0 daily-export file contained
+#     120 rows with SQLDATE 1920-01-01; the parser must recognize these as
+#     sentinel-placeholder rows, route them into per-sentinel diagnostics
+#     only, exclude them from primary aggregates (Option α), and continue
+#     to halt on any non-sentinel SQLDATE whose offset is outside
+#     `EXPECTED_OFFSETS` (discovery-preservation property).
+# ============================================================================
+
+def _make_payload_with_explicit_sqldates(nominal_date, sqldate_rows):
+    """Build a synthetic GDELT-shaped .zip payload with hand-specified
+    SQLDATE values (not offsets). `sqldate_rows` is a list of
+    (sqldate_yyyymmdd_str, count) tuples."""
+    rows = []
+    row_id = 0
+    yyyymmdd_nominal = nominal_date.strftime("%Y%m%d")
+    for sqldate_str, count in sqldate_rows:
+        for _ in range(count):
+            row_id += 1
+            rows.append("{}\t{}\tA".format(row_id, sqldate_str))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "{}.export.CSV".format(yyyymmdd_nominal), "\n".join(rows),
+        )
+    return buf.getvalue()
+
+
+def test_sentinel_sqldates_constant_is_narrow_seed():
+    """SENTINEL_SQLDATES must be seeded exactly with date(1920, 1, 1),
+    narrow now and extensible in shape (per substrate amendment memo §7)."""
+    m = _load_runner()
+    assert m.SENTINEL_SQLDATES == (date(1920, 1, 1),)
+    assert isinstance(m.SENTINEL_SQLDATES, tuple)
+    for s in m.SENTINEL_SQLDATES:
+        assert isinstance(s, date)
+
+
+def test_parser_recognizes_sentinel_sqldate_no_halt():
+    """A row with SQLDATE = 19200101 in a 2019-12-31 payload must be
+    recognized as a sentinel row, NOT raise FullBuildBoundaryBreach, and
+    be routed into per_sentinel_count / sentinel_sqldate_distribution /
+    total_sentinel_rows only (Option α: excluded from primary series)."""
+    m = _load_runner()
+    nom = date(2019, 12, 31)
+    payload = _make_payload_with_explicit_sqldates(
+        nom, [("19200101", 1)],
+    )
+    p = m.parse_payload(payload, nom)
+    assert p["total_sentinel_rows"] == 1
+    assert p["per_sentinel_count"]["1920-01-01"] == 1
+    assert p["sentinel_sqldate_distribution"]["1920-01-01"][
+        "2019-12-31"
+    ] == 1
+    # Option α: sentinel rows excluded from per_offset_count, from
+    # sqldate_offset_counts, and from out_of_window diagnostics.
+    for off, cnt in p["per_offset_count"].items():
+        assert cnt == 0, (off, cnt)
+    assert p["sqldate_offset_counts"] == {}
+    assert p["out_of_window_row_count"] == 0
+    assert p["out_of_window_sqldate_distribution"] == {}
+
+
+def test_parser_still_halts_on_non_sentinel_unexpected_offset():
+    """The halt-on-other-unexpected behavior must be preserved verbatim.
+    A non-sentinel SQLDATE whose offset is not in EXPECTED_OFFSETS must
+    still raise FullBuildBoundaryBreach. Discovery-preservation property
+    (memo §8 / §13)."""
+    m = _load_runner()
+    nom = date(2019, 12, 31)
+    # Offset = -100 days = 2019-09-22; not in EXPECTED_OFFSETS, not in
+    # SENTINEL_SQLDATES.
+    payload = _make_payload_zip(nom, [(-100, 1)])
+    with pytest.raises(m.FullBuildBoundaryBreach):
+        m.parse_payload(payload, nom)
+
+
+def test_parser_canonical_offsets_unchanged_semantics():
+    """A payload of canonical offsets only must still produce
+    per_offset_count / sqldate_offset_counts exactly as before, with
+    sentinel counters at zero (no regression in non-sentinel handling)."""
+    m = _load_runner()
+    nom = date(2018, 6, 15)
+    p = m.parse_payload(
+        _make_payload_zip(nom, [
+            (-3650, 1), (-365, 1), (-30, 1), (-7, 1),
+            (-1, 1), (0, 1), (1, 1),
+        ]),
+        nom,
+    )
+    for off in m.EXPECTED_OFFSETS:
+        assert p["per_offset_count"][off] == 1
+    assert p["total_sentinel_rows"] == 0
+    assert p["per_sentinel_count"]["1920-01-01"] == 0
+    assert p["sentinel_sqldate_distribution"] == {}
+
+
+def test_parser_mixed_sentinel_and_canonical():
+    """A mixed payload must attribute canonical rows to existing
+    aggregates exactly and sentinel rows only to sentinel diagnostics.
+    Accounting identity:
+        row_count
+        == sum(per_offset_count)
+           + total_sentinel_rows
+           + malformed_short_rows
+           + unparseable_sqldate_rows
+    """
+    m = _load_runner()
+    nom = date(2019, 12, 31)
+    # 2 canonical T=0 + 1 canonical T-7 + 3 sentinel
+    canonical_zero = nom.strftime("%Y%m%d")
+    canonical_minus_7 = (nom + timedelta(days=-7)).strftime("%Y%m%d")
+    payload = _make_payload_with_explicit_sqldates(nom, [
+        (canonical_zero, 2),
+        (canonical_minus_7, 1),
+        ("19200101", 3),
+    ])
+    p = m.parse_payload(payload, nom)
+    assert p["per_offset_count"][0] == 2
+    assert p["per_offset_count"][-7] == 1
+    assert p["total_sentinel_rows"] == 3
+    assert p["per_sentinel_count"]["1920-01-01"] == 3
+    canonical_total = sum(p["per_offset_count"].values())
+    accounting_total = (
+        canonical_total
+        + p["total_sentinel_rows"]
+        + p["malformed_short_rows"]
+        + p["unparseable_sqldate_rows"]
+    )
+    assert accounting_total == p["row_count"], (
+        canonical_total, p["total_sentinel_rows"], p["row_count"],
+    )
+
+
+def test_empty_payload_initializes_sentinel_fields():
+    """Empty-parse-result fallback must initialize the new sentinel
+    fields to zero/empty defaults so downstream aggregators have stable
+    types."""
+    m = _load_runner()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        pass
+    nom = date(2019, 12, 31)
+    p = m.parse_payload(buf.getvalue(), nom)
+    assert p["total_sentinel_rows"] == 0
+    assert p["per_sentinel_count"] == {"1920-01-01": 0}
+    assert p["sentinel_sqldate_distribution"] == {}
+
+
+def test_accumulator_aggregates_sentinel_fields():
+    """_ingest_parse_into_accumulator must fold sentinel fields from each
+    parse_result into the running accumulator, preserving Option α
+    attribution at the aggregate level."""
+    m = _load_runner()
+    accum = m._new_accumulator()
+    nom = date(2019, 12, 31)
+    p1 = m.parse_payload(
+        _make_payload_with_explicit_sqldates(nom, [("19200101", 2)]),
+        nom,
+    )
+    nom2 = date(2019, 12, 30)
+    p2 = m.parse_payload(
+        _make_payload_with_explicit_sqldates(nom2, [("19200101", 1)]),
+        nom2,
+    )
+    m._ingest_parse_into_accumulator(accum, p1)
+    m._ingest_parse_into_accumulator(accum, p2)
+    assert accum["total_sentinel_rows"] == 3
+    assert accum["per_sentinel_total"]["1920-01-01"] == 3
+    assert accum["sentinel_sqldate_distribution"]["1920-01-01"][
+        "2019-12-31"
+    ] == 2
+    assert accum["sentinel_sqldate_distribution"]["1920-01-01"][
+        "2019-12-30"
+    ] == 1
+
+
+def test_full_build_authorized_still_false_after_amendment():
+    """The runner amendment must not flip FULL_BUILD_AUTHORIZED. Sentinel
+    handling is a parser-level addition; the three-guard discipline is
+    unchanged."""
+    m = _load_runner()
+    assert m.FULL_BUILD_AUTHORIZED is False
+
+
+def test_expected_offsets_unchanged_after_amendment():
+    """The runner amendment must NOT widen EXPECTED_OFFSETS. R3 retains
+    the 7-element taxonomy for non-sentinel rows verbatim (memo §13)."""
+    m = _load_runner()
+    assert m.EXPECTED_OFFSETS == (-3650, -365, -30, -7, -1, 0, 1)
+
+
+def test_known_substrate_gaps_unchanged_after_amendment():
+    """KNOWN_SUBSTRATE_GAPS is fetch-gap handling, conceptually separate
+    from sentinel-SQLDATE handling. R3 must not modify it (memo §6 /
+    §13)."""
+    m = _load_runner()
+    assert m.KNOWN_SUBSTRATE_GAPS == (
+        "2014-01-23", "2014-01-24", "2014-01-25", "2014-03-19",
+    )

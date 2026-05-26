@@ -119,6 +119,22 @@ SEAL_START = date(2023, 1, 1)
 # Order is canonical: ascending offset value.
 EXPECTED_OFFSETS: Tuple[int, ...] = (-3650, -365, -30, -7, -1, 0, 1)
 
+# Sentinel SQLDATE subclass (substrate amendment memo at commit `7206e30`,
+# R3 + Option α). Rows whose parsed SQLDATE equals a value in this set
+# are recognized as placeholder-dated rather than lookback-retrocoded,
+# routed into per-sentinel diagnostics, excluded from
+# `total_in_window_rows` / `total_out_of_window_rows` under Option α, and
+# NOT subject to the `EXPECTED_OFFSETS` halt. The halt-on-other-unexpected
+# behavior is preserved verbatim for any non-sentinel SQLDATE whose offset
+# is outside `EXPECTED_OFFSETS` — the discovery-preservation property
+# remains load-bearing. Empirical basis: the 2019-12-31 daily-export file
+# contained 120 such rows with SQLDATE `1920-01-01`; archived halt
+# diagnostic at
+# `archive/halted_attempts/lane2_gdelt1_full_daily_count_build/`
+# `chunk_2019_20260525T192552Z/halt_diagnostic.json`. Set is narrow now,
+# extensible in shape — extend only on direct substrate evidence.
+SENTINEL_SQLDATES: Tuple[date, ...] = (date(1920, 1, 1),)
+
 # Known publishing-file substrate gaps from `a8a9dd2` §2 / §10 (memo §12).
 # These dates are excluded from the recognized-list capture by construction;
 # the runner does not fetch them.
@@ -628,7 +644,12 @@ def parse_payload(
       - unparseable-SQLDATE rows (value not parseable as YYYYMMDD);
       - header anomaly on first row;
       - out-of-window SQLDATE rows (excluded from primary series,
-        recorded in `out_of_window_sqldate_distribution`).
+        recorded in `out_of_window_sqldate_distribution`);
+      - sentinel-SQLDATE rows (rows whose SQLDATE is in
+        `SENTINEL_SQLDATES`; excluded from primary series and from offset
+        computation under Option α; recorded in `per_sentinel_count` /
+        `sentinel_sqldate_distribution` / `total_sentinel_rows`; substrate
+        amendment memo at commit `7206e30`, R3 + Option α).
     """
     if nominal_date >= SEAL_START:
         raise FullBuildBoundaryBreach(
@@ -654,6 +675,13 @@ def parse_payload(
     sqldate_offset_counts: Dict[Tuple[str, int], int] = {}
     out_of_window_count = 0
     out_of_window_sqldate_distribution: Dict[str, Dict[str, int]] = {}
+    # Sentinel-SQLDATE diagnostics (substrate amendment memo at commit
+    # `7206e30`, R3 + Option α).
+    per_sentinel_count: Dict[str, int] = {
+        s.isoformat(): 0 for s in SENTINEL_SQLDATES
+    }
+    sentinel_sqldate_distribution: Dict[str, Dict[str, int]] = {}
+    total_sentinel_rows = 0
     malformed_short = 0
     unparseable_sqldate = 0
     header_anomaly = False
@@ -683,6 +711,23 @@ def parse_payload(
                 "2023+ SQLDATE row in payload nominally dated {}: "
                 "{}".format(nominal_date.isoformat(), d.isoformat())
             )
+        if d in SENTINEL_SQLDATES:
+            # Sentinel-SQLDATE row: placeholder-dated, NOT lookback-
+            # retrocoded. Route to per-sentinel diagnostics only; exclude
+            # from per_offset_count / sqldate_offset_counts /
+            # out_of_window_sqldate_distribution (Option α). Halt-on-other-
+            # unexpected behavior below is preserved for non-sentinel rows.
+            iso_sentinel = d.isoformat()
+            per_sentinel_count[iso_sentinel] = (
+                per_sentinel_count.get(iso_sentinel, 0) + 1
+            )
+            nominal_iso = nominal_date.isoformat()
+            entry = sentinel_sqldate_distribution.setdefault(
+                iso_sentinel, {}
+            )
+            entry[nominal_iso] = entry.get(nominal_iso, 0) + 1
+            total_sentinel_rows += 1
+            continue
         offset = (d - nominal_date).days
         if offset not in EXPECTED_OFFSETS:
             raise FullBuildBoundaryBreach(
@@ -725,6 +770,9 @@ def parse_payload(
         "out_of_window_sqldate_distribution": (
             out_of_window_sqldate_distribution
         ),
+        "per_sentinel_count": per_sentinel_count,
+        "sentinel_sqldate_distribution": sentinel_sqldate_distribution,
+        "total_sentinel_rows": total_sentinel_rows,
     }
 
 
@@ -739,6 +787,11 @@ def _empty_parse_result(nominal_date: date) -> Dict[str, Any]:
         "sqldate_offset_counts": {},
         "out_of_window_row_count": 0,
         "out_of_window_sqldate_distribution": {},
+        "per_sentinel_count": {
+            s.isoformat(): 0 for s in SENTINEL_SQLDATES
+        },
+        "sentinel_sqldate_distribution": {},
+        "total_sentinel_rows": 0,
     }
 
 
@@ -943,6 +996,16 @@ def _new_accumulator() -> Dict[str, Any]:
         # Aggregate diagnostics
         "total_malformed_short_rows": 0,
         "total_unparseable_sqldate_rows": 0,
+        # Sentinel-SQLDATE aggregates (substrate amendment memo at commit
+        # `7206e30`, R3 + Option α). per_sentinel_total maps sentinel
+        # ISO-date string -> running count across all fetched files;
+        # sentinel_sqldate_distribution maps sentinel ISO-date string ->
+        # nominal-file-date ISO string -> count.
+        "per_sentinel_total": {
+            s.isoformat(): 0 for s in SENTINEL_SQLDATES
+        },
+        "sentinel_sqldate_distribution": {},
+        "total_sentinel_rows": 0,
         # Per-file manifest (one entry per fetched URL)
         "per_file_manifest": [],
         # Aggregate parsed row count across all fetched files
@@ -975,6 +1038,23 @@ def _ingest_parse_into_accumulator(
         )
         for ostr, cnt in dist.items():
             entry[ostr] = entry.get(ostr, 0) + cnt
+    accum["total_sentinel_rows"] += parse_result.get(
+        "total_sentinel_rows", 0
+    )
+    for iso_sentinel, cnt in parse_result.get(
+        "per_sentinel_count", {}
+    ).items():
+        accum["per_sentinel_total"][iso_sentinel] = (
+            accum["per_sentinel_total"].get(iso_sentinel, 0) + cnt
+        )
+    for iso_sentinel, dist in parse_result.get(
+        "sentinel_sqldate_distribution", {}
+    ).items():
+        entry = accum["sentinel_sqldate_distribution"].setdefault(
+            iso_sentinel, {}
+        )
+        for nominal_iso, cnt in dist.items():
+            entry[nominal_iso] = entry.get(nominal_iso, 0) + cnt
 
 
 # ── Per-civil-date output row construction ───────────────────────────────────
@@ -1906,6 +1986,13 @@ def run_chunk_build(
     total_parsed_rows = 0
     total_malformed_short = 0
     total_unparseable_sqldate = 0
+    # Sentinel-SQLDATE chunk-local accumulators (substrate amendment memo
+    # at commit `7206e30`, R3 + Option α).
+    per_sentinel_total: Dict[str, int] = {
+        s.isoformat(): 0 for s in SENTINEL_SQLDATES
+    }
+    sentinel_sqldate_distribution: Dict[str, Dict[str, int]] = {}
+    total_sentinel_rows = 0
     per_file_manifest: List[Dict[str, Any]] = []
     started_at = datetime.now(timezone.utc).isoformat()
     actual_completed = 0
@@ -1957,6 +2044,23 @@ def run_chunk_build(
                 entry = out_of_window_distribution.setdefault(d_iso, {})
                 for ostr, cnt in dist.items():
                     entry[ostr] = entry.get(ostr, 0) + cnt
+            total_sentinel_rows += parse_result.get(
+                "total_sentinel_rows", 0
+            )
+            for iso_sentinel, cnt in parse_result.get(
+                "per_sentinel_count", {}
+            ).items():
+                per_sentinel_total[iso_sentinel] = (
+                    per_sentinel_total.get(iso_sentinel, 0) + cnt
+                )
+            for iso_sentinel, dist in parse_result.get(
+                "sentinel_sqldate_distribution", {}
+            ).items():
+                entry = sentinel_sqldate_distribution.setdefault(
+                    iso_sentinel, {}
+                )
+                for nominal_iso, cnt in dist.items():
+                    entry[nominal_iso] = entry.get(nominal_iso, 0) + cnt
             actual_completed += 1
     except (FullBuildBoundaryBreach, FetchFailure,
             RecognizedListSchemaError, ReconciliationContradiction,
@@ -1977,17 +2081,18 @@ def run_chunk_build(
     counted_total = (
         total_in_window_rows
         + out_of_window_row_count
+        + total_sentinel_rows
         + total_malformed_short
         + total_unparseable_sqldate
     )
     if counted_total != total_parsed_rows:
         raise FullBuildBoundaryBreach(
             "chunk {!r} counting invariant violation: "
-            "in_window={} + out_of_window={} + malformed={} + "
-            "unparseable={} = {} != total_parsed={}".format(
+            "in_window={} + out_of_window={} + sentinel={} + "
+            "malformed={} + unparseable={} = {} != total_parsed={}".format(
                 chunk_id, total_in_window_rows, out_of_window_row_count,
-                total_malformed_short, total_unparseable_sqldate,
-                counted_total, total_parsed_rows,
+                total_sentinel_rows, total_malformed_short,
+                total_unparseable_sqldate, counted_total, total_parsed_rows,
             )
         )
 
@@ -2026,10 +2131,15 @@ def run_chunk_build(
             "total_parsed_rows": total_parsed_rows,
             "total_in_window_rows": total_in_window_rows,
             "total_out_of_window_rows": out_of_window_row_count,
+            "total_sentinel_rows": total_sentinel_rows,
             "actual_completed_file_count": actual_completed,
             "per_offset_total": {
                 str(k): v for k, v in per_offset_total.items()
             },
+            "per_sentinel_total": per_sentinel_total,
+            "sentinel_sqldate_distribution": (
+                sentinel_sqldate_distribution
+            ),
         },
     }
 
