@@ -92,7 +92,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 # under the future build-execution-authorization prompt. Mirrors prior
 # Lane 2 runners' guard patterns (count-feasibility, event-file probe,
 # row-date characterization).
-FULL_BUILD_AUTHORIZED = True
+FULL_BUILD_AUTHORIZED = False
 
 
 # ── Substrate-pinned constants (no CLI / env / config override) ──────────────
