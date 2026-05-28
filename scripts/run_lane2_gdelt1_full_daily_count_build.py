@@ -276,7 +276,16 @@ class ReconciliationContradiction(RuntimeError):
 
 class FetchFailure(RuntimeError):
     """Raised when a fetch fails (HTTP non-200, redirect, connection
-    error, timeout) for an in-universe URL — hard-fail per Decision I."""
+    error, timeout) for an in-universe URL — hard-fail per Decision I.
+
+    `code` carries the HTTP status when known (e.g. 404), else None. It is
+    used ONLY to narrowly scope the committed documented-exception carve-out
+    to a genuine upstream-object-unavailable 404; it does not relax hard-fail
+    behavior for any other failure class or status."""
+
+    def __init__(self, message: str, code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # ── Local redirect-disabled opener (full-build-scoped) ───────────────────────
@@ -1269,7 +1278,8 @@ def _fetch_one_payload(
         )
     except urllib.error.HTTPError as e:
         raise FetchFailure(
-            "HTTP error {} for {}: {}".format(e.code, url, e.reason)
+            "HTTP error {} for {}: {}".format(e.code, url, e.reason),
+            code=e.code,
         )
     except urllib.error.URLError as e:
         raise FetchFailure(
@@ -1282,7 +1292,8 @@ def _fetch_one_payload(
     status = resp.getcode() if hasattr(resp, "getcode") else None
     if status != 200:
         raise FetchFailure(
-            "non-200 HTTP {} for {}".format(status, url)
+            "non-200 HTTP {} for {}".format(status, url),
+            code=status,
         )
     payload = resp.read()
     if hasattr(resp, "close"):
@@ -1940,7 +1951,143 @@ def render_chunk_summary(
             metadata.get("chunk_manifest_digest", "")
         ),
     ]
+    ded = metadata.get("documented_exception_diagnostic", {})
+    if ded.get("documented_unavailable_data_confirmed_days", 0):
+        parts.extend([
+            "",
+            "- documented_exception_label: {}".format(
+                ded.get("documented_exception_label", "")
+            ),
+            "- expected_calendar_days: {}".format(
+                ded.get("expected_calendar_days", "")
+            ),
+            "- raw_processed_days: {}".format(
+                ded.get("raw_processed_days", "")
+            ),
+            "- documented_unavailable_data_confirmed_days: {}".format(
+                ded.get("documented_unavailable_data_confirmed_days", 0)
+            ),
+            "- recovered_days: {}".format(ded.get("recovered_days", 0)),
+            "- known_no_data_gap_days: {}".format(
+                ded.get("known_no_data_gap_days", 0)
+            ),
+            "- terminal_status_days: {} (= raw_processed_days + "
+            "documented_unavailable_data_confirmed_days)".format(
+                ded.get("terminal_status_days", "")
+            ),
+            "- NOTE: this is NOT a full-raw-year completion and NOT an "
+            "ordinary completion; raw_processed_days is strictly less than "
+            "expected_calendar_days. The documented-exception day is "
+            "official-source data-confirmed but its raw object was "
+            "unavailable; it is NOT recovered, NOT raw-processed, and NOT a "
+            "no-data gap.",
+        ])
     return "\n".join(parts)
+
+
+# ── Documented-exception support (narrow upstream-object-unavailable carve-out) ─
+#
+# Runtime carve-out from the FetchFailure-halt path, governed by the committed
+# contract + representation artifact (commit `5f43a13`; design memos
+# `e60a88a` → `854a606` → `36202b9` → `50dda46`). It applies ONLY to the exact
+# committed quintuple (chunk_id + date + raw_filename + label + md5/size
+# agreement) and ONLY on a genuine 404. It does NOT fetch/recover/parse rows,
+# does NOT treat the date as a no-data gap, does NOT amend `KNOWN_SUBSTRATE_GAPS`,
+# and does NOT reduce expected_file_count. Any other 404 (other date, other
+# chunk, wrong filename) or any non-404 failure still hard-fails as before.
+DOCUMENTED_EXCEPTIONS_CONFIG_PATH = (
+    "configs/lane2_gdelt1_documented_exceptions.json"
+)
+DOCUMENTED_EXCEPTION_LABEL = (
+    "UPSTREAM_OBJECT_UNAVAILABLE_DATA_CONFIRMED_REPRESENTED_ONLY"
+)
+
+
+def load_documented_exceptions(
+    repo_root: str,
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """Load committed documented-exception entries keyed by (chunk_id, date).
+
+    Returns {} if the contract file is absent (ordinary halt-on-fetch-failure
+    behavior fully preserved). Each contract entry is cross-validated against
+    its committed representation artifact; an entry is DROPPED (not loaded) if
+    the artifact is missing, the label is wrong, the md5/size disagree, or any
+    of the negative-evidence booleans are not False. A dropped/mismatched entry
+    therefore CANNOT widen the carve-out — it falls through to the normal halt.
+    """
+    config_path = os.path.join(repo_root, DOCUMENTED_EXCEPTIONS_CONFIG_PATH)
+    if not os.path.isfile(config_path):
+        return {}
+    with open(config_path, "r", encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for entry in cfg.get("documented_exceptions", []):
+        label = entry.get("label")
+        scope = entry.get("allowed_scope", {})
+        rep_rel = entry.get("representation_artifact")
+        if label != DOCUMENTED_EXCEPTION_LABEL or not rep_rel:
+            continue
+        rep_path = os.path.join(repo_root, rep_rel)
+        if not os.path.isfile(rep_path):
+            continue
+        with open(rep_path, "r", encoding="utf-8") as fh:
+            rep = json.load(fh)
+        if (
+            rep.get("label") != DOCUMENTED_EXCEPTION_LABEL
+            or rep.get("chunk_id") != scope.get("chunk_id")
+            or rep.get("date") != scope.get("date")
+            or rep.get("raw_filename") != scope.get("raw_filename")
+            or rep.get("catalog_md5") != scope.get("catalog_md5")
+            or rep.get("catalog_filesize_bytes")
+            != scope.get("catalog_filesize_bytes")
+            or rep.get("raw_object_parsed") is not False
+            or rep.get("rows_recovered") is not False
+            or rep.get("no_data_gap") is not False
+            or rep.get("recovered") is not False
+            or rep.get("raw_processed") is not False
+        ):
+            continue
+        if not (
+            scope.get("chunk_id")
+            and scope.get("date")
+            and scope.get("raw_filename")
+            and scope.get("catalog_md5")
+            and scope.get("catalog_filesize_bytes")
+        ):
+            continue
+        out[(scope["chunk_id"], scope["date"])] = {
+            "label": label,
+            "chunk_id": scope["chunk_id"],
+            "date": scope["date"],
+            "raw_filename": scope["raw_filename"],
+            "catalog_md5": scope["catalog_md5"],
+            "catalog_filesize_bytes": scope["catalog_filesize_bytes"],
+            "representation_artifact": rep_rel,
+        }
+    return out
+
+
+def documented_exception_match(
+    chunk_id: str,
+    iso: str,
+    url: str,
+    exceptions: Dict[Tuple[str, str], Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return the documented-exception entry IFF the exact quintuple matches.
+
+    Quintuple = chunk_id + date + raw_filename (verified against the URL) +
+    label + (md5 AND size as recorded in the committed contract/representation,
+    validated during load). Any deviation returns None -> normal hard-fail.
+    Caller must additionally require a genuine 404 before invoking the carve-out.
+    """
+    entry = exceptions.get((chunk_id, iso))
+    if entry is None:
+        return None
+    if entry["label"] != DOCUMENTED_EXCEPTION_LABEL:
+        return None
+    if not url.endswith("/" + entry["raw_filename"]):
+        return None
+    return entry
 
 
 def run_chunk_build(
@@ -2016,6 +2163,8 @@ def run_chunk_build(
     sentinel_sqldate_distribution: Dict[str, Dict[str, int]] = {}
     total_sentinel_rows = 0
     per_file_manifest: List[Dict[str, Any]] = []
+    documented_exceptions = load_documented_exceptions(repo_root)
+    documented_exception_entries: List[Dict[str, Any]] = []
     started_at = datetime.now(timezone.utc).isoformat()
     actual_completed = 0
 
@@ -2023,9 +2172,55 @@ def run_chunk_build(
         for iso in chunk_manifest:
             nominal = date.fromisoformat(iso)
             url = date_to_daily_url(nominal)
-            payload, payload_sha = _fetch_one_payload(
-                opener, url, timeout=timeout,
-            )
+            try:
+                payload, payload_sha = _fetch_one_payload(
+                    opener, url, timeout=timeout,
+                )
+            except FetchFailure as fe:
+                match = (
+                    documented_exception_match(
+                        chunk_id, iso, url, documented_exceptions,
+                    )
+                    if fe.code == 404
+                    else None
+                )
+                if match is None:
+                    raise
+                # Committed documented exception: officially data-confirmed
+                # but raw object unavailable. Do NOT fetch/recover/parse rows;
+                # do NOT treat as a no-data gap; do NOT amend
+                # KNOWN_SUBSTRATE_GAPS. Record and continue to later raw days.
+                # This does NOT count as a raw-processed day (actual_completed
+                # is not incremented).
+                per_file_manifest.append({
+                    "url": url,
+                    "nominal_date": iso,
+                    "http_status": 404,
+                    "http_status_class": "404_upstream_object_unavailable",
+                    "status": (
+                        "documented_exception_upstream_object_"
+                        "unavailable_data_confirmed_represented_only"
+                    ),
+                    "documented_exception_label": match["label"],
+                    "catalog_md5": match["catalog_md5"],
+                    "catalog_filesize_bytes": match["catalog_filesize_bytes"],
+                    "representation_artifact": match["representation_artifact"],
+                    "raw_object_parsed": False,
+                    "rows_recovered": False,
+                })
+                documented_exception_entries.append({
+                    "date": iso,
+                    "raw_filename": match["raw_filename"],
+                    "url": url,
+                    "label": match["label"],
+                    "catalog_md5": match["catalog_md5"],
+                    "catalog_filesize_bytes": match["catalog_filesize_bytes"],
+                    "representation_artifact": match["representation_artifact"],
+                    "http_status": 404,
+                    "raw_object_parsed": False,
+                    "rows_recovered": False,
+                })
+                continue
             parse_result = parse_payload(payload, nominal)
             del payload
             per_file_manifest.append({
@@ -2138,6 +2333,34 @@ def run_chunk_build(
         "substrate_gap_diagnostic": {
             "known_substrate_gap_dates": list(KNOWN_SUBSTRATE_GAPS),
             "substrate_gap_dates_not_fetched": list(KNOWN_SUBSTRATE_GAPS),
+        },
+        "documented_exception_diagnostic": {
+            "documented_exception_label": DOCUMENTED_EXCEPTION_LABEL,
+            "expected_calendar_days": len(chunk_manifest),
+            "raw_processed_days": actual_completed,
+            "documented_unavailable_data_confirmed_days": len(
+                documented_exception_entries
+            ),
+            "recovered_days": 0,
+            "known_no_data_gap_days": 0,
+            "terminal_status_days": (
+                actual_completed + len(documented_exception_entries)
+            ),
+            "terminal_status_complete": (
+                (actual_completed + len(documented_exception_entries))
+                == len(chunk_manifest)
+            ),
+            "raw_object_parsed_for_documented_days": False,
+            "rows_recovered_for_documented_days": False,
+            "recovered": False,
+            "no_data_gap": False,
+            "known_substrate_gap_amended": False,
+            "bigquery_count_semantics_note": (
+                "Any official BigQuery COUNT(*) for a documented-exception "
+                "date is coverage evidence, NOT an exact runner-output "
+                "validation gate."
+            ),
+            "documented_exceptions": documented_exception_entries,
         },
         "out_of_window_sqldate_diagnostic": {
             "total_out_of_window_rows": out_of_window_row_count,

@@ -30,7 +30,8 @@ RUNNER_PATH = REPO_ROOT / "scripts" / "run_lane2_gdelt1_full_daily_count_build.p
 LABEL = "UPSTREAM_OBJECT_UNAVAILABLE_DATA_CONFIRMED_REPRESENTED_ONLY"
 CATALOG_MD5 = "91e15516016f986e5b8a08712e1de95a"
 CATALOG_SIZE = 6714105
-EXPECTED_RUNNER_BLOB = "dec8e09283de9357b2b2aa65af13e21b21fe85cc"
+BASELINE_RUNNER_BLOB = "dec8e09283de9357b2b2aa65af13e21b21fe85cc"
+POST_SUPPORT_RUNNER_BLOB = "464c0539475102f3de762ce851f862903ff2985c"
 EXPECTED_KNOWN_SUBSTRATE_GAPS = ("2014-01-23", "2014-01-24", "2014-01-25", "2014-03-19")
 
 
@@ -119,9 +120,12 @@ def test_config_contract_core():
     assert scope["raw_filename"] == "20221110.export.CSV.zip"
     assert scope["catalog_md5"] == CATALOG_MD5
     assert scope["catalog_filesize_bytes"] == CATALOG_SIZE
-    assert cfg["future_runner_support_required"] is True
-    assert cfg["runner_support_implemented"] is False
+    # Runner support is now implemented (post runner-support turn); merge gate
+    # remains closed pending the merge-gate machinery.
+    assert cfg["runner_support_implemented"] is True
+    assert cfg["future_runner_support_required"] is False
     assert cfg["merge_gate_open"] is False
+    assert cfg["production_runner_blob_baseline_pre_support"] == BASELINE_RUNNER_BLOB
 
 
 # 10. Config forbids the listed misuses.
@@ -150,28 +154,37 @@ def test_known_substrate_gaps_unchanged():
     assert "20221110" not in src
 
 
-# 12. Production runner source blob is byte-identical to the committed baseline.
-def test_runner_blob_unchanged():
-    assert _git_blob_sha1(RUNNER_PATH) == EXPECTED_RUNNER_BLOB
+# 12. Production runner source blob is the pinned post-support blob (changed
+#     from the pre-support baseline by the runner-support implementation turn).
+def test_runner_blob_is_post_support():
+    blob = _git_blob_sha1(RUNNER_PATH)
+    assert blob == POST_SUPPORT_RUNNER_BLOB
+    assert blob != BASELINE_RUNNER_BLOB
 
 
-# 13. No production runner source wiring of the documented-exception label/mechanism.
-def test_runner_has_no_documented_exception_wiring():
+# 13. Production runner source NOW wires the documented-exception mechanism,
+#     but still hard-codes neither the date nor a no-data-gap classification.
+def test_runner_has_documented_exception_wiring():
     src = RUNNER_PATH.read_text(encoding="utf-8")
-    assert LABEL not in src
-    assert "documented_exception" not in src
-    assert "lane2_gdelt1_documented_exceptions" not in src
+    assert LABEL in src
+    assert "load_documented_exceptions" in src
+    assert "documented_exception_match" in src
+    assert "lane2_gdelt1_documented_exceptions" in src
+    # The runner must NOT hard-code the date; it is loaded from the contract.
+    assert "2022-11-10" not in src
+    assert "20221110" not in src
 
 
-# 14. By construction no runtime exception path exists this turn; arbitrary-404 behavior unchanged.
-def test_no_runtime_path_this_turn():
+# 14. Runtime path is implemented; merge gate still closed; baseline recorded.
+def test_runtime_path_implemented():
     rep = _rep()
     cfg = _cfg()
-    assert rep["runner_support_implemented"] is False
-    assert rep["runtime_documented_exception_path_exists"] is False
-    assert rep["production_runner_blob_at_representation"] == EXPECTED_RUNNER_BLOB
-    assert cfg["runner_support_implemented"] is False
-    assert cfg["production_runner_blob_unchanged"] == EXPECTED_RUNNER_BLOB
+    assert rep["runner_support_implemented"] is True
+    assert rep["runtime_documented_exception_path_exists"] is True
+    assert rep["production_runner_blob_at_representation"] == BASELINE_RUNNER_BLOB
+    assert cfg["runner_support_implemented"] is True
+    assert cfg["merge_gate_open"] is False
+    assert cfg["production_runner_blob_baseline_pre_support"] == BASELINE_RUNNER_BLOB
 
 
 # Extra: completion / merge not declared anywhere in the artifacts.

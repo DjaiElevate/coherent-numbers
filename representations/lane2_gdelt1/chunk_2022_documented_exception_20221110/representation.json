@@ -48,8 +48,8 @@
     "self_heal_observed": false
   },
   "production_runner_blob_at_representation": "dec8e09283de9357b2b2aa65af13e21b21fe85cc",
-  "runner_support_implemented": false,
-  "runtime_documented_exception_path_exists": false,
+  "runner_support_implemented": true,
+  "runtime_documented_exception_path_exists": true,
   "forbidden_claims": [
     "raw 365/365",
     "ordinary completion",

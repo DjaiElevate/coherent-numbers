@@ -28,10 +28,11 @@
     "ordinary completion"
   ],
   "scope_match_requirement": "The documented-exception status may apply ONLY to the exact quintuple chunk_2022 + 2022-11-10 + 20221110.export.CSV.zip + label + (catalog_md5 AND catalog_filesize_bytes). Any other 404 (other date, other chunk, neighboring date) must NOT receive this label and must halt under existing runner behavior.",
-  "future_runner_support_required": true,
-  "runner_support_implemented": false,
+  "future_runner_support_required": false,
+  "runner_support_implemented": true,
+  "runner_support_status": "implemented_v0_1_pending_conformance_review_and_merge_gate",
   "merge_gate_open": false,
-  "production_runner_blob_unchanged": "dec8e09283de9357b2b2aa65af13e21b21fe85cc",
-  "runtime_note": "No runtime documented-exception path exists yet. Because the production runner source was NOT modified in this turn, arbitrary 404s (including 2022-11-10 under the current runner) still halt with FetchFailure exactly as before. A separately-authorized future runner-support turn must implement the runtime path with affirmative regression tests, and must record the new runner blob if it changes source.",
+  "production_runner_blob_baseline_pre_support": "dec8e09283de9357b2b2aa65af13e21b21fe85cc",
+  "runtime_note": "Runtime documented-exception support is implemented in scripts/run_lane2_gdelt1_full_daily_count_build.py (run_chunk_build): on a genuine 404 matching the exact committed quintuple (chunk_id + date + raw_filename + label + md5/size) it records a documented-exception entry and continues, WITHOUT fetching/recovering/parsing rows, WITHOUT treating the date as a no-data gap, and WITHOUT amending KNOWN_SUBSTRATE_GAPS or reducing expected_file_count. Every other 404 (other date, other chunk, wrong filename) and every non-404 failure still halts with FetchFailure. The post-support runner blob is recorded in the implementation commit/report (not embedded here to avoid a self-referential pin). merge_gate_open remains false: the merge-gate machinery (cross-chunk disclosure table + pre-merge conformance + a fresh labeled chunk_2022 run) is not yet complete.",
   "known_substrate_gaps_relationship": "This documented-exception mechanism is DISTINCT from KNOWN_SUBSTRATE_GAPS (the four 2014 no-data dates). 2022-11-10 must NEVER be added to KNOWN_SUBSTRATE_GAPS and is NOT a no-data gap."
 }
