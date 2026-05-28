@@ -1,0 +1,62 @@
+{
+  "artifact_type": "lane2_gdelt1_documented_exception",
+  "schema_version": "v0.1",
+  "label": "UPSTREAM_OBJECT_UNAVAILABLE_DATA_CONFIRMED_REPRESENTED_ONLY",
+  "chunk_id": "chunk_2022",
+  "date": "2022-11-10",
+  "sqldate": 20221110,
+  "raw_filename": "20221110.export.CSV.zip",
+  "raw_url": "http://data.gdeltproject.org/events/20221110.export.CSV.zip",
+  "catalog_md5": "91e15516016f986e5b8a08712e1de95a",
+  "catalog_filesize_bytes": 6714105,
+  "bigquery_counts": {
+    "20221109": 117008,
+    "20221110": 105041,
+    "20221111": 40588
+  },
+  "bigquery_count_semantics": "105041 is official-source (gdelt-bq.full.events) coverage evidence that SQLDATE 20221110 is data-bearing; it is NOT an exact runner-output validation gate and must be reconciled against runner daily-count semantics before any exact-match use.",
+  "status": "data_confirmed_raw_object_unavailable_represented_only",
+  "raw_object_parsed": false,
+  "rows_recovered": false,
+  "semantic_recovery_artifact_created": false,
+  "known_substrate_gap_amended": false,
+  "no_data_gap": false,
+  "raw_processed": false,
+  "recovered": false,
+  "merge_gate_status": "pending_labeled_completion_implementation",
+  "current_raw_progress_before_labeled_run": 313,
+  "target_expected_calendar_days": 365,
+  "target_raw_processed_days_after_future_labeled_run": 364,
+  "target_documented_unavailable_data_confirmed_days": 1,
+  "target_recovered_days": 0,
+  "target_known_no_data_gap_days": 0,
+  "memo_references": {
+    "merge_gate_representation_design": "50dda46",
+    "recovery_consistency_implementation_design": "36202b9",
+    "official_source_confirmation_recovery_consistency_design": "854a606",
+    "catalog_object_conflict_remediation_design": "e60a88a"
+  },
+  "halt_diagnostic_sha256": "009720576b0e3dc3f11d67dbd811e36bbfd5a385df55567e1191ad30441057b7",
+  "halt_class": "FetchFailure",
+  "original_halt_message": "HTTP error 404 for http://data.gdeltproject.org/events/20221110.export.CSV.zip: Not Found",
+  "raw_object_probe_history": {
+    "head_status": [404, 404, 404, 404],
+    "range_get_status": [416, 404, 416, 416],
+    "neighbors_available": ["20221109", "20221111"],
+    "alternate_official_raw_object_found": false,
+    "path_c_ruled_out": true,
+    "self_heal_observed": false
+  },
+  "production_runner_blob_at_representation": "dec8e09283de9357b2b2aa65af13e21b21fe85cc",
+  "runner_support_implemented": false,
+  "runtime_documented_exception_path_exists": false,
+  "forbidden_claims": [
+    "raw 365/365",
+    "ordinary completion",
+    "no-data gap",
+    "recovered day",
+    "raw-processed day",
+    "exact runner-output gate from BigQuery count 105041"
+  ],
+  "notes": "This is a committed representation/disclosure artifact only. No raw object was parsed; no rows were recovered; no semantic recovery artifact exists; KNOWN_SUBSTRATE_GAPS was not amended; 2022-11-10 is NOT a no-data gap and is NOT raw-processed. chunk_2022 is NOT complete. The merge gate is NOT open. Labeled-completion target (364 raw + 1 documented exception) requires a separately-authorized future runner-support turn and a fresh chunk_2022 run; this artifact does not implement runtime behavior. If the canonical raw object self-heals, the normal raw-object path is preferred and would supersede this representation for the date."
+}
