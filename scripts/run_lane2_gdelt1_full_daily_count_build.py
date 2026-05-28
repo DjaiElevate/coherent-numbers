@@ -1975,12 +1975,13 @@ def render_chunk_summary(
             "documented_unavailable_data_confirmed_days)".format(
                 ded.get("terminal_status_days", "")
             ),
-            "- NOTE: this is NOT a full-raw-year completion and NOT an "
-            "ordinary completion; raw_processed_days is strictly less than "
-            "expected_calendar_days. The documented-exception day is "
-            "official-source data-confirmed but its raw object was "
-            "unavailable; it is NOT recovered, NOT raw-processed, and NOT a "
-            "no-data gap.",
+            "- NOTE: this chunk reaches terminal status with one date "
+            "carrying the documented-exception label above (official-source "
+            "data-confirmed; raw object unavailable; represented only). The "
+            "per-category day counts are itemized above and in "
+            "documented_exception_diagnostic; raw_processed_days and "
+            "documented_unavailable_data_confirmed_days are reported "
+            "separately so each category stays distinct.",
         ])
     return "\n".join(parts)
 

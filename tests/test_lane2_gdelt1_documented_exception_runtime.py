@@ -12,12 +12,33 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import urllib.error
 import zipfile
 from datetime import date, timedelta
 
 import pytest
+
+# Forbidden-phrasing tokens F1..F6 (provenance: merge-gate representation design
+# memo, scaffold commit 5f43a13 / memo commit 50dda46). These are audited ONLY
+# against runtime-emitted summary OUTPUT — never against test scaffolding — so
+# this test file may itself contain the literals without self-failing.
+FORBIDDEN_PATTERNS = {
+    "F1": r"365/365",
+    "F2": r"raw 365/365",
+    "F3": r"ordinary",
+    "F4": r"no caveat",
+    "F5": r"gap[ -]day",
+    "F6": r"no[ -]data[ -]day",
+}
+
+
+def _forbidden_counts(text):
+    return {
+        k: len(re.findall(p, text, flags=re.IGNORECASE))
+        for k, p in FORBIDDEN_PATTERNS.items()
+    }
 
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 DOC_DATE = "2022-11-10"
@@ -64,9 +85,13 @@ class _FakeResponse:
         pass
 
 
+def _year_isos(year, n=365):
+    start = date(year, 1, 1)
+    return [(start + timedelta(days=i)).isoformat() for i in range(n)]
+
+
 def _all_2022_isos():
-    start = date(2022, 1, 1)
-    return [(start + timedelta(days=i)).isoformat() for i in range(365)]
+    return _year_isos(2022)
 
 
 def _write_capture(tmp_path, isos):
@@ -96,8 +121,8 @@ def _copy_committed(tmp_path, config=True, rep=True):
         shutil.copy(os.path.join(REPO_ROOT, REP_REL), dst)
 
 
-def _setup(m, monkeypatch, tmp_path, config=True, rep=True):
-    cap_path = _write_capture(tmp_path, _all_2022_isos())
+def _setup(m, monkeypatch, tmp_path, config=True, rep=True, isos=None):
+    cap_path = _write_capture(tmp_path, isos if isos is not None else _all_2022_isos())
     actual_sha = m._hash_file_sha256(cap_path)
     monkeypatch.setattr(m, "RECOGNIZED_LIST_SHA256", actual_sha)
     monkeypatch.setattr(m, "assert_reconciliation_consistent", lambda r: None)
@@ -306,7 +331,11 @@ def test_known_substrate_gaps_unchanged():
     )
 
 
-def test_summary_does_not_claim_raw_completion(tmp_path, monkeypatch):
+def test_summary_runtime_output_forbidden_tokens_absent(tmp_path, monkeypatch):
+    """Row 22: ALL of F1..F6 must be absent from the runtime-emitted summary
+    output for the documented-exception state (generalizes the prior
+    slash-count-only check). The audited corpus is the generated `summary`
+    string — NOT this test's own scaffolding."""
     m = _load_runner()
     _setup(m, monkeypatch, tmp_path, config=True, rep=True)
     opener = _opener_factory(m, fail_iso=DOC_DATE, fail_code=404)
@@ -315,7 +344,10 @@ def test_summary_does_not_claim_raw_completion(tmp_path, monkeypatch):
         timestamp_utc="20260601T000006Z", opener=opener,
     )
     summary = m.render_chunk_summary("chunk_2022", res["metadata"])
-    assert "365/365" not in summary
+    counts = _forbidden_counts(summary)
+    assert counts == {"F1": 0, "F2": 0, "F3": 0, "F4": 0, "F5": 0, "F6": 0}, counts
+    # Positive status assertions: the label and separated category counts
+    # are present and explicit.
     assert "documented_exception_label" in summary
     assert "raw_processed_days: 364" in summary
     assert "documented_unavailable_data_confirmed_days: 1" in summary
@@ -324,3 +356,65 @@ def test_summary_does_not_claim_raw_completion(tmp_path, monkeypatch):
     assert ded["no_data_gap"] is False
     assert ded["recovered"] is False
     assert ded["known_substrate_gap_amended"] is False
+
+
+# ── Row 10: malformed-artifact fail-closed coverage ──────────────────────────
+
+def test_malformed_contract_fails_closed(tmp_path, monkeypatch):
+    """Row 10: a syntactically malformed contract must NOT silently apply the
+    carve-out. Current behavior is fail-closed (the loader raises during JSON
+    parse); the run aborts rather than applying any documented exception."""
+    m = _load_runner()
+    _copy_committed(tmp_path, config=True, rep=True)
+    (tmp_path / CONFIG_REL).write_text("{ this is : not valid json ,,, ",
+                                       encoding="utf-8")
+    # Loader-level: fails closed by raising (no entry dict returned).
+    with pytest.raises(json.JSONDecodeError):
+        m.load_documented_exceptions(str(tmp_path))
+    # End-to-end: a 404 on the documented date does NOT become a silent
+    # carve-out; the run aborts (no successful result with a documented entry).
+    _setup(m, monkeypatch, tmp_path, config=True, rep=True)
+    (tmp_path / CONFIG_REL).write_text("{ this is : not valid json ,,, ",
+                                       encoding="utf-8")
+    opener = _opener_factory(m, fail_iso=DOC_DATE, fail_code=404)
+    with pytest.raises(Exception):
+        m.run_chunk_build(
+            "chunk_2022", str(tmp_path), cli_flag=True,
+            timestamp_utc="20260601T000010Z", opener=opener,
+        )
+
+
+def test_malformed_representation_fails_closed(tmp_path, monkeypatch):
+    """Row 10: a syntactically malformed representation artifact must NOT
+    silently apply the carve-out (fail-closed: loader raises during parse)."""
+    m = _load_runner()
+    _copy_committed(tmp_path, config=True, rep=True)
+    (tmp_path / REP_REL).write_text("{ broken json :::", encoding="utf-8")
+    with pytest.raises(json.JSONDecodeError):
+        m.load_documented_exceptions(str(tmp_path))
+
+
+# ── Row 12: other-chunk arbitrary-404 e2e halt (direct) ──────────────────────
+
+def test_other_chunk_arbitrary_404_halts_e2e(tmp_path, monkeypatch):
+    """Row 12: an arbitrary 404 in a chunk OTHER than chunk_2022 halts via the
+    normal failure path, even with the committed contract present. The carve-out
+    is keyed to (chunk_2022, 2022-11-10) only and must not apply to chunk_2021.
+    KNOWN_SUBSTRATE_GAPS must remain the four 2014 dates."""
+    m = _load_runner()
+    # chunk_2021 universe (non-leap, 365 days) + committed contract present.
+    _setup(m, monkeypatch, tmp_path, config=True, rep=True, isos=_year_isos(2021))
+    opener = _opener_factory(m, fail_iso="2021-06-15", fail_code=404)
+    with pytest.raises(m.FetchFailure):
+        m.run_chunk_build(
+            "chunk_2021", str(tmp_path), cli_flag=True,
+            timestamp_utc="20260601T000012Z", opener=opener,
+        )
+    # Canon preserved: the matcher never applies to a non-target chunk, and KSG
+    # is untouched.
+    exc = m.load_documented_exceptions(str(tmp_path))
+    url = m.date_to_daily_url(date(2021, 6, 15))
+    assert m.documented_exception_match("chunk_2021", "2021-06-15", url, exc) is None
+    assert tuple(m.KNOWN_SUBSTRATE_GAPS) == (
+        "2014-01-23", "2014-01-24", "2014-01-25", "2014-03-19",
+    )
