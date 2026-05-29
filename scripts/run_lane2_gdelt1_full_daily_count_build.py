@@ -2610,6 +2610,659 @@ def merge_chunks(
     }
 
 
+# ── Documented-exception-aware merge build (offline writer; v0.2 memo) ────────
+#
+# Wraps the structural `merge_chunks` (chunk-set / digest / URL / union guards)
+# and adds documented-exception propagation, per-chunk + aggregate category-count
+# coherence, row-level represented_only / documented_exception_label enrichment,
+# and a non-circular merged-artifact writer. Offline: no GDELT fetch, no BigQuery,
+# no market data, no Step 2. Does NOT reuse FULL_BUILD_AUTHORIZED.
+
+MERGE_IMPLEMENTATION_VERSION = "v0.2"
+
+MERGE_OUTPUT_DAILY_COUNTS = "build_daily_counts.csv"
+MERGE_OUTPUT_METADATA = "build_metadata.json"
+MERGE_OUTPUT_SUMMARY = "build_summary.md"
+
+# Pinned expected terminal-status day counts per chunk (v0.2 design memo §9).
+PINNED_TERMINAL_STATUS_DAYS: Dict[str, int] = {
+    "chunk_2013_partial": 275,
+    "chunk_2014": 365,
+    "chunk_2015": 365,
+    "chunk_2016": 366,
+    "chunk_2017": 365,
+    "chunk_2018": 365,
+    "chunk_2019": 365,
+    "chunk_2020": 366,
+    "chunk_2021": 365,
+    "chunk_2022": 365,
+}
+PINNED_AGGREGATE_TERMINAL_STATUS_DAYS = 3562
+PINNED_AGGREGATE_RAW = 3557
+PINNED_AGGREGATE_DOCUMENTED = 1
+PINNED_AGGREGATE_RECOVERED = 0
+PINNED_AGGREGATE_KSG = 4
+
+# Pinned expected SHA-256s of the committed documented-exception contract +
+# chunk_2022 representation artifact (v0.2 memo §8). The merge computes the
+# actual file SHA-256s at runtime and fails closed if either differs.
+EXPECTED_CONTRACT_SHA256 = (
+    "afee1c0d1e0e1d73fbe1ef45161deba4d174a4903e4b90093d00ac00472dda97"
+)
+EXPECTED_REPRESENTATION_SHA256 = (
+    "91276597f4f3882d15133e32ec2d845badd244f7c89e706d06482a9d729c4ee3"
+)
+
+# Fixed retained halt-history provenance (v0.2 design memo §7). Informational
+# only; never a merge input. NOT discovered by scanning the filesystem — these
+# are pinned constants from the ordinal-116 disclosure.
+RETAINED_HALT_HISTORY: Tuple[Dict[str, str], ...] = (
+    {
+        "path": "results/lane2_gdelt1_full_daily_count_build/"
+                "chunk_2022_20260528T121150Z/halt_diagnostic.json",
+        "halt_diagnostic_sha256":
+            "009720576b0e3dc3f11d67dbd811e36bbfd5a385df55567e1191ad30441057b7",
+    },
+    {
+        "path": "results/lane2_gdelt1_full_daily_count_build/"
+                "chunk_2020_20260526T164747Z/halt_diagnostic.json",
+        "halt_diagnostic_sha256":
+            "a6c9060a8798ad1392b2be1f3daf810b997ebada2c6d5f3bf1d879ddd170992f",
+    },
+    {
+        "path": "archive/halted_attempts/lane2_gdelt1_full_daily_count_build/"
+                "chunk_2019_20260525T192552Z/halt_diagnostic.json",
+        "halt_diagnostic_sha256":
+            "3b2b43708d0a7a9410d59a7bfd4deec7fef84f8a6543472f25942e67e1058005",
+    },
+)
+
+_MERGE_OFFSET_COLUMNS: Tuple[str, ...] = (
+    "rows_from_offset_0",
+    "rows_from_offset_minus_1",
+    "rows_from_offset_minus_7",
+    "rows_from_offset_minus_30",
+    "rows_from_offset_minus_365",
+    "rows_from_offset_minus_3650",
+    "rows_from_offset_plus_1",
+)
+
+_MERGE_CSV_COLUMNS: Tuple[str, ...] = (
+    ("civil_date", "total_row_count") + _MERGE_OFFSET_COLUMNS + (
+        "t0_file_status",
+        "expected_contributing_files_count",
+        "available_contributing_files_count",
+        "coverage_quality_flag",
+        "coverage_completeness",
+        "represented_only",
+        "documented_exception_label",
+    )
+)
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(65536), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _in_window_ksg_count(chunk_id: str) -> int:
+    """Count of KNOWN_SUBSTRATE_GAPS dates inside a chunk's range.
+
+    Pure: derived from KNOWN_SUBSTRATE_GAPS + CHUNK_YEAR_RANGES constants;
+    no filesystem access. The four 2014 gaps fall only in chunk_2014.
+    """
+    lo, hi = CHUNK_YEAR_RANGES[chunk_id]
+    n = 0
+    for g in KNOWN_SUBSTRATE_GAPS:
+        if lo <= date.fromisoformat(g) <= hi:
+            n += 1
+    return n
+
+
+def _chunk_category_counts(
+    chunk_id: str,
+    metadata: Dict[str, Any],
+    documented_exceptions: Dict[Tuple[str, str], Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Derive + validate per-chunk category counts (no filesystem access).
+
+    chunk_2022 reads its `documented_exception_diagnostic`; raw-complete chunks
+    derive from `actual_completed_file_count` + in-window KSG. Hard-stops
+    (ChunkManifestError) on: a documented-exception entry not present in the
+    contract-validated `documented_exceptions` (undocumented / mismatched /
+    on chunks 2013-2021), per-chunk category incoherence, terminal !=
+    expected_calendar, or deviation from the pinned per-chunk count.
+    """
+    ded = metadata.get("documented_exception_diagnostic")
+    ded_entries = (ded or {}).get("documented_exceptions") or []
+    if ded_entries:
+        for e in ded_entries:
+            key = (chunk_id, e.get("date"))
+            if key not in documented_exceptions:
+                raise ChunkManifestError(
+                    "merge halt: undocumented/contract-mismatched documented "
+                    "exception in {!r}: {!r}".format(chunk_id, e.get("date"))
+                )
+            if e.get("label") != DOCUMENTED_EXCEPTION_LABEL:
+                raise ChunkManifestError(
+                    "merge halt: wrong documented-exception label in "
+                    "{!r}".format(chunk_id)
+                )
+        status_class = "labeled_complete_documented_exception"
+        expected_calendar_days = ded.get("expected_calendar_days")
+        raw_processed_days = ded.get("raw_processed_days")
+        documented_days = ded.get("documented_unavailable_data_confirmed_days")
+        recovered_days = ded.get("recovered_days")
+        known_no_data_gap_days = ded.get("known_no_data_gap_days")
+        terminal_status_days = ded.get("terminal_status_days")
+        terminal_status_complete = ded.get("terminal_status_complete")
+    else:
+        status_class = "raw_complete"
+        actual = metadata.get("actual_completed_file_count")
+        in_window_ksg = _in_window_ksg_count(chunk_id)
+        raw_processed_days = actual
+        documented_days = 0
+        recovered_days = 0
+        known_no_data_gap_days = in_window_ksg
+        expected_calendar_days = (
+            None if actual is None else actual + in_window_ksg
+        )
+        terminal_status_days = (
+            None if actual is None
+            else raw_processed_days + documented_days + recovered_days
+            + known_no_data_gap_days
+        )
+        terminal_status_complete = (
+            terminal_status_days == expected_calendar_days
+        )
+
+    counts = {
+        "status_class": status_class,
+        "expected_calendar_days": expected_calendar_days,
+        "raw_processed_days": raw_processed_days,
+        "documented_unavailable_data_confirmed_days": documented_days,
+        "recovered_days": recovered_days,
+        "known_no_data_gap_days": known_no_data_gap_days,
+        "terminal_status_days": terminal_status_days,
+        "terminal_status_complete": terminal_status_complete,
+    }
+    if any(
+        counts[k] is None for k in (
+            "expected_calendar_days", "raw_processed_days",
+            "documented_unavailable_data_confirmed_days", "recovered_days",
+            "known_no_data_gap_days", "terminal_status_days",
+        )
+    ):
+        raise ChunkManifestError(
+            "merge halt: missing category counts for {!r}".format(chunk_id)
+        )
+    if (
+        raw_processed_days + documented_days + recovered_days
+        + known_no_data_gap_days
+    ) != terminal_status_days:
+        raise ChunkManifestError(
+            "merge halt: category partition != terminal_status_days for "
+            "{!r}".format(chunk_id)
+        )
+    if terminal_status_days != expected_calendar_days:
+        raise ChunkManifestError(
+            "merge halt: terminal_status_days != expected_calendar_days for "
+            "{!r}".format(chunk_id)
+        )
+    if chunk_id in PINNED_TERMINAL_STATUS_DAYS and (
+        terminal_status_days != PINNED_TERMINAL_STATUS_DAYS[chunk_id]
+    ):
+        raise ChunkManifestError(
+            "merge halt: terminal_status_days {} != pinned {} for {!r}".format(
+                terminal_status_days,
+                PINNED_TERMINAL_STATUS_DAYS[chunk_id],
+                chunk_id,
+            )
+        )
+    if not terminal_status_complete:
+        raise ChunkManifestError(
+            "merge halt: terminal_status_complete is false for {!r}".format(
+                chunk_id
+            )
+        )
+    return counts
+
+
+def _chunk_category_record(
+    chunk_id: str,
+    chunk_dir: str,
+    metadata: Dict[str, Any],
+    documented_exceptions: Dict[Tuple[str, str], Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Full per-chunk metadata record: validated counts + artifact SHA-256s."""
+    counts = _chunk_category_counts(chunk_id, metadata, documented_exceptions)
+    rec = {
+        "chunk_id": chunk_id,
+        "canonical_output_dir": chunk_dir,
+        "chunk_metadata_sha256": _sha256_file(
+            os.path.join(chunk_dir, "chunk_metadata.json")
+        ),
+        "chunk_summary_sha256": _sha256_file(
+            os.path.join(chunk_dir, "chunk_summary.md")
+        ),
+        "chunk_contributions_sha256": _sha256_file(
+            os.path.join(chunk_dir, "chunk_contributions.csv")
+        ),
+        "chunk_manifest_digest": metadata.get("chunk_manifest_digest"),
+    }
+    rec.update(counts)
+    return rec
+
+
+def _assert_merge_aggregate(per_chunk: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate category partition + pinned-aggregate + single-exception
+    hard-stops. Returns the aggregate dict."""
+    agg_raw = sum(r["raw_processed_days"] for r in per_chunk)
+    agg_doc = sum(
+        r["documented_unavailable_data_confirmed_days"] for r in per_chunk
+    )
+    agg_rec = sum(r["recovered_days"] for r in per_chunk)
+    agg_ksg = sum(r["known_no_data_gap_days"] for r in per_chunk)
+    agg_term = sum(r["terminal_status_days"] for r in per_chunk)
+    if agg_raw + agg_doc + agg_rec + agg_ksg != agg_term:
+        raise ChunkManifestError(
+            "merge halt: aggregate partition != aggregate terminal"
+        )
+    if (agg_raw, agg_doc, agg_rec, agg_ksg, agg_term) != (
+        PINNED_AGGREGATE_RAW, PINNED_AGGREGATE_DOCUMENTED,
+        PINNED_AGGREGATE_RECOVERED, PINNED_AGGREGATE_KSG,
+        PINNED_AGGREGATE_TERMINAL_STATUS_DAYS,
+    ):
+        raise ChunkManifestError(
+            "merge halt: aggregate partition {} != pinned (3557 raw + 1 "
+            "documented + 0 recovered + 4 KSG = 3562)".format(
+                (agg_raw, agg_doc, agg_rec, agg_ksg, agg_term)
+            )
+        )
+    doc_chunks = sorted(
+        r["chunk_id"] for r in per_chunk
+        if r["documented_unavailable_data_confirmed_days"] > 0
+    )
+    if doc_chunks != ["chunk_2022"]:
+        raise ChunkManifestError(
+            "merge halt: documented exception not confined to chunk_2022: "
+            "{!r}".format(doc_chunks)
+        )
+    return {
+        "raw_processed_days": agg_raw,
+        "documented_unavailable_data_confirmed_days": agg_doc,
+        "recovered_days": agg_rec,
+        "known_no_data_gap_days": agg_ksg,
+        "terminal_status_days": agg_term,
+    }
+
+
+def documented_exception_provenance(
+    repo_root: str, representation_artifact_rel: str
+) -> Dict[str, str]:
+    """Compute + validate the contract and representation SHA-256s for a
+    documented-exception entry (v0.2 memo §8). Computes the actual file
+    SHA-256s and fails closed (ChunkManifestError) if either differs from the
+    pinned expected value. Returns the validated provenance, surfaced once and
+    passed through to `_build_documented_entries`."""
+    contract_rel = DOCUMENTED_EXCEPTIONS_CONFIG_PATH
+    contract_sha = _sha256_file(os.path.join(repo_root, contract_rel))
+    if contract_sha != EXPECTED_CONTRACT_SHA256:
+        raise ChunkManifestError(
+            "merge halt: contract SHA-256 {} != pinned {}".format(
+                contract_sha, EXPECTED_CONTRACT_SHA256
+            )
+        )
+    rep_sha = _sha256_file(os.path.join(repo_root, representation_artifact_rel))
+    if rep_sha != EXPECTED_REPRESENTATION_SHA256:
+        raise ChunkManifestError(
+            "merge halt: representation SHA-256 {} != pinned {}".format(
+                rep_sha, EXPECTED_REPRESENTATION_SHA256
+            )
+        )
+    return {
+        "contract": contract_rel,
+        "contract_sha256": contract_sha,
+        "representation_artifact_sha256": rep_sha,
+    }
+
+
+def _build_documented_entries(
+    documented_exceptions: Dict[Tuple[str, str], Dict[str, Any]],
+    chunk_2022_metadata: Dict[str, Any],
+    provenance: Dict[str, str],
+    chunk_2022_record: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Build the documented_exceptions[] metadata block with full §8 provenance,
+    failing closed on any disagreement between the chunk diagnostic and the
+    contract-validated entry. `provenance` carries the computed-and-validated
+    contract/representation SHA-256s; source-chunk fields are derived from the
+    chunk_2022 `per_chunk` record (consistent-by-construction, no re-scan)."""
+    ded = chunk_2022_metadata.get("documented_exception_diagnostic") or {}
+    source_chunk_output_dir = os.path.basename(
+        chunk_2022_record["canonical_output_dir"]
+    )
+    source_chunk_metadata_sha256 = chunk_2022_record["chunk_metadata_sha256"]
+    out: List[Dict[str, Any]] = []
+    for e in ded.get("documented_exceptions", []):
+        contract = documented_exceptions.get(("chunk_2022", e.get("date")))
+        if contract is None:
+            raise ChunkManifestError(
+                "merge halt: chunk_2022 documented exception {!r} not "
+                "contract-validated".format(e.get("date"))
+            )
+        if (
+            e.get("label") != contract["label"]
+            or e.get("raw_filename") != contract["raw_filename"]
+            or e.get("catalog_md5") != contract["catalog_md5"]
+            or e.get("catalog_filesize_bytes")
+            != contract["catalog_filesize_bytes"]
+            or e.get("raw_object_parsed") is not False
+            or e.get("rows_recovered") is not False
+            or e.get("http_status") != 404
+        ):
+            raise ChunkManifestError(
+                "merge halt: chunk_2022 documented-exception fields disagree "
+                "with the contract for {!r}".format(e.get("date"))
+            )
+        no_data_gap = bool(ded.get("no_data_gap"))
+        recovered = bool(ded.get("recovered"))
+        ksg_amended = bool(ded.get("known_substrate_gap_amended"))
+        if no_data_gap or recovered or ksg_amended:
+            raise ChunkManifestError(
+                "merge halt: documented exception carries a forbidden true flag"
+            )
+        out.append({
+            "chunk_id": "chunk_2022",
+            "date": e.get("date"),
+            "raw_filename": e.get("raw_filename"),
+            "label": e.get("label"),
+            "catalog_md5": e.get("catalog_md5"),
+            "catalog_filesize_bytes": e.get("catalog_filesize_bytes"),
+            "http_status": e.get("http_status"),
+            "raw_object_parsed": False,
+            "rows_recovered": False,
+            "no_data_gap": no_data_gap,
+            "recovered": recovered,
+            "known_substrate_gap_amended": ksg_amended,
+            "representation_artifact": contract["representation_artifact"],
+            "representation_artifact_sha256":
+                provenance["representation_artifact_sha256"],
+            "contract": provenance["contract"],
+            "contract_sha256": provenance["contract_sha256"],
+            "source_chunk_output_dir": source_chunk_output_dir,
+            "source_chunk_metadata_sha256": source_chunk_metadata_sha256,
+        })
+    return out
+
+
+def _enrich_merge_row(
+    row: Dict[str, Any], documented_dates: Set[str]
+) -> Dict[str, Any]:
+    """Add represented_only + documented_exception_label; hard-stop if
+    total_row_count != the seven-offset sum. represented_only is label-derived
+    (true iff the civil date carries a documented-exception label); KSG dates
+    are never represented-only."""
+    seven = sum(row[c] for c in _MERGE_OFFSET_COLUMNS)
+    if row["total_row_count"] != seven:
+        raise ChunkManifestError(
+            "merge halt: total_row_count {} != seven-offset sum {} for "
+            "{}".format(row["total_row_count"], seven, row["civil_date"])
+        )
+    is_doc = row["civil_date"] in documented_dates
+    new_row = dict(row)
+    new_row["represented_only"] = bool(is_doc)
+    new_row["documented_exception_label"] = (
+        DOCUMENTED_EXCEPTION_LABEL if is_doc else ""
+    )
+    return new_row
+
+
+def merge_chunks_with_documented_exceptions(
+    chunk_dirs: Dict[str, str],
+    repo_root: str,
+) -> Dict[str, Any]:
+    """Offline documented-exception-aware merge (v0.2 design memo §3-§10).
+
+    Wraps `merge_chunks` (structural guards) and adds per-chunk + aggregate
+    category-count coherence, documented-exception propagation/validation,
+    and row-level represented_only / documented_exception_label enrichment.
+    Returns an in-memory result; does NOT write and does NOT contact GDELT.
+    """
+    base = merge_chunks(chunk_dirs, repo_root)
+    documented_exceptions = load_documented_exceptions(repo_root)
+    documented_dates = {d for (_cid, d) in documented_exceptions.keys()}
+
+    per_chunk: List[Dict[str, Any]] = []
+    for cid in CHUNK_IDS:
+        md = load_chunk_metadata(chunk_dirs[cid])
+        per_chunk.append(
+            _chunk_category_record(cid, chunk_dirs[cid], md, documented_exceptions)
+        )
+    aggregate = _assert_merge_aggregate(per_chunk)
+    aggregate.update({
+        "total_in_window_rows": base["aggregate_metrics"]["total_in_window_rows"],
+        "civil_days_in_output_domain":
+            base["aggregate_metrics"]["civil_days_in_output_domain"],
+        "chunks_merged": base["aggregate_metrics"]["chunks_merged"],
+    })
+
+    chunk_2022_record = next(
+        r for r in per_chunk if r["chunk_id"] == "chunk_2022"
+    )
+    # Locate the chunk_2022 contract entry by chunk_id (the date is loaded from
+    # the contract, never hard-coded in the runner source).
+    chunk_2022_contract = next(
+        (v for (cid, _date), v in documented_exceptions.items()
+         if cid == "chunk_2022"),
+        None,
+    )
+    if chunk_2022_contract is None:
+        raise ChunkManifestError(
+            "merge halt: chunk_2022 documented exception is not "
+            "contract-validated"
+        )
+    provenance = documented_exception_provenance(
+        repo_root, chunk_2022_contract["representation_artifact"]
+    )
+    documented_entries = _build_documented_entries(
+        documented_exceptions,
+        load_chunk_metadata(chunk_dirs["chunk_2022"]),
+        provenance,
+        chunk_2022_record,
+    )
+
+    enriched_rows = [
+        _enrich_merge_row(row, documented_dates)
+        for row in base["daily_count_rows"]
+    ]
+
+    return {
+        "daily_count_rows": enriched_rows,
+        "per_chunk": per_chunk,
+        "aggregate": aggregate,
+        "documented_exceptions": documented_entries,
+        "retained_halt_history": [dict(h) for h in RETAINED_HALT_HISTORY],
+        "input_chunk_manifest_digests": [
+            r["chunk_manifest_digest"] for r in per_chunk
+        ],
+        "merge_implementation_version": MERGE_IMPLEMENTATION_VERSION,
+    }
+
+
+def render_merge_build_summary(result: Dict[str, Any]) -> str:
+    """Positive-status build summary. No artifact-level F1-F6 forbidden literal
+    appears here (field names use underscores; no slash-count claim)."""
+    agg = result["aggregate"]
+    de = result["documented_exceptions"][0]
+    lines: List[str] = [
+        "# Lane 2 GDELT1 merged daily-count build summary",
+        "",
+        "- substrate status: 10/10 terminal-status "
+        "(9 raw-complete + 1 labeled-complete documented-exception)",
+        "- aggregate terminal-status days: {}".format(
+            agg["terminal_status_days"]
+        ),
+        "- aggregate partition: {} raw_processed + {} "
+        "documented_unavailable_data_confirmed + {} recovered + {} "
+        "known_no_data_gap = {} terminal_status".format(
+            agg["raw_processed_days"],
+            agg["documented_unavailable_data_confirmed_days"],
+            agg["recovered_days"],
+            agg["known_no_data_gap_days"],
+            agg["terminal_status_days"],
+        ),
+        "- documented exception: {} carries label {} "
+        "(date-confirmed, represented-only; its daily-count row has "
+        "rows_from_offset_0 = 0, represented via neighbor offsets)".format(
+            de["date"], de["label"]
+        ),
+        "",
+        "## Per-chunk category counts",
+        "",
+        "| chunk_id | status_class | expected_calendar_days | "
+        "raw_processed_days | documented_unavailable_data_confirmed_days | "
+        "recovered_days | known_no_data_gap_days | terminal_status_days | "
+        "terminal_status_complete |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for r in result["per_chunk"]:
+        lines.append(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                r["chunk_id"], r["status_class"], r["expected_calendar_days"],
+                r["raw_processed_days"],
+                r["documented_unavailable_data_confirmed_days"],
+                r["recovered_days"], r["known_no_data_gap_days"],
+                r["terminal_status_days"], r["terminal_status_complete"],
+            )
+        )
+    lines.append(
+        "| aggregate | - | - | {} | {} | {} | {} | {} | - |".format(
+            agg["raw_processed_days"],
+            agg["documented_unavailable_data_confirmed_days"],
+            agg["recovered_days"], agg["known_no_data_gap_days"],
+            agg["terminal_status_days"],
+        )
+    )
+    lines += [
+        "",
+        "## Retained halt-history (informational provenance; not merge inputs)",
+        "",
+    ]
+    for h in result["retained_halt_history"]:
+        lines.append(
+            "- {} (halt_diagnostic sha256 {})".format(
+                h["path"], h["halt_diagnostic_sha256"]
+            )
+        )
+    lines += [
+        "",
+        "## Boundaries",
+        "",
+        "- This merged substrate opens no Step 2, accesses no market data, "
+        "performs no GDELT fetch, performs no BigQuery recovery, and amends no "
+        "KNOWN_SUBSTRATE_GAPS entry.",
+        "- Self-heal: if a future separately authorized rebuild replaces the "
+        "documented-exception state, raw-path processing supersedes it; until "
+        "then the merged substrate carries the documented-exception label.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_merge_artifacts(result: Dict[str, Any], out_dir: str) -> Dict[str, Any]:
+    """Write build_daily_counts.csv, build_summary.md, then build_metadata.json
+    to out_dir (created if absent). The CSV and summary are written first; their
+    SHA-256s feed a NON-CIRCULAR build_manifest_digest (ordered input chunk
+    manifest digests + CSV sha + summary sha; the metadata's own sha is NOT
+    included, since the digest is stored inside the metadata). Deterministic and
+    independent of input ordering (per_chunk is canonical CHUNK_IDS order).
+    Offline: no GDELT / BigQuery / market data."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    csv_path = os.path.join(out_dir, MERGE_OUTPUT_DAILY_COUNTS)
+    csv_lines = [",".join(_MERGE_CSV_COLUMNS)]
+    for row in result["daily_count_rows"]:
+        csv_lines.append(",".join(str(row[c]) for c in _MERGE_CSV_COLUMNS))
+    csv_text = "\n".join(csv_lines) + "\n"
+    with open(csv_path, "w", encoding="utf-8") as fh:
+        fh.write(csv_text)
+    csv_sha = _sha256_text(csv_text)
+
+    summary_path = os.path.join(out_dir, MERGE_OUTPUT_SUMMARY)
+    summary_text = render_merge_build_summary(result)
+    with open(summary_path, "w", encoding="utf-8") as fh:
+        fh.write(summary_text)
+    summary_sha = _sha256_text(summary_text)
+
+    h = hashlib.sha256()
+    for d in result["input_chunk_manifest_digests"]:
+        h.update(str(d).encode("ascii"))
+        h.update(b"\n")
+    h.update(csv_sha.encode("ascii"))
+    h.update(b"\n")
+    h.update(summary_sha.encode("ascii"))
+    h.update(b"\n")
+    build_manifest_digest = h.hexdigest()
+
+    metadata = {
+        "merge_implementation_version": result["merge_implementation_version"],
+        "merge_authorization": {
+            "write_authorization_mechanism": "write_merge_output_cli_flag",
+            "full_build_authorized_reused": False,
+            "merge_execution_requires_separate_authorization": True,
+        },
+        "per_chunk": result["per_chunk"],
+        "aggregate": result["aggregate"],
+        "documented_exceptions": result["documented_exceptions"],
+        "retained_halt_history": result["retained_halt_history"],
+        "input_chunk_manifest_digests": result["input_chunk_manifest_digests"],
+        "output_artifact_sha256s": {
+            MERGE_OUTPUT_DAILY_COUNTS: csv_sha,
+            MERGE_OUTPUT_SUMMARY: summary_sha,
+        },
+        "build_manifest_digest": build_manifest_digest,
+        "boundary_declarations": {
+            "no_step_2": True,
+            "no_market_data": True,
+            "no_gdelt_fetch": True,
+            "no_bigquery": True,
+            "no_row_export": True,
+            "no_known_substrate_gaps_amendment": True,
+        },
+    }
+    meta_path = os.path.join(out_dir, MERGE_OUTPUT_METADATA)
+    meta_text = json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+    with open(meta_path, "w", encoding="utf-8") as fh:
+        fh.write(meta_text)
+
+    return {
+        "out_dir": out_dir,
+        "build_daily_counts_csv": csv_path,
+        "build_metadata_json": meta_path,
+        "build_summary_md": summary_path,
+        "build_daily_counts_sha256": csv_sha,
+        "build_summary_sha256": summary_sha,
+        "build_metadata_sha256": _sha256_text(meta_text),
+        "build_manifest_digest": build_manifest_digest,
+    }
+
+
+def _fresh_merge_output_dir(repo_root: str) -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return os.path.join(
+        repo_root, "results", "lane2_gdelt1_full_daily_count_build",
+        "merged_{}".format(ts),
+    )
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def _make_argparser() -> argparse.ArgumentParser:
@@ -2677,6 +3330,17 @@ def _make_argparser() -> argparse.ArgumentParser:
             "directory for merge."
         ),
     )
+    ap.add_argument(
+        "--write-merge-output",
+        action="store_true",
+        help=(
+            "Write-authorization flag for the --merge path only. Without it, "
+            "--merge computes in memory and writes nothing (default). With it, "
+            "the documented-exception-aware merge writes build_daily_counts.csv "
+            "+ build_metadata.json + build_summary.md to a fresh merged_<ts>Z "
+            "directory. Offline; does NOT reuse FULL_BUILD_AUTHORIZED; no fetch."
+        ),
+    )
     return ap
 
 
@@ -2714,12 +3378,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         if args.merge:
             chunk_dirs = _parse_merge_inputs(args.merge_input)
-            merge_chunks(chunk_dirs, repo_root=args.repo_root)
-            print(
-                "Merge complete (in-memory only; CLI does not "
-                "write canonical artifacts in this implementation turn).",
-                file=sys.stdout,
-            )
+            if args.write_merge_output:
+                result = merge_chunks_with_documented_exceptions(
+                    chunk_dirs, repo_root=args.repo_root
+                )
+                out_dir = _fresh_merge_output_dir(args.repo_root)
+                written = write_merge_artifacts(result, out_dir)
+                print(
+                    "Merge complete; wrote canonical artifacts to {}".format(
+                        written["out_dir"]
+                    ),
+                    file=sys.stdout,
+                )
+            else:
+                merge_chunks(chunk_dirs, repo_root=args.repo_root)
+                print(
+                    "Merge complete (in-memory only; pass --write-merge-output "
+                    "to write canonical artifacts).",
+                    file=sys.stdout,
+                )
             return 0
         if args.chunk_id:
             run_chunk_build(
