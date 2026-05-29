@@ -1,0 +1,252 @@
+{
+  "aggregate": {
+    "chunks_merged": [
+      "chunk_2013_partial",
+      "chunk_2014",
+      "chunk_2015",
+      "chunk_2016",
+      "chunk_2017",
+      "chunk_2018",
+      "chunk_2019",
+      "chunk_2020",
+      "chunk_2021",
+      "chunk_2022"
+    ],
+    "civil_days_in_output_domain": 3562,
+    "documented_unavailable_data_confirmed_days": 1,
+    "known_no_data_gap_days": 4,
+    "raw_processed_days": 3557,
+    "recovered_days": 0,
+    "terminal_status_days": 3562,
+    "total_in_window_rows": 519109665
+  },
+  "boundary_declarations": {
+    "no_bigquery": true,
+    "no_gdelt_fetch": true,
+    "no_known_substrate_gaps_amendment": true,
+    "no_market_data": true,
+    "no_row_export": true,
+    "no_step_2": true
+  },
+  "build_manifest_digest": "4b312183d9bb126169fc82c5b76008359778df18ee803527c567f7ade3a89650",
+  "documented_exceptions": [
+    {
+      "catalog_filesize_bytes": 6714105,
+      "catalog_md5": "91e15516016f986e5b8a08712e1de95a",
+      "chunk_id": "chunk_2022",
+      "contract": "configs/lane2_gdelt1_documented_exceptions.json",
+      "contract_sha256": "afee1c0d1e0e1d73fbe1ef45161deba4d174a4903e4b90093d00ac00472dda97",
+      "date": "2022-11-10",
+      "http_status": 404,
+      "known_substrate_gap_amended": false,
+      "label": "UPSTREAM_OBJECT_UNAVAILABLE_DATA_CONFIRMED_REPRESENTED_ONLY",
+      "no_data_gap": false,
+      "raw_filename": "20221110.export.CSV.zip",
+      "raw_object_parsed": false,
+      "recovered": false,
+      "representation_artifact": "representations/lane2_gdelt1/chunk_2022_documented_exception_20221110/representation.json",
+      "representation_artifact_sha256": "91276597f4f3882d15133e32ec2d845badd244f7c89e706d06482a9d729c4ee3",
+      "rows_recovered": false,
+      "source_chunk_metadata_sha256": "e986e217d1906aa3e7fbe3bf412add975738bf10fba8334b704440b9d3184de1",
+      "source_chunk_output_dir": "chunk_2022_20260528T234738Z"
+    }
+  ],
+  "input_chunk_manifest_digests": [
+    "6ac92439455d3f59df64cfeca6256f54a319c0ac82d40886f11b26becbfc8b43",
+    "93f9709656cb30252e1a9e5a8167dadb17b4f63bbb58ac6e4f4405b593994aba",
+    "a5c61b06dee77a9916db6725cabe3a41d74d47d5807dce6ca2be1709bf17bd67",
+    "e03e84ac29045a46ba4d2f207227b6f8f6c1222ba24bafbeefc7e02bd382c7a2",
+    "6aec5ad96f63721b5ce26831d3ebb38af05646fb64842e18fda14bba492c258e",
+    "d53798c99b8be65ca550dc07fd35bc2b5e3a44e5bbde86935be083afa3e4c820",
+    "2f8a1fbf429624f1ecb49ed09dca75b9c11415701c6c62800c0bb57865974fd6",
+    "305438b8f7e255fb328ce809e5f036448c60888e04afa3237e5aec4fa509faa0",
+    "12173f8d0a21b3892d45b457205a4382f5c332d5810ba31a249943fb6a33bca9",
+    "c4d8a6fceb55032a2be6b533c8f9b9d508a2da1f4b083e7c47c0623b363bbf9a"
+  ],
+  "merge_authorization": {
+    "full_build_authorized_reused": false,
+    "merge_execution_requires_separate_authorization": true,
+    "write_authorization_mechanism": "write_merge_output_cli_flag"
+  },
+  "merge_implementation_version": "v0.2",
+  "output_artifact_sha256s": {
+    "build_daily_counts.csv": "84b6ac9f47888fea4bd5c9d448058db0e5c568e3aa194a0fc7d4d5c95704045e",
+    "build_summary.md": "7677bbaf3d84923209a8b0be64dd9d3f64ffe752ac56f4eb5ad65169bae86e97"
+  },
+  "per_chunk": [
+    {
+      "canonical_output_dir": "results/lane2_gdelt1_full_daily_count_build/chunk_2013_partial_20260524T135157Z",
+      "chunk_contributions_sha256": "9f07c8018c322027841dbf6484f19c2218d2945731e775b9ced03099cfa37247",
+      "chunk_id": "chunk_2013_partial",
+      "chunk_manifest_digest": "6ac92439455d3f59df64cfeca6256f54a319c0ac82d40886f11b26becbfc8b43",
+      "chunk_metadata_sha256": "14a407a49e53f660a581bcdc7cee224e3228046aa1ea51eaae5e7eb5dc8a03c1",
+      "chunk_summary_sha256": "9e88e95cc33e4f99ddc3a810db23cd076ac51928d7504b7bab35780d5d15ed42",
+      "documented_unavailable_data_confirmed_days": 0,
+      "expected_calendar_days": 275,
+      "known_no_data_gap_days": 0,
+      "raw_processed_days": 275,
+      "recovered_days": 0,
+      "status_class": "raw_complete",
+      "terminal_status_complete": true,
+      "terminal_status_days": 275
+    },
+    {
+      "canonical_output_dir": "results/lane2_gdelt1_full_daily_count_build/chunk_2014_20260524T150055Z",
+      "chunk_contributions_sha256": "2ffd56fbd039ef5e7825c048358d7dc0a0b1e6f24d3d8614902de6217ce43660",
+      "chunk_id": "chunk_2014",
+      "chunk_manifest_digest": "93f9709656cb30252e1a9e5a8167dadb17b4f63bbb58ac6e4f4405b593994aba",
+      "chunk_metadata_sha256": "e0a944e38204d3fa6deb904d1b71b1a465a284c8203d75c025df372c80fd69d6",
+      "chunk_summary_sha256": "93db53b075e0e15bf1e91d5a4b41a75eb03695925aa5ff0e8a7ceae5c5c3459d",
+      "documented_unavailable_data_confirmed_days": 0,
+      "expected_calendar_days": 365,
+      "known_no_data_gap_days": 4,
+      "raw_processed_days": 361,
+      "recovered_days": 0,
+      "status_class": "raw_complete",
+      "terminal_status_complete": true,
+      "terminal_status_days": 365
+    },
+    {
+      "canonical_output_dir": "results/lane2_gdelt1_full_daily_count_build/chunk_2015_20260524T163556Z",
+      "chunk_contributions_sha256": "7f7307be58e450190db5925cbc69861b95a827bbf279598a9eccecf549301ea2",
+      "chunk_id": "chunk_2015",
+      "chunk_manifest_digest": "a5c61b06dee77a9916db6725cabe3a41d74d47d5807dce6ca2be1709bf17bd67",
+      "chunk_metadata_sha256": "a73d5a252610c8610d22d579cbef18e8a58338a7985dac56d9f4d1fe5158d4e2",
+      "chunk_summary_sha256": "2de7dd3595d340d31c27993e416204050c1734dfd4d6ebd137f21c7135d5b2f9",
+      "documented_unavailable_data_confirmed_days": 0,
+      "expected_calendar_days": 365,
+      "known_no_data_gap_days": 0,
+      "raw_processed_days": 365,
+      "recovered_days": 0,
+      "status_class": "raw_complete",
+      "terminal_status_complete": true,
+      "terminal_status_days": 365
+    },
+    {
+      "canonical_output_dir": "results/lane2_gdelt1_full_daily_count_build/chunk_2016_20260524T194435Z",
+      "chunk_contributions_sha256": "91d82561f7296d08e8e134adf59729fb6c82fc2d4d3f11e02112b1a8393c2883",
+      "chunk_id": "chunk_2016",
+      "chunk_manifest_digest": "e03e84ac29045a46ba4d2f207227b6f8f6c1222ba24bafbeefc7e02bd382c7a2",
+      "chunk_metadata_sha256": "b933d2f920716684a71a6ec1db7cce482519546c571f3572a53b08c03070b371",
+      "chunk_summary_sha256": "16570ed6a234045f3dc7892d6b5f5c9250220838ba94fdcaf79d402dc15326df",
+      "documented_unavailable_data_confirmed_days": 0,
+      "expected_calendar_days": 366,
+      "known_no_data_gap_days": 0,
+      "raw_processed_days": 366,
+      "recovered_days": 0,
+      "status_class": "raw_complete",
+      "terminal_status_complete": true,
+      "terminal_status_days": 366
+    },
+    {
+      "canonical_output_dir": "results/lane2_gdelt1_full_daily_count_build/chunk_2017_20260524T231143Z",
+      "chunk_contributions_sha256": "87ba1a907d0c6879e370796ef12bf1df1efa1c9e2281489821b44f3343db3223",
+      "chunk_id": "chunk_2017",
+      "chunk_manifest_digest": "6aec5ad96f63721b5ce26831d3ebb38af05646fb64842e18fda14bba492c258e",
+      "chunk_metadata_sha256": "56fece119d32e1ebeab5d5964c83848200b91ce2486ca177017578b67ee24016",
+      "chunk_summary_sha256": "b2f42542fa295b6feb1248220d05a11302b1d43d52bb616ba09df9c171fdeffc",
+      "documented_unavailable_data_confirmed_days": 0,
+      "expected_calendar_days": 365,
+      "known_no_data_gap_days": 0,
+      "raw_processed_days": 365,
+      "recovered_days": 0,
+      "status_class": "raw_complete",
+      "terminal_status_complete": true,
+      "terminal_status_days": 365
+    },
+    {
+      "canonical_output_dir": "results/lane2_gdelt1_full_daily_count_build/chunk_2018_20260525T025641Z",
+      "chunk_contributions_sha256": "87d637fc8ba699f9468c2ce86ad8a397966a537918c68bebe64fffeb0b5fce10",
+      "chunk_id": "chunk_2018",
+      "chunk_manifest_digest": "d53798c99b8be65ca550dc07fd35bc2b5e3a44e5bbde86935be083afa3e4c820",
+      "chunk_metadata_sha256": "38b00e10f5e40f363c1dfa4c46f8e3ffa91ef709096a1cc68be43958ac21cd37",
+      "chunk_summary_sha256": "656ee9ce7042e1fb9fda91b4cca76354a8aea854ed84c99ba9dda1eff5bccda4",
+      "documented_unavailable_data_confirmed_days": 0,
+      "expected_calendar_days": 365,
+      "known_no_data_gap_days": 0,
+      "raw_processed_days": 365,
+      "recovered_days": 0,
+      "status_class": "raw_complete",
+      "terminal_status_complete": true,
+      "terminal_status_days": 365
+    },
+    {
+      "canonical_output_dir": "results/lane2_gdelt1_full_daily_count_build/chunk_2019_20260526T130910Z",
+      "chunk_contributions_sha256": "a9ded0ab9d9b6e90ebe6835b4ecb4ee7b63f94454f9f017b0eaa3c60e44136b7",
+      "chunk_id": "chunk_2019",
+      "chunk_manifest_digest": "2f8a1fbf429624f1ecb49ed09dca75b9c11415701c6c62800c0bb57865974fd6",
+      "chunk_metadata_sha256": "1d6add219d36ddc2662ed330551733fb87de7aaf69b834c600eee7e03e96d09e",
+      "chunk_summary_sha256": "f4ca5823378ad190391ce8ae0bd5b796f0515fc232a8b4e1c1375461f6772d5d",
+      "documented_unavailable_data_confirmed_days": 0,
+      "expected_calendar_days": 365,
+      "known_no_data_gap_days": 0,
+      "raw_processed_days": 365,
+      "recovered_days": 0,
+      "status_class": "raw_complete",
+      "terminal_status_complete": true,
+      "terminal_status_days": 365
+    },
+    {
+      "canonical_output_dir": "results/lane2_gdelt1_full_daily_count_build/chunk_2020_20260528T080812Z",
+      "chunk_contributions_sha256": "9df16036b2525a16f4ab1df04b007571bfdc15dab4b231495d2d9d2f82e6537a",
+      "chunk_id": "chunk_2020",
+      "chunk_manifest_digest": "305438b8f7e255fb328ce809e5f036448c60888e04afa3237e5aec4fa509faa0",
+      "chunk_metadata_sha256": "882dd39dcfc1977391436720aad1f63cfde60dd67e30debb1fa9b4783ecba1df",
+      "chunk_summary_sha256": "70bc5326e6d164982a1211ca7b4276bba7d7e8f525d8a7d1b673ccaa5dea45db",
+      "documented_unavailable_data_confirmed_days": 0,
+      "expected_calendar_days": 366,
+      "known_no_data_gap_days": 0,
+      "raw_processed_days": 366,
+      "recovered_days": 0,
+      "status_class": "raw_complete",
+      "terminal_status_complete": true,
+      "terminal_status_days": 366
+    },
+    {
+      "canonical_output_dir": "results/lane2_gdelt1_full_daily_count_build/chunk_2021_20260528T110740Z",
+      "chunk_contributions_sha256": "6a1818233c5d005fb0400a7f1c338be254635b542da2eed6114eea756e5705ce",
+      "chunk_id": "chunk_2021",
+      "chunk_manifest_digest": "12173f8d0a21b3892d45b457205a4382f5c332d5810ba31a249943fb6a33bca9",
+      "chunk_metadata_sha256": "aab63a700ffcc20ad3b532e0e3ed7f847fda9beff2510070c298da131184a201",
+      "chunk_summary_sha256": "866db409d5cc152e8fc1cda3200f07f5777b5808a9a9867e4d8edd9b7263f531",
+      "documented_unavailable_data_confirmed_days": 0,
+      "expected_calendar_days": 365,
+      "known_no_data_gap_days": 0,
+      "raw_processed_days": 365,
+      "recovered_days": 0,
+      "status_class": "raw_complete",
+      "terminal_status_complete": true,
+      "terminal_status_days": 365
+    },
+    {
+      "canonical_output_dir": "results/lane2_gdelt1_full_daily_count_build/chunk_2022_20260528T234738Z",
+      "chunk_contributions_sha256": "45405bf9cc59776578a2081f55d86617453d1ece6ef5b9d1b1f4c3363e66004a",
+      "chunk_id": "chunk_2022",
+      "chunk_manifest_digest": "c4d8a6fceb55032a2be6b533c8f9b9d508a2da1f4b083e7c47c0623b363bbf9a",
+      "chunk_metadata_sha256": "e986e217d1906aa3e7fbe3bf412add975738bf10fba8334b704440b9d3184de1",
+      "chunk_summary_sha256": "d92e22b4b72d4da556a9878d777b6ef577102c88b2fbf5f9689cdf8e6aef0da0",
+      "documented_unavailable_data_confirmed_days": 1,
+      "expected_calendar_days": 365,
+      "known_no_data_gap_days": 0,
+      "raw_processed_days": 364,
+      "recovered_days": 0,
+      "status_class": "labeled_complete_documented_exception",
+      "terminal_status_complete": true,
+      "terminal_status_days": 365
+    }
+  ],
+  "retained_halt_history": [
+    {
+      "halt_diagnostic_sha256": "009720576b0e3dc3f11d67dbd811e36bbfd5a385df55567e1191ad30441057b7",
+      "path": "results/lane2_gdelt1_full_daily_count_build/chunk_2022_20260528T121150Z/halt_diagnostic.json"
+    },
+    {
+      "halt_diagnostic_sha256": "a6c9060a8798ad1392b2be1f3daf810b997ebada2c6d5f3bf1d879ddd170992f",
+      "path": "results/lane2_gdelt1_full_daily_count_build/chunk_2020_20260526T164747Z/halt_diagnostic.json"
+    },
+    {
+      "halt_diagnostic_sha256": "3b2b43708d0a7a9410d59a7bfd4deec7fef84f8a6543472f25942e67e1058005",
+      "path": "archive/halted_attempts/lane2_gdelt1_full_daily_count_build/chunk_2019_20260525T192552Z/halt_diagnostic.json"
+    }
+  ]
+}
