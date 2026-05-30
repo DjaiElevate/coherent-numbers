@@ -26,10 +26,11 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import math
 import statistics
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -1116,3 +1117,171 @@ def render_step2_metadata(
         "merge_write_flag_reused": False,
     }
     return out
+
+
+# ----------------------------------------------------------------------------
+# Output artifact constants (§5) and the write path (§§5, 11, 14)
+# ----------------------------------------------------------------------------
+
+OUTPUT_DAILY_FEATURES_BASENAME = "step2_daily_features.csv"
+OUTPUT_METADATA_BASENAME = "step2_metadata.json"
+OUTPUT_SUMMARY_BASENAME = "step2_summary.md"
+
+# Final-output basenames. Only these three may be written by the writer; any
+# other basename trips a hard-fail. Mirrors the chunk/merge allow-list pattern.
+ALLOWED_OUTPUT_BASENAMES: Tuple[str, ...] = (
+    OUTPUT_DAILY_FEATURES_BASENAME,
+    OUTPUT_METADATA_BASENAME,
+    OUTPUT_SUMMARY_BASENAME,
+)
+
+# The canonical results parent for a real (separately authorized) execution.
+# The writer itself takes an explicit `output_parent_dir`, so tests target a
+# pytest `tmp_path` outside the repo and never touch this directory.
+CANONICAL_STEP2_OUTPUT_PARENT_BASENAME = "lane2_gdelt1_step2_daily_features"
+
+PASS_VERDICT = "PASS — STEP 2 IMPLEMENTATION CONFORMS TO DESIGN MEMO"
+
+
+def utc_timestamp_compact() -> str:
+    """Return a compact UTC timestamp `YYYYMMDDTHHMMSS` (no trailing `Z`).
+
+    The caller appends the `Z` suffix to form the `<UTC-ts>Z` output-dir name
+    per §5. The timestamp affects only the directory name, never any artifact
+    file content, so the three written artifacts stay byte-deterministic.
+    """
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+
+def _format_csv_cell(value: Any) -> str:
+    """Deterministically format a feature value as a CSV cell string.
+
+    Locked conventions (so output SHA-256s are reproducible across runs):
+      - None        -> "" (empty cell; a warmup/undefined rolling value)
+      - bool        -> "true" / "false" (checked before int: bool subclasses int)
+      - int         -> str(int)
+      - float       -> repr(float) (shortest round-trip form; stable in CPython)
+      - str         -> the string unchanged
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    return str(value)
+
+
+def render_step2_daily_features_csv(
+    feature_rows: Sequence[Mapping[str, Any]],
+) -> str:
+    """Render the locked-schema feature table as deterministic CSV text.
+
+    Header row is exactly `FEATURE_SCHEMA`; data rows follow in the order given
+    (the caller passes civil-date-ascending rows). Uses `\\n` line terminators
+    and minimal quoting so the byte stream is platform-independent.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(list(FEATURE_SCHEMA))
+    for r in feature_rows:
+        writer.writerow([_format_csv_cell(r[col]) for col in FEATURE_SCHEMA])
+    return buf.getvalue()
+
+
+def write_step2_outputs(
+    merged_dir: Path,
+    output_parent_dir: Path,
+    *,
+    verify_pins: bool = True,
+    timestamp_utc: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run the §11 conformance gate, then write the three Step 2 artifacts.
+
+    This is the write path behind the dedicated `--write-step2-output` CLI flag.
+    It is gate-agnostic at this level — the CLI script applies the separate
+    `STEP2_EXECUTION_AUTHORIZED` execution gate before calling this. Tests call
+    this directly with a `tmp_path` `output_parent_dir` outside the repo.
+
+    Contract (memo §§5, 11, 14):
+      - the §11 conformance gate must PASS before any byte is written (fail
+        closed otherwise — no partial output);
+      - exactly the three §5 artifacts are written, into a fresh
+        `<output_parent_dir>/<UTC-ts>Z/` directory that must not pre-exist;
+      - artifact contents are deterministic (no timestamp / output path is
+        embedded in any artifact), so re-runs produce identical SHA-256s;
+      - returns a manifest with the output dir, per-artifact SHA-256s, the
+        verdict, and the row counts.
+    """
+    merged_dir = Path(merged_dir)
+    output_parent_dir = Path(output_parent_dir)
+
+    # 1. Re-PASS the pre-execution conformance gate (memo §11). Any failure
+    #    raises (Step2InputError / Step2ConformanceError) before we touch disk.
+    report = run_conformance_gate(merged_dir, verify_pins=verify_pins)
+    if report.get("verdict") != PASS_VERDICT:
+        raise Step2ConformanceError(
+            f"refusing to write: conformance verdict={report.get('verdict')!r}"
+        )
+
+    # 2. Re-derive the artifacts deterministically from the pinned substrate.
+    rows, metadata = load_inputs(merged_dir, verify_pins=False)
+    feature_rows = derive_features(rows)
+
+    csv_text = render_step2_daily_features_csv(feature_rows)
+    summary_text = render_step2_summary(feature_rows, metadata, merged_dir)
+
+    step2_metadata = dict(render_step2_metadata(feature_rows, metadata, merged_dir))
+    step2_metadata["pre_execution_conformance_verdict"] = report["verdict"]
+    step2_metadata["input_row_count"] = report["input_row_count"]
+    step2_metadata["feature_row_count"] = report["feature_row_count"]
+    metadata_text = json.dumps(step2_metadata, indent=2, sort_keys=True)
+
+    # Defense-in-depth: re-run the F1-F6 audit on the exact rendered bytes.
+    for label, text in (("summary", summary_text), ("metadata", metadata_text)):
+        hits = audit_f1_f6(text)
+        if hits:
+            raise Step2ConformanceError(
+                f"refusing to write: F1-F6 audit failed on {label}: {hits}"
+            )
+
+    artifacts: Dict[str, str] = {
+        OUTPUT_DAILY_FEATURES_BASENAME: csv_text,
+        OUTPUT_METADATA_BASENAME: metadata_text,
+        OUTPUT_SUMMARY_BASENAME: summary_text,
+    }
+    for basename in artifacts:
+        if basename not in ALLOWED_OUTPUT_BASENAMES:
+            raise Step2BoundaryError(
+                f"output basename not allow-listed: {basename!r}"
+            )
+
+    # 3. Fresh, unique `<UTC-ts>Z` output dir; never overwrite.
+    if timestamp_utc is None:
+        timestamp_utc = utc_timestamp_compact()
+    output_dir = output_parent_dir / f"{timestamp_utc}Z"
+    if output_dir.exists():
+        raise Step2BoundaryError(
+            f"refusing to overwrite existing output dir: {output_dir}"
+        )
+    output_dir.mkdir(parents=True, exist_ok=False)
+
+    # 4. Write exactly the three allow-listed artifacts; hash each.
+    artifacts_sha256: Dict[str, str] = {}
+    for basename in ALLOWED_OUTPUT_BASENAMES:
+        path = output_dir / basename
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(artifacts[basename])
+        artifacts_sha256[basename] = sha256_of_file(path)
+
+    return {
+        "output_dir": str(output_dir),
+        "artifacts_sha256": artifacts_sha256,
+        "verdict": report["verdict"],
+        "input_row_count": report["input_row_count"],
+        "feature_row_count": report["feature_row_count"],
+        "build_manifest_digest": EXPECTED_BUILD_MANIFEST_DIGEST,
+        "step2_implementation_version": STEP2_IMPLEMENTATION_VERSION,
+    }

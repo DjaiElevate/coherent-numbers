@@ -9,6 +9,7 @@ authorization prompt).
 from __future__ import annotations
 
 import copy
+import csv
 import json
 import math
 import statistics
@@ -848,3 +849,217 @@ def test_real_input_pins_verified():
         observed["build_summary.md"]
         == step2.INPUT_ARTIFACT_SHA256["build_summary.md"]
     )
+
+
+# ----------------------------------------------------------------------------
+# §5 / §14 CSV rendering + write path (output goes to tmp_path OUTSIDE the repo)
+# ----------------------------------------------------------------------------
+
+def _load_cli_module():
+    """Load the standalone CLI script as a module (scripts/ is not a package)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "run_lane2_gdelt1_step2_features", CLI_SCRIPT
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.pop(0)
+    return mod
+
+
+def test_csv_cell_formatting_is_deterministic_and_typed():
+    assert step2._format_csv_cell(None) == ""
+    assert step2._format_csv_cell(True) == "true"
+    assert step2._format_csv_cell(False) == "false"
+    # bool must be handled before int (bool subclasses int)
+    assert step2._format_csv_cell(1) == "1"
+    assert step2._format_csv_cell(0) == "0"
+    assert step2._format_csv_cell(3562) == "3562"
+    assert step2._format_csv_cell(0.5) == "0.5"
+    assert step2._format_csv_cell(math.log1p(100)) == repr(math.log1p(100))
+    assert step2._format_csv_cell("2013-04-01") == "2013-04-01"
+
+
+def test_render_csv_header_is_exact_schema_and_rowcount_matches():
+    rows = _make_increasing_dataset(40)
+    feats = step2.derive_features(rows)
+    text = step2.render_step2_daily_features_csv(feats)
+    parsed = list(csv.reader(text.splitlines()))
+    assert tuple(parsed[0]) == step2.FEATURE_SCHEMA
+    assert len(parsed) == 1 + len(feats)  # header + one row per feature row
+    # No market/outcome column can appear because the header IS the locked schema
+    for forbidden in ("return", "target", "pnl", "price", "ticker", "vix"):
+        assert not any(forbidden in col.lower() for col in parsed[0])
+
+
+def test_render_csv_is_byte_deterministic_across_runs():
+    rows = _make_increasing_dataset(40)
+    feats = step2.derive_features(rows)
+    a = step2.render_step2_daily_features_csv(feats)
+    b = step2.render_step2_daily_features_csv(step2.derive_features(rows))
+    assert a == b
+
+
+def test_render_csv_warmup_none_cells_are_empty():
+    rows = _make_increasing_dataset(3)  # all rolling w>=7 are warmup -> None
+    feats = step2.derive_features(rows)
+    text = step2.render_step2_daily_features_csv(feats)
+    parsed = list(csv.reader(text.splitlines()))
+    header = parsed[0]
+    col_idx = header.index("roll_mean_total_w7")
+    # row 0 (first data row) is warmup for w7 -> empty cell
+    assert parsed[1][col_idx] == ""
+
+
+def test_allowed_output_basenames_are_exactly_the_three():
+    assert step2.ALLOWED_OUTPUT_BASENAMES == (
+        "step2_daily_features.csv",
+        "step2_metadata.json",
+        "step2_summary.md",
+    )
+
+
+def test_write_fails_closed_on_missing_inputs_and_writes_nothing(tmp_path):
+    """The writer runs the §11 gate first; a bad/missing input substrate must
+    raise BEFORE any output directory or artifact is created."""
+    empty_merged = tmp_path / "not_a_substrate"
+    empty_merged.mkdir()
+    out_parent = tmp_path / "out"
+    with pytest.raises(step2.Step2InputError):
+        step2.write_step2_outputs(empty_merged, out_parent, verify_pins=True)
+    # No output directory may have been created by the aborted write.
+    assert not out_parent.exists() or list(out_parent.iterdir()) == []
+
+
+def test_write_refuses_to_overwrite_existing_output_dir(tmp_path):
+    """A pre-existing `<ts>Z` target dir must hard-fail (never overwrite)."""
+    out_parent = tmp_path / "out"
+    fixed_ts = "20200101T000000"
+    (out_parent / f"{fixed_ts}Z").mkdir(parents=True)
+    # Use a missing substrate so the gate would fail anyway, but the overwrite
+    # guard is reached only if the gate passes; to isolate the guard we point
+    # at the real substrate when present, else assert the gate-failure path.
+    if (MERGED_DIR / "build_daily_counts.csv").is_file():
+        with pytest.raises(step2.Step2BoundaryError, match="overwrite"):
+            step2.write_step2_outputs(
+                MERGED_DIR, out_parent, verify_pins=True, timestamp_utc=fixed_ts
+            )
+    else:
+        with pytest.raises(step2.Step2InputError):
+            step2.write_step2_outputs(
+                tmp_path / "missing", out_parent, timestamp_utc=fixed_ts
+            )
+
+
+@pytest.mark.skipif(
+    not (MERGED_DIR / "build_daily_counts.csv").is_file(),
+    reason="canonical merged substrate not present in this checkout",
+)
+def test_write_step2_outputs_writes_three_artifacts_to_tmp(tmp_path):
+    out_parent = tmp_path / "step2_out"
+    manifest = step2.write_step2_outputs(MERGED_DIR, out_parent, verify_pins=True)
+    output_dir = Path(manifest["output_dir"])
+    # Output is under tmp_path (outside the repo), never in the repo tree.
+    assert tmp_path in output_dir.parents
+    assert REPO_ROOT not in output_dir.parents
+    # Exactly the three allow-listed artifacts, nothing else.
+    written = sorted(p.name for p in output_dir.iterdir())
+    assert written == sorted(step2.ALLOWED_OUTPUT_BASENAMES)
+    # Manifest SHA-256s match the on-disk files.
+    for basename, digest in manifest["artifacts_sha256"].items():
+        assert step2.sha256_of_file(output_dir / basename) == digest
+    assert manifest["verdict"] == step2.PASS_VERDICT
+    assert manifest["input_row_count"] == step2.EXPECTED_ROW_COUNT
+    assert manifest["feature_row_count"] == step2.EXPECTED_ROW_COUNT
+    # The CSV has 3562 data rows + 1 header.
+    csv_path = output_dir / "step2_daily_features.csv"
+    with open(csv_path, encoding="utf-8") as fh:
+        n_lines = sum(1 for _ in fh)
+    assert n_lines == step2.EXPECTED_ROW_COUNT + 1
+
+
+@pytest.mark.skipif(
+    not (MERGED_DIR / "build_daily_counts.csv").is_file(),
+    reason="canonical merged substrate not present in this checkout",
+)
+def test_write_step2_outputs_is_deterministic_across_runs(tmp_path):
+    """Two writes of the same pinned substrate (to different `<ts>Z` dirs) must
+    produce byte-identical artifacts (memo §14 determinism)."""
+    parent_a = tmp_path / "a"
+    parent_b = tmp_path / "b"
+    m1 = step2.write_step2_outputs(
+        MERGED_DIR, parent_a, verify_pins=True, timestamp_utc="20200101T000000"
+    )
+    m2 = step2.write_step2_outputs(
+        MERGED_DIR, parent_b, verify_pins=True, timestamp_utc="20200102T000000"
+    )
+    assert m1["artifacts_sha256"] == m2["artifacts_sha256"]
+
+
+@pytest.mark.skipif(
+    not (MERGED_DIR / "build_daily_counts.csv").is_file(),
+    reason="canonical merged substrate not present in this checkout",
+)
+def test_written_metadata_records_pins_schema_and_verdict(tmp_path):
+    out_parent = tmp_path / "step2_out"
+    manifest = step2.write_step2_outputs(MERGED_DIR, out_parent, verify_pins=True)
+    output_dir = Path(manifest["output_dir"])
+    with open(output_dir / "step2_metadata.json", encoding="utf-8") as fh:
+        meta = json.load(fh)
+    assert meta["input_substrate"]["build_manifest_digest"] == (
+        step2.EXPECTED_BUILD_MANIFEST_DIGEST
+    )
+    assert meta["input_substrate"]["build_daily_counts_sha256"] == (
+        step2.INPUT_ARTIFACT_SHA256["build_daily_counts.csv"]
+    )
+    assert meta["input_substrate"]["build_metadata_sha256"] == (
+        step2.INPUT_ARTIFACT_SHA256["build_metadata.json"]
+    )
+    assert meta["input_substrate"]["build_summary_sha256"] == (
+        step2.INPUT_ARTIFACT_SHA256["build_summary.md"]
+    )
+    assert meta["feature_schema"] == list(step2.FEATURE_SCHEMA)
+    assert meta["feature_schema_locked"] is True
+    assert meta["pre_execution_conformance_verdict"] == step2.PASS_VERDICT
+    assert meta["feature_row_count"] == step2.EXPECTED_ROW_COUNT
+    for k in step2.BOUNDARY_DECLARATIONS_KEYS:
+        assert meta["boundary_declarations"][k] is True
+    assert meta["full_build_authorized_reused"] is False
+    assert meta["merge_write_flag_reused"] is False
+    # F1-F6 clean on the written summary + metadata bytes.
+    with open(output_dir / "step2_summary.md", encoding="utf-8") as fh:
+        assert step2.audit_f1_f6(fh.read()) == []
+    with open(output_dir / "step2_metadata.json", encoding="utf-8") as fh:
+        assert step2.audit_f1_f6(fh.read()) == []
+
+
+# ----------------------------------------------------------------------------
+# CLI execution-gate: write path stays blocked closed this turn
+# ----------------------------------------------------------------------------
+
+def test_cli_execution_authorization_constant_is_false():
+    mod = _load_cli_module()
+    assert mod.STEP2_EXECUTION_AUTHORIZED is False
+    # The canonical real-output parent points inside the repo results tree.
+    assert mod.CANONICAL_STEP2_OUTPUT_PARENT_PATH == (
+        REPO_ROOT / "results" / step2.CANONICAL_STEP2_OUTPUT_PARENT_BASENAME
+    )
+
+
+def test_cli_write_blocked_creates_no_output_dir(tmp_path):
+    """Invoking --write-step2-output while execution is unauthorized must raise
+    BEFORE any write and must not create the canonical output directory."""
+    mod = _load_cli_module()
+    canonical_parent = mod.CANONICAL_STEP2_OUTPUT_PARENT_PATH
+    existed_before = canonical_parent.exists()
+    with pytest.raises(step2.Step2BoundaryError, match="blocked closed"):
+        mod.main([
+            "--write-step2-output",
+            "--output-parent-dir", str(tmp_path / "should_not_be_used"),
+        ])
+    # Neither the canonical parent nor the redirected tmp parent was created.
+    assert canonical_parent.exists() == existed_before
+    assert not (tmp_path / "should_not_be_used").exists()

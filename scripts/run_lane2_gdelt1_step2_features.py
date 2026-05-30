@@ -37,6 +37,19 @@ CANONICAL_MERGED_DIR_PATH = (
     / step2.CANONICAL_MERGED_DIR_BASENAME
 )
 
+# Canonical parent for a real (separately authorized) execution's output.
+# The writer creates a fresh `<UTC-ts>Z/` subdir under this path. This turn
+# never writes here: the write path is blocked closed (see below).
+CANONICAL_STEP2_OUTPUT_PARENT_PATH = (
+    REPO_ROOT
+    / "results"
+    / step2.CANONICAL_STEP2_OUTPUT_PARENT_BASENAME
+)
+
+# Locked False. A real Step 2 execution requires a separate, explicit
+# execution-authorization prompt that flips this to True in that authorized
+# turn. While it is False, `--write-step2-output` is blocked closed and raises
+# Step2BoundaryError before any byte is written.
 STEP2_EXECUTION_AUTHORIZED = False  # locked False; do not flip here
 
 
@@ -74,8 +87,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Reserved dedicated write flag. Currently BLOCKED CLOSED until a "
-            "separate execution-authorization prompt. Invoking it raises "
-            "Step2BoundaryError."
+            "separate execution-authorization prompt flips "
+            "STEP2_EXECUTION_AUTHORIZED to True. While blocked, invoking it "
+            "raises Step2BoundaryError before any byte is written."
+        ),
+    )
+    parser.add_argument(
+        "--output-parent-dir",
+        type=Path,
+        default=CANONICAL_STEP2_OUTPUT_PARENT_PATH,
+        help=(
+            "Parent directory under which a real execution writes a fresh "
+            "<UTC-ts>Z/ output directory (default: results/"
+            f"{step2.CANONICAL_STEP2_OUTPUT_PARENT_BASENAME}). Only used when "
+            "--write-step2-output is authorized."
         ),
     )
     parser.add_argument(
@@ -109,20 +134,53 @@ def _format_text_report(report: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_write_manifest(manifest: dict) -> str:
+    lines = [
+        "=== Lane 2 GDELT1 Step 2 Output Write ===",
+        f"output_dir: {manifest['output_dir']}",
+        f"verdict: {manifest['verdict']}",
+        f"input_row_count: {manifest['input_row_count']}",
+        f"feature_row_count: {manifest['feature_row_count']}",
+        f"build_manifest_digest: {manifest['build_manifest_digest']}",
+        "artifacts_sha256:",
+    ]
+    for basename, digest in manifest["artifacts_sha256"].items():
+        lines.append(f"  {basename}: {digest}")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.write_step2_output:
-        # The write path is reserved for a future execution-authorization
-        # prompt; this implementation turn does not open it.
-        raise step2.Step2BoundaryError(
-            "--write-step2-output is blocked closed in this implementation. "
-            "A separate execution-authorization prompt is required, and the "
-            "§§9-11 conformance gate must independently PASS first. "
-            "See docs/lane2_gdelt1_step2_implementation_design_memo_v0.1.md "
-            "§§5, 11, 14."
+        if not STEP2_EXECUTION_AUTHORIZED:
+            # Blocked closed: the write path is implemented and tested, but a
+            # real write requires a separate execution-authorization prompt
+            # that flips STEP2_EXECUTION_AUTHORIZED to True in that authorized
+            # turn. We fail before any byte is written.
+            raise step2.Step2BoundaryError(
+                "--write-step2-output is blocked closed in this implementation. "
+                "A separate execution-authorization prompt is required (it "
+                "flips STEP2_EXECUTION_AUTHORIZED to True), and the §§9-11 "
+                "conformance gate must independently PASS first. "
+                "See docs/lane2_gdelt1_step2_implementation_design_memo_v0.1.md "
+                "§§5, 11, 14."
+            )
+        # Authorized execution path (only reachable when a separately
+        # authorized turn has set STEP2_EXECUTION_AUTHORIZED = True). The
+        # writer re-runs the §11 conformance gate and fails closed on any
+        # mismatch before writing.
+        manifest = step2.write_step2_outputs(
+            args.merged_dir,
+            args.output_parent_dir,
+            verify_pins=not args.skip_input_pin_verification,
         )
+        if args.report_json:
+            print(json.dumps(manifest, indent=2, sort_keys=True))
+        else:
+            print(_format_write_manifest(manifest))
+        return 0
 
     report = step2.run_conformance_gate(
         args.merged_dir,
