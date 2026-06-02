@@ -71,7 +71,8 @@ Insert into v2.1 **Phase 0.5** a new **required** conformance item:
 Insert into v2.1 **Phase 0.5** a new **required** conformance item:
 
 **[Phase 0.5 — NEW ITEM] Planted-signal surrogate `y_synth` locked to implementation exactness.** Phase 0.5 must extract and confirm, against v0.3 (`c6aeb2b`):
-- `y_synth` is an **i.i.d.-by-day synthetic surrogate** (no autocorrelation in the *injected signal* path);
+- `y_synth` is an **AR(1)-style synthetic surrogate target / outcome stand-in with persistence `φ_synth`** (binding `φ_synth = 0.50`; the persistence exists only to power-match / stress the effective-N environment — per v0.3 §8/§10). `y_synth` is **not** a zero-autocorrelation / φ=0 surrogate;
+- the **no-autocorrelation, daily / high-frequency lead-lag** character belongs to the **injected signal (a separate object)**, **not** to `y_synth`; the injected signal is **not** trend-shaped or regime-shaped;
 - **seed = `1729`** (deterministic);
 - **gain calibrated to the realized pre-stack association** (calibration uses `y_synth` only, never an outcome);
 - the synthetic surrogate substitutes for the outcome **only** in the planted-signal / fidelity-diagnostic path;
@@ -145,7 +146,7 @@ The amended Phase 0.5 canary must verify **at least**:
 2b. **field-selection scope is consciously separated from row-universe scope** (§F2): *no row filters does not mean unrestricted field reads.* EventCode is the concrete dual-use example — **no EventCode row filter keeps all EventCode rows in the universe**, while **no EventCode family / no EventCode field read keeps the EventCode column/family out of the extraction payload**. Phase 0.5 must verify the durable v2.1 / extraction-stage **field allow-list invariant is preserved** (only `civil_date`/SQLDATE, `QuadClass`, `GoldsteinScale`, `AvgTone`, `NumMentions`), and **must not** treat v0.3's all-row universe as permission to read **EventCode family, actor, location, article text, market data/outcome fields, price-derived fields (including trailing realized volatility), or other non-allow-listed fields**;
 3. date logic spec-locked as **`civil_date = SQLDATE`**, no event-occurrence backdating, intended **+1 availability lag**, with **empirical no-lookahead / ingestion-availability validation explicitly deferred to Phase 2** extraction-time validation (§F);
 4. **primary controlled-association statistic = full-rank simultaneous Spearman partial** (§C);
-5. **planted-signal `y_synth` construction locked**: i.i.d.-by-day, seed `1729`, gain calibrated to realized pre-stack association (§D);
+5. **planted-signal `y_synth` construction locked**: AR(1)-style surrogate target with binding `φ_synth = 0.50`, seed `1729`, gain calibrated to realized pre-stack association (§D);
 6. planted-signal **injection point = raw-component / pre-standardization only**;
 7. **"pre-standardization composite" removed** as invalid;
 8. transformation sequence **includes the compositing step and the simultaneous partial**;
