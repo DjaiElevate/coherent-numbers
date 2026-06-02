@@ -42,7 +42,7 @@
   - the **§10 at-join** control-count / Fisher-z / MDE-floor references;
   - the **§12 at-join** influence-gate control count / Fisher-z / computability references.
 - `c6aeb2b` **remains the governing baseline everywhere else.**
-- In particular, `c6aeb2b` **remains baseline for §11**, which this amendment explicitly leaves **pre-join, outcome-free, RV-free, k=4, `N_eff − 7`**.
+- In particular, `c6aeb2b` **remains baseline for §11**, which this amendment explicitly leaves **pre-join, outcome-free, and RV-free, retaining its k=4 control set** (rank-date + 3 ranked controls). §11 owns no Fisher-z / SE / `N_eff − 7` term; see the amendment's §11 preservation note and §10 dual-use clarification below.
 - This repoint **does not replace `8fdf233`.** `8fdf233` **remains the Phase 0.5 corrected-amendment pin**; the new HAR-RV amendment commit becomes an **additional governing-spec amendment leg**, not a substitute for the Phase 0.5 leg.
 - Consequence for the next canary manifest: it must be the **five-commit set** — governing chain `294494a` + `c6aeb2b` + this HAR-RV commit; Phase 0.5 corrected amendment `8fdf233`; v2.1 base `3411db5`.
 
@@ -82,10 +82,16 @@ Generic form: `SE_z = 1 / sqrt(N_eff − k − 3)`.
 - **§12 LOYO / leave-two influence gate** re-runs the at-join §7 statistic, so it **inherits the 6-control at-join structure**: each deletion subset recomputes its own realized `N_eff`, seam-safe `φ`, and per-subset MDE floor at **k=6**, and the approximate one-sided Fisher-z confidence-bound diagnostic uses **`SE_z = 1 / sqrt(N_eff − 9)`**.
 - **Acknowledgement (stricter computability):** the `+2` controls raise the computability floor from `N_eff > 7` to `N_eff > 9`. Some §12 deletion subsets (especially leave-two on the smallest retained samples) may become **non-computable / BLOCKED** that were computable under k=4. This is expected and is handled by the existing degenerate → BLOCKED convention, not by silently reverting to k=4.
 
+**§10 dual-use clarification (per `c6aeb2b` §10).** The single locked MDE rule — `ρ_MDE` via `sqrt(N_eff − k − 3)`, `k` the control count — produces two distinct floors from one formula:
+1. the **pre-join, outcome-free planted-signal MDE floor** used by §11 (the binding `φ_synth = 0.50` planted floor), and
+2. the **at-join, outcome-dependent interpretive MDE floor** used by the real-outcome primary and by §12's per-subset deletion floors.
+
+This amendment changes **only use (2)**: §10's at-join interpretive / Fisher-z / MDE use, and §12's at-join influence-gate confidence-bound diagnostic, move from `k=4` / `N_eff − 7` to `k=6` / `N_eff − 9` (computability threshold `N_eff > 9`). The §10 **pre-join planted-signal floor used by §11 stays at `k=4` / `N_eff − 7`**, because RV is unavailable pre-join. §11 itself owns no Fisher-z / SE / DOF term; it only references floor (1).
+
 ## 8. §11 planted-signal fidelity preservation (RV-free, pre-join, k=4)
 
 - **§11 remains pre-join, outcome-free, and RV-free.** It keeps **k=4**: rank-date + the three volume/coverage controls only. It does **not** include `trailing_rv_5` or `trailing_rv_22`.
-- **§11 retains its own constants:** the §11 fidelity statistic uses `k=4` and therefore does **not** inherit the at-join `N_eff − 9` / `N_eff > 9` rule; any §11 computability / SE quantity stays at the `k=4` form (`N_eff − 7`).
+- **§11 retains its k=4 control set and owns no DOF term.** The §11 retention statistic is a ratio — a `k=4` full-rank simultaneous Spearman partial numerator (with `y_synth` substituted for the outcome) over a plain-Spearman denominator — judged against the **§10 pre-join, outcome-free planted-signal MDE floor**. §11 carries **no Fisher-z / SE / `N_eff − 7` term of its own**. It therefore does **not** inherit the at-join k=6 change; the at-join `N_eff − 7 → N_eff − 9` / `N_eff > 9` DOF update is scoped to §10's at-join interpretive use and §12 only.
 - **Rationale:** RV is computed *at the join* from the price series; §11 (planted-signal / fidelity diagnostic) executes *before* the join, where no price series and no outcome are available. Injecting RV into §11 is therefore impossible and forbidden.
 - **This is not a contradiction:** the k=4 (§11) vs k=6 (§7 / §12 / §10 at-join) split is a **deliberate stage-specific control distinction** (pre-join vs at-join), not an inconsistency. The amendment states this explicitly so a canary does not flag the two control counts as conflicting.
 
