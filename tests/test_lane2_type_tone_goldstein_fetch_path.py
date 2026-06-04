@@ -810,6 +810,413 @@ def test_slice_aware_coverage_for_bounded_april_2013():
     assert archive.fetched_set_fully_covers(datetime.date(2013, 4, 30), fetched) is False
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# WIRED bounded-run orchestration tests (§10 items 1-28). Synthetic / local only.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _april_dates():
+    import datetime
+    return [datetime.date(2013, 4, d) for d in range(1, 31)]  # 2013-04-01..30
+
+
+def _april_payloads():
+    """One exactly-58-col row per file, SQLDATE == file date (offset 0)."""
+    out = {}
+    for d in _april_dates():
+        out[d] = make_payload([make_gdelt_row(d.strftime("%Y%m%d"), "4", "1.0", "5", "0.5")])
+    return out
+
+
+def _manifests_for(payloads):
+    file_map = {fetch_path.expected_source_filename(d): payloads[d] for d in payloads}
+    return _mk_manifests(file_map)
+
+
+class RecordingFetcher:
+    """Injected non-network fetcher that serves in-memory payloads and records
+    the dates it was asked for (to prove no out-of-slice fetch is attempted)."""
+
+    def __init__(self, payloads):
+        self.payloads = payloads
+        self.dates = []
+
+    def __call__(self, source_file_date, source_file_url):
+        self.dates.append(source_file_date)
+        return self.payloads[source_file_date]
+
+
+def _run_april(monkeypatch, tmp_path, *, payloads=None, fetcher=None, cache_dir=None,
+               md5_b=None, size_b=None, fetch_attempts=2, write_cache=True,
+               out_name="out"):
+    g = _guarded(monkeypatch)
+    payloads = payloads if payloads is not None else _april_payloads()
+    if md5_b is None or size_b is None:
+        md5_b, size_b = _manifests_for(payloads)
+    if fetcher is None:
+        fetcher = RecordingFetcher(payloads)
+    res = fetch_path.run_bounded_integrity_build(
+        "2013-04-01", "2013-04-30", out_dir=str(tmp_path / out_name),
+        md5sums_bytes=md5_b, filesizes_bytes=size_b,
+        cache_dir=cache_dir, fetch_callable=fetcher,
+        fetch_attempts=fetch_attempts, write_cache=write_cache, **g,
+    )
+    return res, fetcher
+
+
+# 1. Source gate remains disabled (committed).
+
+def test_wired_source_gate_remains_disabled():
+    assert fetch_path.REAL_FETCH_SOURCE_GATE_ENABLED is False
+
+
+# 2 & 16-19. Wired happy path: reconciliation runs; slice-aware coverage applied.
+
+def test_wired_happy_path_slice_coverage(monkeypatch, tmp_path):
+    res, fetcher = _run_april(monkeypatch, tmp_path)
+    # Manifest reconciliation ran and reconciled all 30 expected files.
+    assert res["reconcile_status"]["reconciled_ok"] is True
+    assert res["reconcile_status"]["expected_count"] == 30
+    # 17/18: 2013-04-01 and 2013-04-30 routed OUT of the primary archive.
+    assert "2013-04-01" not in res["primary_covered_sqldates"]
+    assert "2013-04-30" not in res["primary_covered_sqldates"]
+    assert "2013-04-30" in res["slice_edge_incomplete_sqldates"]
+    assert "2013-04-01" in res["window_edge_incomplete_days"]
+    # 19: covered primary dates are exactly 2013-04-02 .. 2013-04-29.
+    expected = ["2013-04-{:02d}".format(d) for d in range(2, 30)]
+    assert res["primary_covered_sqldates"] == expected
+
+
+# 20. No 2013-03-31 or 2013-05-01 fetch/open is attempted.
+
+def test_wired_no_out_of_slice_fetch(monkeypatch, tmp_path):
+    import datetime
+    res, fetcher = _run_april(monkeypatch, tmp_path)
+    assert datetime.date(2013, 3, 31) not in fetcher.dates
+    assert datetime.date(2013, 5, 1) not in fetcher.dates
+    assert min(fetcher.dates) == datetime.date(2013, 4, 1)
+    assert max(fetcher.dates) == datetime.date(2013, 4, 30)
+    assert "2013-03-31" not in res["fetched_dates"]
+    assert "2013-05-01" not in res["fetched_dates"]
+
+
+# 2/9. Reconciliation happens BEFORE any daily fetch (missing entry -> no fetch).
+
+def test_wired_reconciliation_before_fetch(monkeypatch, tmp_path):
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    # Drop one expected file from md5sums -> reconcile must fail before any fetch.
+    import datetime
+    drop_fn = fetch_path.expected_source_filename(datetime.date(2013, 4, 15))
+    md5map = fetch_path.parse_md5sums(md5_b.decode())
+    lines = [ln for ln in md5_b.decode().splitlines() if drop_fn not in ln]
+    md5_b2 = ("\n".join(lines) + "\n").encode()
+    fetcher = RecordingFetcher(payloads)
+    with pytest.raises(fetch_path.IntegrityManifestError):
+        _run_april(monkeypatch, tmp_path, payloads=payloads, fetcher=fetcher,
+                   md5_b=md5_b2, size_b=size_b)
+    assert fetcher.dates == [], "no daily file may be fetched before reconciliation passes"
+
+
+# 3 & 4. Missing md5sums / filesizes entry fails closed before archive write.
+
+def test_wired_missing_md5_entry_fails_closed(monkeypatch, tmp_path):
+    import datetime
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    drop_fn = fetch_path.expected_source_filename(datetime.date(2013, 4, 10))
+    md5_b2 = ("\n".join(ln for ln in md5_b.decode().splitlines() if drop_fn not in ln) + "\n").encode()
+    with pytest.raises(fetch_path.IntegrityManifestError):
+        _run_april(monkeypatch, tmp_path, payloads=payloads, md5_b=md5_b2, size_b=size_b)
+    assert not (tmp_path / "out" / "ttg_approved_fields_archive.csv").exists()
+
+
+def test_wired_missing_filesizes_entry_fails_closed(monkeypatch, tmp_path):
+    import datetime
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    drop_fn = fetch_path.expected_source_filename(datetime.date(2013, 4, 10))
+    size_b2 = ("\n".join(ln for ln in size_b.decode().splitlines() if drop_fn not in ln) + "\n").encode()
+    with pytest.raises(fetch_path.IntegrityManifestError):
+        _run_april(monkeypatch, tmp_path, payloads=payloads, md5_b=md5_b, size_b=size_b2)
+    assert not (tmp_path / "out" / "ttg_approved_fields_archive.csv").exists()
+
+
+# 5 & 6. MD5 mismatch / byte-size mismatch fails closed before archive write.
+
+def test_wired_md5_mismatch_fails_closed(monkeypatch, tmp_path):
+    import datetime, hashlib as _h
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    bad_fn = fetch_path.expected_source_filename(datetime.date(2013, 4, 12))
+    # Corrupt the md5 for one file (reconcile still passes; per-file verify fails).
+    lines = []
+    for ln in md5_b.decode().splitlines():
+        if bad_fn in ln:
+            lines.append("{}  {}".format("0" * 32, bad_fn))
+        else:
+            lines.append(ln)
+    md5_b2 = ("\n".join(lines) + "\n").encode()
+    with pytest.raises(fetch_path.IntegrityVerificationError):
+        _run_april(monkeypatch, tmp_path, payloads=payloads, md5_b=md5_b2, size_b=size_b)
+    assert not (tmp_path / "out" / "ttg_approved_fields_archive.csv").exists()
+
+
+def test_wired_size_mismatch_fails_closed(monkeypatch, tmp_path):
+    import datetime
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    bad_fn = fetch_path.expected_source_filename(datetime.date(2013, 4, 12))
+    lines = []
+    for ln in size_b.decode().splitlines():
+        if bad_fn in ln:
+            lines.append("{} {}".format(999999, bad_fn))
+        else:
+            lines.append(ln)
+    size_b2 = ("\n".join(lines) + "\n").encode()
+    with pytest.raises(fetch_path.IntegrityVerificationError):
+        _run_april(monkeypatch, tmp_path, payloads=payloads, md5_b=md5_b, size_b=size_b2)
+    assert not (tmp_path / "out" / "ttg_approved_fields_archive.csv").exists()
+
+
+# 7. Unstable retry fails closed before archive write.
+
+def test_wired_unstable_retry_fails_closed(monkeypatch, tmp_path):
+    import datetime
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    flaky_date = datetime.date(2013, 4, 5)
+    calls = {"n": 0}
+
+    def _flaky(source_file_date, url):
+        if source_file_date == flaky_date:
+            calls["n"] += 1
+            # Return different bytes on the 2nd attempt -> unstable.
+            return payloads[source_file_date] if calls["n"] == 1 else payloads[source_file_date] + b"X"
+        return payloads[source_file_date]
+
+    with pytest.raises(fetch_path.UnstableDownloadError):
+        _run_april(monkeypatch, tmp_path, payloads=payloads, fetcher=_flaky,
+                   md5_b=md5_b, size_b=size_b, fetch_attempts=2)
+    assert not (tmp_path / "out" / "ttg_approved_fields_archive.csv").exists()
+
+
+# 8 & 11. Cache hit re-verified before use; mixed cache/fetch records provenance.
+
+def test_wired_all_from_verified_cache(monkeypatch, tmp_path):
+    import datetime
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    for d in _april_dates():
+        (cache_dir / fetch_path.expected_source_filename(d)).write_bytes(payloads[d])
+
+    # A fetcher that errors if called — proves all bytes came from cache.
+    def _never(source_file_date, url):
+        raise AssertionError("fetch must not be called when cache is complete")
+
+    res, _ = _run_april(monkeypatch, tmp_path, payloads=payloads, fetcher=_never,
+                        cache_dir=str(cache_dir), md5_b=md5_b, size_b=size_b)
+    sources = {pf["integrity"]["source"] for pf in res["manifest"]["per_file_provenance"]}
+    assert sources == {"cache"}
+    assert res["primary_covered_sqldates"] == ["2013-04-{:02d}".format(d) for d in range(2, 30)]
+
+
+def test_wired_mixed_cache_and_fetch_records_provenance(monkeypatch, tmp_path):
+    import datetime
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    # Cache only the even days; odd days are fetched.
+    cached_dates = [d for d in _april_dates() if d.day % 2 == 0]
+    for d in cached_dates:
+        (cache_dir / fetch_path.expected_source_filename(d)).write_bytes(payloads[d])
+    fetcher = RecordingFetcher(payloads)
+    res, _ = _run_april(monkeypatch, tmp_path, payloads=payloads, fetcher=fetcher,
+                        cache_dir=str(cache_dir), md5_b=md5_b, size_b=size_b)
+    sources = {pf["source_file_date"]: pf["integrity"]["source"]
+               for pf in res["manifest"]["per_file_provenance"]}
+    assert sources["2013-04-02"] == "cache"
+    assert sources["2013-04-03"] == "fetch"
+    # Only odd (uncached) days were fetched.
+    assert all(d.day % 2 == 1 for d in fetcher.dates)
+    # Provenance is structural-only for every file.
+    for pf in res["manifest"]["per_file_provenance"]:
+        assert pf["integrity"]["integrity_status"] == "verified"
+        assert pf["integrity"]["md5_ok"] is True and pf["integrity"]["size_ok"] is True
+
+
+# 9. Cache cannot bypass manifest reconciliation.
+
+def test_wired_cache_cannot_bypass_reconciliation(monkeypatch, tmp_path):
+    import datetime
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    for d in _april_dates():
+        (cache_dir / fetch_path.expected_source_filename(d)).write_bytes(payloads[d])
+    # Even with a complete cache, a missing manifest entry fails closed first.
+    drop_fn = fetch_path.expected_source_filename(datetime.date(2013, 4, 20))
+    md5_b2 = ("\n".join(ln for ln in md5_b.decode().splitlines() if drop_fn not in ln) + "\n").encode()
+    with pytest.raises(fetch_path.IntegrityManifestError):
+        _run_april(monkeypatch, tmp_path, payloads=payloads, fetcher=lambda d, u: payloads[d],
+                   cache_dir=str(cache_dir), md5_b=md5_b2, size_b=size_b)
+
+
+# 10. Cache integrity failure fails closed without silent re-download.
+
+def test_wired_cache_integrity_failure_no_silent_redownload(monkeypatch, tmp_path):
+    import datetime
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    for d in _april_dates():
+        (cache_dir / fetch_path.expected_source_filename(d)).write_bytes(payloads[d])
+    # Corrupt ONE cached file.
+    bad_d = datetime.date(2013, 4, 14)
+    (cache_dir / fetch_path.expected_source_filename(bad_d)).write_bytes(b"CORRUPT")
+    fetched = []
+
+    def _record(source_file_date, url):
+        fetched.append(source_file_date)
+        return payloads[source_file_date]
+
+    with pytest.raises(fetch_path.CacheIntegrityError):
+        _run_april(monkeypatch, tmp_path, payloads=payloads, fetcher=_record,
+                   cache_dir=str(cache_dir), md5_b=md5_b, size_b=size_b)
+    # No silent re-download of the corrupt cached file.
+    assert bad_d not in fetched
+
+
+# 12-15. Exact-58 enforcement is invoked BY the orchestration.
+
+@pytest.mark.parametrize("ncols", [35, 45, 59])
+def test_wired_exact58_enforced_in_orchestration(monkeypatch, tmp_path, ncols):
+    import datetime
+    g = _guarded(monkeypatch)
+    d = datetime.date(2013, 4, 10)
+    # A single wrong-width row for this file's payload.
+    payload = ("\n".join([_make_row_ncols(ncols, sqldate="20130410")]) + "\n").encode()
+    fn = fetch_path.expected_source_filename(d)
+    md5_b, size_b = _mk_manifests({fn: payload})  # whole-file integrity passes
+    res = fetch_path.run_bounded_integrity_build(
+        "2013-04-10", "2013-04-10", out_dir=str(tmp_path / "out"),
+        md5sums_bytes=md5_b, filesizes_bytes=size_b,
+        fetch_callable=lambda dd, u: payload, **g,
+    )
+    pf = res["manifest"]["per_file_provenance"][0]
+    # Integrity passed (whole-file), but the wrong-width row failed exact-58.
+    assert pf["integrity"]["integrity_status"] == "verified"
+    assert pf["dropped_by_reason"]["column_count_mismatch"] == 1
+    assert pf["retained_row_count"] == 0
+    # Nothing wrong-width reached the archive.
+    assert res["primary_covered_sqldates"] == []
+
+
+# 21-23. Generated manifest/report data structural-only, value-agnostic.
+
+def test_wired_manifest_structural_and_value_agnostic(monkeypatch, tmp_path):
+    res, _ = _run_april(monkeypatch, tmp_path)
+    manifest = res["manifest"]
+    # No value-summary / value-bucket KEYS anywhere. (The approved field NAMES
+    # may appear as schema name/type values — that is the schema, not a value
+    # summary — so we scan KEYS, not values.)
+    keys = _all_keys(manifest)
+    for bad in ("quadclass", "goldsteinscale", "nummentions", "avgtone",
+                "by_value", "by_tone", "by_sign", "_bucket", "bucketed", "sample",
+                "mean", "median", "histogram", "distribution", "value_counts"):
+        for k in keys:
+            assert bad not in k.lower(), (k, bad)
+    assert "rows" not in keys
+    # Wired structural markers present.
+    assert manifest["wired_orchestrator"] == "run_bounded_integrity_build"
+    assert manifest["boundary_declarations"]["single_real_network_entrypoint"] is True
+    assert manifest["boundary_declarations"]["integrity_checked_before_archive_write"] is True
+    assert manifest["boundary_declarations"]["slice_aware_coverage_applied"] is True
+
+
+# 24. No 2023+ enumeration/open path exists (wired path).
+
+def test_wired_no_2023plus_enumeration(monkeypatch, tmp_path):
+    g = _guarded(monkeypatch)
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    spy = FetchSpy()
+    with pytest.raises(archive.Post2022SealBreach):
+        fetch_path.run_bounded_integrity_build(
+            "2022-12-30", "2023-01-02", out_dir=str(tmp_path / "out"),
+            md5sums_bytes=md5_b, filesizes_bytes=size_b,
+            fetch_callable=spy, **g,
+        )
+    assert spy.calls == [], "no fetch after a 2023+ enumeration breach"
+
+
+# 25. No real network contact occurs in tests (default reaches the real gate).
+
+def test_wired_default_fetch_is_real_gated(monkeypatch, tmp_path):
+    g = _guarded(monkeypatch)
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    # No injected fetcher, no cache: the default per-file source is the real
+    # gated fetch, which hard-errors (proving the default IS the real entrypoint
+    # and that no test performs real network contact).
+    with pytest.raises(fetch_path.RealFetchNotAuthorized):
+        fetch_path.run_bounded_integrity_build(
+            "2013-04-01", "2013-04-30", out_dir=str(tmp_path / "out"),
+            md5sums_bytes=md5_b, filesizes_bytes=size_b,
+            fetch_callable=None, cache_dir=None, **g,
+        )
+
+
+# 26 & 27. Single real/default entrypoint; bare harness cannot reach _open_url.
+
+def test_bare_harness_refuses_default_and_real_fetch(monkeypatch, tmp_path):
+    g = _guarded(monkeypatch)
+    # Default (None) -> fail closed (no fall-back to real fetch).
+    with pytest.raises(fetch_path.SyntheticOrchestratorViolation):
+        fetch_path.run_phase2_archive_build(["2014-06-10"], out_dir="UNUSED", **g)
+    # Real-network entrypoints rejected as the fetcher.
+    for real_fn in (fetch_path.fetch_one_source_file, fetch_path.fetch_stable,
+                    fetch_path._open_url):
+        with pytest.raises(fetch_path.SyntheticOrchestratorViolation):
+            fetch_path.run_phase2_archive_build(
+                ["2014-06-10"], out_dir="UNUSED", fetch_callable=real_fn, **g)
+
+
+def test_bare_harness_synthetic_fetcher_never_opens_url(monkeypatch, tmp_path):
+    g = _guarded(monkeypatch)
+    spy = FetchSpy()
+    # A synthetic spy is accepted; it is the ONLY way the bare harness fetches,
+    # and a spy never reaches _open_url.
+    with pytest.raises(archive.Post2022SealBreach):
+        fetch_path.run_phase2_archive_build(
+            ["2023-01-01"], out_dir="UNUSED", fetch_callable=spy, **g)
+    assert spy.calls == []
+
+
+# 28. Injected-fetcher seam cannot bypass integrity in the wired path.
+
+def test_wired_injected_fetcher_cannot_bypass_integrity(monkeypatch, tmp_path):
+    g = _guarded(monkeypatch)
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    # An injected fetcher that returns CORRUPT bytes (not matching the official
+    # manifest) must still be caught by verify_file_integrity in the wired path.
+    def _corrupt(source_file_date, url):
+        return b"CORRUPT-bytes-not-matching-manifest"
+
+    with pytest.raises(fetch_path.IntegrityVerificationError):
+        fetch_path.run_bounded_integrity_build(
+            "2013-04-01", "2013-04-30", out_dir=str(tmp_path / "out"),
+            md5sums_bytes=md5_b, filesizes_bytes=size_b,
+            fetch_callable=_corrupt, **g,
+        )
+    assert not (tmp_path / "out" / "ttg_approved_fields_archive.csv").exists()
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _strip_hashes(obj):

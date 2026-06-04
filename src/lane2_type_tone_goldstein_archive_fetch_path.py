@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import lane2_type_tone_goldstein_local_archive as archive
@@ -86,6 +86,14 @@ class RealFetchNotAuthorized(archive.ArchiveBoundaryError):
     """Raised by the real fetch entrypoint while the source gate is False.
 
     Message is exactly `REAL_FETCH_BLOCK_MESSAGE`."""
+
+
+class SyntheticOrchestratorViolation(archive.ArchiveBoundaryError):
+    """Raised by `run_phase2_archive_build` (the synthetic/legacy harness) when
+    it is asked to perform a real or default fetch. The bare harness is NOT a
+    real-fetch-capable orchestrator: it requires an explicitly injected
+    non-network fetcher and refuses the real-network entrypoints. The single
+    real/default fetch entrypoint is `run_bounded_integrity_build`."""
 
 
 # ── Provenance URL (file-download namespace, distinct from row SOURCEURL) ────
@@ -165,7 +173,13 @@ def _open_url(url: str, _opener: Optional[Any] = None) -> bytes:
         return resp.read()
 
 
-# ── Phase-2 build orchestration (network-free; injected fetcher) ─────────────
+# ── SYNTHETIC/LEGACY build harness (cannot perform real fetches) ─────────────
+
+# The real-network primitives the synthetic harness must never wire in. Used by
+# an identity check so the bare harness cannot reach `_open_url` for real bytes.
+def _real_fetch_entrypoints():
+    return (fetch_one_source_file, fetch_stable, _open_url)
+
 
 def run_phase2_archive_build(
     candidate_dates: Sequence[str],
@@ -180,26 +194,43 @@ def run_phase2_archive_build(
     is_zip: bool = False,
     enforce_exact_columns: bool = True,
 ) -> Dict[str, Any]:
-    """Orchestrate a Phase-2 archive build.
+    """SYNTHETIC / LEGACY build harness — NOT a real-fetch-capable orchestrator.
 
-    Sequence:
-      1. Verify codebook indices (fail closed on mismatch) — before any fetch.
-      2. Three-guard run gate (module constant + CLI flag + env). Refuse if not
-         all satisfied — before enumeration / fetch.
-      3. Enumerate the source-file universe (2023+ and pre-window dates
-         hard-error at enumeration, before any open).
-      4. For each in-window source-file date: fetch bytes via `fetch_callable`
-         (default = the gated real fetch, which hard-errors), classify rows by
-         availability eligibility + window coverage, accumulate retained rows
-         and value-agnostic per-file provenance.
-      5. Write the approved-fields archive + a value-agnostic provenance
-         manifest under `out_dir`.
+    This harness exercises the classify/accumulate/manifest logic on bytes
+    supplied by an INJECTED, NON-NETWORK `fetch_callable`. It deliberately does
+    NOT default to the real fetch and cannot reach `_open_url` for real bytes:
 
-    `fetch_callable(source_file_date: date, source_file_url: str) -> bytes` is a
-    seam so synthetic tests can inject a non-network fetcher. The DEFAULT is the
-    gated real fetch, which hard-errors before any URL open. This function
-    performs no network access itself.
+      - `fetch_callable=None` -> raise `SyntheticOrchestratorViolation` (it does
+        NOT silently fall back to the real gated fetch);
+      - a `fetch_callable` that is one of the real-network entrypoints
+        (`fetch_one_source_file` / `fetch_stable` / `_open_url`) -> raise.
+
+    The single real/default fetch entrypoint for future real runs is
+    `run_bounded_integrity_build`, which always applies manifest reconciliation,
+    official MD5/size verification, exact-58 classification, and slice-aware
+    coverage around the fetch. This harness has NONE of that wiring and is for
+    synthetic classification/provenance tests only.
+
+    Sequence: (0) refuse real/default fetch; (1) verify codebook indices;
+    (2) three-guard run gate; (3) enumerate (2023+/pre-window hard-error);
+    (4) per file: injected fetch -> classify -> accumulate; (5) write archive +
+    value-agnostic provenance manifest.
     """
+    # 0. Synthetic-harness guard: refuse real/default fetch (footgun closure).
+    if fetch_callable is None:
+        raise SyntheticOrchestratorViolation(
+            "run_phase2_archive_build is a synthetic/legacy harness and requires "
+            "an explicitly injected non-network fetch_callable; it does NOT "
+            "default to the real fetch. Use run_bounded_integrity_build for the "
+            "real/default integrity-checked path."
+        )
+    if fetch_callable in _real_fetch_entrypoints():
+        raise SyntheticOrchestratorViolation(
+            "run_phase2_archive_build refuses a real-network fetch entrypoint as "
+            "its fetcher; the bare harness cannot reach _open_url for real bytes. "
+            "Use run_bounded_integrity_build for the real/default path."
+        )
+
     # 1. Codebook index verification — fail closed before anything else.
     archive.assert_codebook_indices(
         codebook_derived_indices
@@ -216,7 +247,8 @@ def run_phase2_archive_build(
     # 3. Enumerate (2023+ / pre-window hard-error at enumeration).
     universe = archive.enumerate_source_universe(candidate_dates or [])
 
-    fetch = fetch_callable if fetch_callable is not None else fetch_one_source_file
+    # The §0 guard guarantees `fetch_callable` is a non-None, non-real fetcher.
+    fetch = fetch_callable
 
     retained_rows: List[Dict[str, str]] = []
     per_file_provenance: List[Dict[str, Any]] = []
@@ -225,8 +257,8 @@ def run_phase2_archive_build(
     for iso in universe:
         f_date = date.fromisoformat(iso)
         url = build_source_file_url(f_date)
-        # Default `fetch` is the gated real fetch: it raises RealFetchNotAuthorized
-        # here, aborting the build before any network contact.
+        # `fetch` is the injected non-network synthetic fetcher (guaranteed by
+        # the §0 guard); this harness performs no real network contact.
         payload = fetch(f_date, url)
         byte_hash = archive.sha256_hex(payload)
         cls = archive.classify_payload_rows(
@@ -557,3 +589,242 @@ def fetch_stable(
                 )
             )
     return first
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# WIRED bounded-run orchestration — the SINGLE real/default fetch entrypoint.
+#
+# This is the one orchestrator the future bounded real run will use. It wires the
+# already-reviewed integrity primitives together in a fixed order so that the
+# real-bytes path is ALWAYS: manifest reconciliation -> (cache verify | stable
+# fetch) -> official MD5/size verification -> exact-58 classification ->
+# slice-aware coverage. There is NO bare `fetch -> classify` real path: the
+# synthetic harness `run_phase2_archive_build` cannot reach `_open_url` (it
+# refuses real/default fetch), and the only orchestrator whose default byte
+# source is the real gated fetch is THIS function — and it applies integrity
+# unconditionally to whatever bytes it receives, so an injected fetcher cannot
+# bypass the checks either.
+#
+# In THIS dispatch the function is exercised only with synthetic manifest bytes,
+# synthetic fixture daily bytes, injected non-network fetchers, and pytest temp
+# cache dirs. The shipped source gate keeps the real default inert.
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def _date_range_inclusive(start_iso: str, end_iso: str) -> List[date]:
+    """Every civil date from `start_iso` to `end_iso` inclusive (structural)."""
+    start = date.fromisoformat(start_iso)
+    end = date.fromisoformat(end_iso)
+    if end < start:
+        raise ValueError("end_date {} precedes start_date {}".format(end_iso, start_iso))
+    out: List[date] = []
+    d = start
+    while d <= end:
+        out.append(d)
+        d = d + timedelta(days=1)
+    return out
+
+
+def run_bounded_integrity_build(
+    start_date: str,
+    end_date: str,
+    out_dir: str,
+    *,
+    md5sums_bytes: bytes,
+    filesizes_bytes: bytes,
+    cli_flag: bool = False,
+    module_authorized: Optional[bool] = None,
+    env: Optional[Mapping[str, str]] = None,
+    cache_dir: Optional[str] = None,
+    fetch_callable: Optional[Callable[..., bytes]] = None,
+    codebook_derived_indices: Optional[Mapping[str, int]] = None,
+    is_zip: bool = False,
+    fetch_attempts: int = 2,
+    write_cache: bool = True,
+) -> Dict[str, Any]:
+    """Wired, integrity-checked bounded-run orchestration (single real entrypoint).
+
+    Fixed order (fail closed at every step):
+      1.  Verify codebook indices.
+      2.  Three-guard run gate.
+      3.  Build the bounded source-file universe from start/end and enumerate
+          (rejects any date outside the authorized window and any 2023+ date
+          BEFORE any fetch/open).
+      4.  Compute manifest provenance (SHA-256 + size of the supplied manifest
+          bytes) and parse official-style md5sums / filesizes.
+      5.  Reconcile the bounded universe against BOTH manifests (fail closed).
+      6.  Per source date:
+          a. cache check first: if a cached zip exists, `verify_cached_zip`
+             re-verifies official MD5/size before use (CacheIntegrityError on
+             failure; no silent re-download);
+          b. else `fetch_stable` (retry-stability) via the injected fetcher
+             (default = real gated fetch), then `verify_file_integrity`
+             (official MD5/size; SHA-256 recorded as local provenance), then
+             write the verified bytes to cache (after verification only);
+          c. `classify_payload_rows(..., enforce_exact_columns=True)`.
+      7.  Slice-aware coverage: re-filter classify survivors with
+          `fetched_set_fully_covers` against the ACTUAL fetched date set, so a
+          slice-edge SQLDATE (e.g. 2013-04-30 needing an unfetched 2013-05-01)
+          is routed OUT of the primary archive — never completed by fetching
+          outside the bounded set.
+      8.  Write the approved-fields archive (primary, slice-covered rows only)
+          and a value-agnostic provenance manifest.
+
+    `fetch_callable(source_file_date, source_file_url) -> bytes` is a test seam;
+    its DEFAULT is the real gated fetch via `fetch_stable`. Integrity is applied
+    unconditionally to the returned bytes, so an injected fetcher cannot bypass
+    `verify_file_integrity` / exact-58 / slice coverage. Value-blind throughout.
+    """
+    # 1. Codebook index verification (fail closed before anything else).
+    archive.assert_codebook_indices(
+        codebook_derived_indices
+        if codebook_derived_indices is not None
+        else CANONICAL_CODEBOOK_DERIVED_INDICES
+    )
+
+    # 2. Three-guard run gate.
+    if not archive.guards_satisfied(
+        cli_flag, module_authorized=module_authorized, env=env
+    ):
+        raise archive.ArchiveBuildRefused(archive.REFUSAL_MESSAGE)
+
+    # 3. Bounded universe + window/2023+ rejection BEFORE any fetch/open.
+    candidate_isos = [d.isoformat() for d in _date_range_inclusive(start_date, end_date)]
+    universe = archive.enumerate_source_universe(candidate_isos)  # sorted, in-window
+    fetched_dates = {date.fromisoformat(x) for x in universe}
+    expected_filenames = expected_source_filenames(sorted(fetched_dates))
+
+    # 4. Manifest provenance + parse official-style manifests.
+    prov = manifest_provenance(md5sums_bytes, filesizes_bytes)
+    md5map = parse_md5sums(md5sums_bytes.decode("utf-8", "replace"))
+    sizemap = parse_filesizes(filesizes_bytes.decode("utf-8", "replace"))
+
+    # 5. Reconcile bounded universe against BOTH manifests (fail closed).
+    reconcile_status = reconcile_universe_against_manifests(
+        expected_filenames, md5map, sizemap
+    )
+
+    fetch = fetch_callable  # may be None -> fetch_stable uses the real gated fetch
+
+    classify_retained: List[Dict[str, str]] = []
+    per_file_provenance: List[Dict[str, Any]] = []
+    window_edge_incomplete_days: set = set()
+
+    # 6. Per source date: cache-or-stable-fetch -> integrity verify -> classify.
+    for f_date in sorted(fetched_dates):
+        filename = expected_source_filename(f_date)
+        url = build_source_file_url(f_date)
+        cache_path = os.path.join(cache_dir, filename) if cache_dir else None
+        source = None
+        if cache_path is not None and os.path.exists(cache_path):
+            # 6a. Cache hit: re-verify official MD5/size BEFORE use (fail closed).
+            integ = verify_cached_zip(cache_path, filename, md5map, sizemap)
+            with open(cache_path, "rb") as fh:
+                payload = fh.read()
+            source = "cache"
+        else:
+            # 6b. Cache miss: stable fetch (retry) -> official verify -> cache write.
+            payload = fetch_stable(
+                f_date, fetch_callable=fetch, attempts=fetch_attempts
+            )
+            integ = verify_file_integrity(filename, payload, md5map, sizemap)
+            integ = dict(integ)
+            integ["source"] = "fetch"
+            if cache_path is not None and write_cache:
+                # Write to cache ONLY after integrity verification succeeded.
+                os.makedirs(cache_dir, exist_ok=True)
+                with open(cache_path, "wb") as fh:
+                    fh.write(payload)
+                integ["cache_path"] = cache_path
+            source = "fetch"
+
+        # 6c. Exact-58 classification of VERIFIED bytes only.
+        cls = archive.classify_payload_rows(
+            payload,
+            source_file_date=f_date,
+            is_zip=is_zip,
+            route_edge_incomplete=True,
+            enforce_exact_columns=True,
+        )
+        classify_retained.extend(cls.retained_rows)
+        if cls.dropped_by_reason.get(archive.DROP_REASON_EDGE_WINDOW_EXCLUSION, 0):
+            window_edge_incomplete_days.add(f_date.isoformat())
+
+        entry = archive.build_per_file_provenance_entry(
+            source_file_date=f_date,
+            source_file_url=url,
+            attempted=True,
+            opened=True,
+            classification=cls,
+            byte_hash=integ.get("sha256_local_provenance"),
+            byte_size=integ.get("byte_size"),
+            error_status=None,
+        )
+        entry["integrity"] = {
+            "source": source,
+            "md5_ok": integ.get("md5_ok"),
+            "size_ok": integ.get("size_ok"),
+            "integrity_status": integ.get("integrity_status"),
+            "official_md5": integ.get("official_md5"),
+        }
+        per_file_provenance.append(entry)
+
+    # 7. Slice-aware coverage against the ACTUAL fetched date set. A classify
+    #    survivor whose SQLDATE is not slice-complete is routed OUT of the
+    #    primary archive (slice-edge incomplete) — never completed by fetching
+    #    outside the bounded set.
+    primary_rows: List[Dict[str, str]] = []
+    slice_edge_incomplete_sqldates: set = set()
+    for row in classify_retained:
+        sqld = date.fromisoformat(row["sqldate"])
+        if archive.fetched_set_fully_covers(sqld, fetched_dates):
+            primary_rows.append(row)
+        else:
+            slice_edge_incomplete_sqldates.add(row["sqldate"])
+
+    # 8. Write archive (primary slice-covered rows) + structural manifest.
+    os.makedirs(out_dir, exist_ok=True)
+    archive_path = os.path.join(out_dir, "ttg_approved_fields_archive.csv")
+    artifact = archive.write_approved_archive_csv(primary_rows, archive_path)
+
+    covered_sqldates = sorted({r["sqldate"] for r in primary_rows})
+    manifest = archive.build_phase2_provenance_manifest(
+        source_file_window={
+            "start": start_date,
+            "end": end_date,
+            "authorized_window_start": archive.WINDOW_START.isoformat(),
+            "authorized_window_end": archive.WINDOW_END.isoformat(),
+            "enumeration": "bounded YYYYMMDD per-day; no 2023+; no pre-window; no out-of-slice fetch",
+        },
+        per_file_provenance=per_file_provenance,
+        archive_artifacts=[artifact],
+        total_retained_row_count=len(primary_rows),
+        edge_incomplete_day_count=len(window_edge_incomplete_days),
+    )
+    # Wired-path structural provenance (value-agnostic).
+    manifest["wired_orchestrator"] = "run_bounded_integrity_build"
+    manifest["manifest_provenance"] = prov
+    manifest["manifest_reconciliation"] = reconcile_status
+    manifest["fetched_source_file_count"] = len(fetched_dates)
+    manifest["window_edge_incomplete_day_count"] = len(window_edge_incomplete_days)
+    manifest["slice_edge_incomplete_sqldate_count"] = len(slice_edge_incomplete_sqldates)
+    manifest["primary_covered_sqldate_count"] = len(covered_sqldates)
+    manifest["boundary_declarations"]["single_real_network_entrypoint"] = True
+    manifest["boundary_declarations"]["integrity_checked_before_archive_write"] = True
+    manifest["boundary_declarations"]["slice_aware_coverage_applied"] = True
+
+    manifest_path = os.path.join(out_dir, "ttg_archive_provenance_manifest.json")
+    with open(manifest_path, "w") as fh:
+        json.dump(manifest, fh, indent=2, sort_keys=False)
+
+    return {
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "archive_artifact": artifact,
+        "universe": universe,
+        "fetched_dates": sorted(x.isoformat() for x in fetched_dates),
+        "primary_covered_sqldates": covered_sqldates,
+        "slice_edge_incomplete_sqldates": sorted(slice_edge_incomplete_sqldates),
+        "window_edge_incomplete_days": sorted(window_edge_incomplete_days),
+        "reconcile_status": reconcile_status,
+    }
