@@ -514,6 +514,302 @@ def test_outcome_join_gate_docs_unmodified():
         assert got == want, "governing doc modified: {}".format(rel)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Pre-contact real-run hardening tests (§8 items 1-20). Synthetic / local only.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _make_row_ncols(n, sqldate="20140610"):
+    """Build a TAB row with EXACTLY n columns, with a valid SQLDATE at idx 1 and
+    valid approved values at idx 29/30/31/34 when n is wide enough. Used to prove
+    the exact-58 guard rejects wrong-width rows that would otherwise satisfy the
+    approved-index short-row guard."""
+    cells = ["FILLER"] * n
+    if n > archive.DATE_FIELD_COLUMN_INDEX:
+        cells[archive.DATE_FIELD_COLUMN_INDEX] = sqldate
+    for idx, val in ((archive.QUADCLASS_COLUMN_INDEX, "4"),
+                     (archive.GOLDSTEINSCALE_COLUMN_INDEX, "1.0"),
+                     (archive.NUMMENTIONS_COLUMN_INDEX, "5"),
+                     (archive.AVGTONE_COLUMN_INDEX, "0.5")):
+        if n > idx:
+            cells[idx] = val
+    return "\t".join(cells)
+
+
+def _mk_manifests(file_map):
+    """Build official-style md5sums + filesizes bytes from {filename: bytes}."""
+    md5_lines = ["{}  {}".format(hashlib.md5(b).hexdigest(), fn)
+                 for fn, b in file_map.items()]
+    size_lines = ["{} {}".format(len(b), fn) for fn, b in file_map.items()]
+    return (("\n".join(md5_lines) + "\n").encode("utf-8"),
+            ("\n".join(size_lines) + "\n").encode("utf-8"))
+
+
+# 1 & 2. _open_url itself is gated before urllib import/open; not runtime-flippable.
+
+def test_open_url_itself_gated_before_urllib_import():
+    spy = FetchSpy()
+    # Direct call to _open_url must hard-error while the gate is False.
+    with pytest.raises(fetch_path.RealFetchNotAuthorized) as ei:
+        fetch_path._open_url("http://data.gdeltproject.org/events/20140610.export.CSV.zip",
+                             _opener=spy)
+    assert "_open_url defense-in-depth" in str(ei.value)
+    assert spy.calls == [], "no opener may be invoked while the gate is False"
+    # Source-order proof: the gate check precedes the lazy urllib import inside _open_url.
+    src = Path(fetch_path.__file__).read_text()
+    body = src.split("def _open_url(", 1)[1]
+    gate_pos = body.index("if not REAL_FETCH_SOURCE_GATE_ENABLED:")
+    import_pos = body.index("import urllib")
+    assert gate_pos < import_pos, "gate must be checked before the urllib import"
+
+
+def test_open_url_gate_not_runtime_flippable(monkeypatch):
+    monkeypatch.setenv("REAL_FETCH_SOURCE_GATE_ENABLED", "1")
+    monkeypatch.setenv("ENABLE_REAL_FETCH", "1")
+    with pytest.raises(fetch_path.RealFetchNotAuthorized):
+        fetch_path._open_url("http://example.invalid/x")
+
+
+# 3. Source gate remains disabled in committed code.
+
+def test_source_gate_remains_disabled_in_committed_code():
+    assert fetch_path.REAL_FETCH_SOURCE_GATE_ENABLED is False
+    src_lines = Path(fetch_path.__file__).read_text().splitlines()
+    assigns = [ln for ln in src_lines
+               if ln.strip().startswith("REAL_FETCH_SOURCE_GATE_ENABLED =")
+               and not ln.strip().startswith("REAL_FETCH_SOURCE_GATE_ENABLED ==")]
+    assert assigns == ["REAL_FETCH_SOURCE_GATE_ENABLED = False"], assigns
+
+
+# 4 & 12. Integrity manifests required + universe reconciled against them.
+
+def test_universe_reconciliation_ok_and_required():
+    import datetime
+    dates = [datetime.date(2013, 4, d) for d in (2, 3, 4)]
+    fnames = fetch_path.expected_source_filenames(dates)
+    file_map = {fn: ("payload-" + fn).encode() for fn in fnames}
+    md5_b, size_b = _mk_manifests(file_map)
+    md5map = fetch_path.parse_md5sums(md5_b.decode())
+    sizemap = fetch_path.parse_filesizes(size_b.decode())
+    status = fetch_path.reconcile_universe_against_manifests(fnames, md5map, sizemap)
+    assert status["reconciled_ok"] is True
+    assert status["expected_count"] == 3
+    assert status["missing_from_md5sums"] == [] and status["missing_from_filesizes"] == []
+
+
+# 5. Missing md5sums entry fails closed.
+
+def test_missing_md5sums_entry_fails_closed():
+    import datetime
+    fnames = fetch_path.expected_source_filenames(
+        [datetime.date(2013, 4, 2), datetime.date(2013, 4, 3)])
+    file_map = {fn: b"x" for fn in fnames}
+    md5_b, size_b = _mk_manifests(file_map)
+    md5map = fetch_path.parse_md5sums(md5_b.decode())
+    sizemap = fetch_path.parse_filesizes(size_b.decode())
+    del md5map[fnames[1]]  # drop one md5 entry
+    with pytest.raises(fetch_path.IntegrityManifestError):
+        fetch_path.reconcile_universe_against_manifests(fnames, md5map, sizemap)
+
+
+# 6. Missing filesizes entry fails closed.
+
+def test_missing_filesizes_entry_fails_closed():
+    import datetime
+    fnames = fetch_path.expected_source_filenames(
+        [datetime.date(2013, 4, 2), datetime.date(2013, 4, 3)])
+    file_map = {fn: b"x" for fn in fnames}
+    md5_b, size_b = _mk_manifests(file_map)
+    md5map = fetch_path.parse_md5sums(md5_b.decode())
+    sizemap = fetch_path.parse_filesizes(size_b.decode())
+    del sizemap[fnames[0]]  # drop one size entry
+    with pytest.raises(fetch_path.IntegrityManifestError):
+        fetch_path.reconcile_universe_against_manifests(fnames, md5map, sizemap)
+
+
+# 7. MD5 mismatch fails closed.
+
+def test_md5_mismatch_fails_closed():
+    fn = "20130402.export.CSV.zip"
+    data = b"the-real-bytes"
+    md5_b, size_b = _mk_manifests({fn: data})
+    md5map = fetch_path.parse_md5sums(md5_b.decode())
+    sizemap = fetch_path.parse_filesizes(size_b.decode())
+    tampered = b"tampered-bytes!"  # different content
+    assert len(tampered) != len(data) or True
+    with pytest.raises(fetch_path.IntegrityVerificationError):
+        fetch_path.verify_file_integrity(fn, tampered, md5map, sizemap)
+
+
+# 8. Byte-size mismatch fails closed (MD5 map points at the right md5, size wrong).
+
+def test_byte_size_mismatch_fails_closed():
+    fn = "20130402.export.CSV.zip"
+    data = b"abc"
+    md5map = {fn: hashlib.md5(data).hexdigest()}
+    sizemap = {fn: 999}  # wrong size on purpose
+    with pytest.raises(fetch_path.IntegrityVerificationError):
+        fetch_path.verify_file_integrity(fn, data, md5map, sizemap)
+
+
+# 9. Unstable retry fails closed.
+
+def test_unstable_retry_fails_closed():
+    import datetime
+    seq = [b"v1", b"v2-different"]  # second attempt differs
+
+    def _flaky(source_file_date, url):
+        return seq.pop(0)
+
+    with pytest.raises(fetch_path.UnstableDownloadError):
+        fetch_path.fetch_stable(datetime.date(2013, 4, 2),
+                                fetch_callable=_flaky, attempts=2)
+
+
+def test_stable_retry_returns_bytes():
+    import datetime
+
+    def _steady(source_file_date, url):
+        return b"identical-bytes"
+
+    out = fetch_path.fetch_stable(datetime.date(2013, 4, 2),
+                                  fetch_callable=_steady, attempts=3)
+    assert out == b"identical-bytes"
+
+
+# 10 & 11. Cached zip re-verified before use; cache is not a bypass.
+
+def test_cached_zip_reverified_before_use(tmp_path):
+    fn = "20130402.export.CSV.zip"
+    data = b"cached-good-bytes"
+    md5_b, size_b = _mk_manifests({fn: data})
+    md5map = fetch_path.parse_md5sums(md5_b.decode())
+    sizemap = fetch_path.parse_filesizes(size_b.decode())
+    cache_file = tmp_path / fn
+    cache_file.write_bytes(data)
+    status = fetch_path.verify_cached_zip(str(cache_file), fn, md5map, sizemap)
+    assert status["integrity_status"] == "verified"
+    assert status["source"] == "cache"
+    assert status["cache_path"] == str(cache_file)
+
+
+def test_cache_is_not_a_bypass_around_integrity(tmp_path):
+    fn = "20130402.export.CSV.zip"
+    good = b"official-bytes"
+    md5_b, size_b = _mk_manifests({fn: good})
+    md5map = fetch_path.parse_md5sums(md5_b.decode())
+    sizemap = fetch_path.parse_filesizes(size_b.decode())
+    cache_file = tmp_path / fn
+    cache_file.write_bytes(b"CORRUPT-cache-bytes")  # present but wrong
+    with pytest.raises(fetch_path.CacheIntegrityError):
+        fetch_path.verify_cached_zip(str(cache_file), fn, md5map, sizemap)
+
+
+# 13-16. Exact 58-column layout enforcement.
+
+def test_exact_58_layout_passes():
+    assert archive.EXPECTED_DAILY_COLUMN_COUNT == 58
+    assert archive.is_exact_daily_layout(58) is True
+    st = archive.exact_daily_layout_status(_make_row_ncols(58))
+    assert st["ok"] is True and st["column_count"] == 58 and st["expected"] == 58
+
+
+@pytest.mark.parametrize("ncols", [35, 45, 59])
+def test_wrong_width_rows_fail_exact_layout(ncols):
+    # Unit check on the validator.
+    assert archive.is_exact_daily_layout(ncols) is False
+    assert archive.exact_daily_layout_status(_make_row_ncols(ncols))["ok"] is False
+
+
+def test_exact_layout_enforced_in_classify_distinct_from_short_guard():
+    import datetime
+    f = datetime.date(2014, 6, 10)
+    # 35/45/59-col rows all carry the max approved index (34) and a valid SQLDATE.
+    rows = [_make_row_ncols(35), _make_row_ncols(45), _make_row_ncols(59)]
+    payload = ("\n".join(rows) + "\n").encode("utf-8")
+    cls = archive.classify_payload_rows(payload, source_file_date=f,
+                                        enforce_exact_columns=True)
+    assert cls.retained_row_count == 0
+    assert cls.dropped_by_reason[archive.DROP_REASON_COLUMN_COUNT_MISMATCH] == 3
+    assert cls.dropped_by_reason[archive.DROP_REASON_SHORT_ROW] == 0
+    # Distinctness: WITHOUT exact enforcement, a 45-col row (max approved idx
+    # present) slips past the short-row guard and is retained — which is exactly
+    # why the exact-58 guard is needed.
+    cls_off = archive.classify_payload_rows(
+        ("\n".join([_make_row_ncols(45)]) + "\n").encode("utf-8"),
+        source_file_date=f, enforce_exact_columns=False)
+    assert cls_off.retained_row_count == 1
+    assert cls_off.dropped_by_reason[archive.DROP_REASON_COLUMN_COUNT_MISMATCH] == 0
+    # Exactly-58 valid row is retained under enforcement.
+    good = make_gdelt_row("20140610", "4", "1.0", "5", "0.5")
+    cls_good = archive.classify_payload_rows(make_payload([good]), source_file_date=f,
+                                             enforce_exact_columns=True)
+    assert cls_good.retained_row_count == 1
+
+
+# 17 & 18. Integrity/report output value-agnostic; no sample rows / value summaries.
+
+def test_integrity_status_value_agnostic():
+    fn = "20130402.export.CSV.zip"
+    data = b"some-zip-bytes"
+    md5map = {fn: hashlib.md5(data).hexdigest()}
+    sizemap = {fn: len(data)}
+    status = fetch_path.verify_file_integrity(fn, data, md5map, sizemap)
+    keys = _all_keys(status)
+    for bad in ("quadclass", "goldstein", "nummentions", "avgtone", "tone",
+                "rows", "sample", "mean", "median", "bucket", "distribution",
+                "value_counts", "groupby"):
+        for k in keys:
+            assert bad not in k.lower(), (k, bad)
+    # Only structural keys present.
+    assert set(status.keys()) >= {"filename", "byte_size", "official_md5",
+                                  "computed_md5", "md5_ok", "size_ok",
+                                  "sha256_local_provenance", "integrity_status"}
+    # Manifest provenance is SHA-256 + size only (no field values).
+    prov = fetch_path.manifest_provenance(b"md5sums-bytes", b"filesizes-bytes")
+    assert "md5sums_sha256" in prov and "filesizes_sha256" in prov
+    assert "quadclass" not in json.dumps(prov)
+
+
+# 19. No 2023+ enumeration/open path exists.
+
+def test_no_2023plus_enumeration_or_open_path():
+    import datetime
+    with pytest.raises(archive.Post2022SealBreach):
+        archive.enumerate_source_universe(["2023-01-01"])
+    # The real fetch of a 2023 date hard-errors at the gate before any window/open.
+    with pytest.raises(fetch_path.RealFetchNotAuthorized):
+        fetch_path.fetch_one_source_file(datetime.date(2023, 6, 15))
+    assert archive.WINDOW_END == datetime.date(2022, 12, 31)
+    assert archive.SEAL_START == datetime.date(2023, 1, 1)
+
+
+# 20. No real network contact occurs in tests (gate False => fetch path inert).
+
+def test_no_real_network_contact_possible_in_tests():
+    import datetime
+    assert fetch_path.REAL_FETCH_SOURCE_GATE_ENABLED is False
+    # Default (real) fetch_stable path hard-errors at the gate, no network.
+    with pytest.raises(fetch_path.RealFetchNotAuthorized):
+        fetch_path.fetch_stable(datetime.date(2014, 6, 10), attempts=2)
+    # Neither module exposes a live network library as an attribute.
+    for mod in (archive, fetch_path):
+        for name in ("urllib", "requests", "socket", "http"):
+            assert not hasattr(mod, name), (mod.__name__, name)
+
+
+# Slice-aware coverage helper (future bounded-run requirement, §10).
+
+def test_slice_aware_coverage_for_bounded_april_2013():
+    import datetime
+    fetched = {datetime.date(2013, 4, d) for d in range(1, 31)}  # 2013-04-01..30
+    # Interior days fully covered.
+    assert archive.fetched_set_fully_covers(datetime.date(2013, 4, 2), fetched) is True
+    assert archive.fetched_set_fully_covers(datetime.date(2013, 4, 29), fetched) is True
+    # Slice edges NOT fully covered (need pre-window 03-31 / unfetched 05-01).
+    assert archive.fetched_set_fully_covers(datetime.date(2013, 4, 1), fetched) is False
+    assert archive.fetched_set_fully_covers(datetime.date(2013, 4, 30), fetched) is False
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _strip_hashes(obj):

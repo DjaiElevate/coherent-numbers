@@ -137,11 +137,27 @@ def fetch_one_source_file(
 
 def _open_url(url: str, _opener: Optional[Any] = None) -> bytes:
     """Open a URL and return its bytes. Reached ONLY after the source gate has
-    been enabled by a reviewed source edit. The network library is imported
-    lazily here — so when the gate is False (shipped), no network library is
-    imported at all. `_opener` is a future test seam; the shipped gate prevents
-    this function from ever being reached in this dispatch.
+    been enabled by a reviewed source edit.
+
+    DEFENSE-IN-DEPTH SOURCE GATE: the FIRST statement re-checks
+    `REAL_FETCH_SOURCE_GATE_ENABLED` and hard-errors while it is False — BEFORE
+    the lazy `urllib` import and BEFORE any network open. This is belt-and-
+    suspenders: it does not replace the higher-level gate in
+    `fetch_one_source_file`; it guarantees that even a direct call to `_open_url`
+    (bypassing the entrypoint) cannot import a network library or open a socket
+    while the gate is disabled. The gate is a source literal — no env var, CLI
+    flag, config/settings file, parameter, or runtime switch can flip it.
+
+    The network library is imported lazily AFTER the gate check — so when the
+    gate is False (shipped), no network library is imported at all. `_opener` is
+    a future test seam; the shipped gate prevents this function from ever being
+    reached in this dispatch.
     """
+    if not REAL_FETCH_SOURCE_GATE_ENABLED:
+        raise RealFetchNotAuthorized(
+            REAL_FETCH_BLOCK_MESSAGE + " [_open_url defense-in-depth gate]"
+        )
+    # --- Below is reachable only after a reviewed source edit + future auth. ---
     import urllib.request  # lazy: only after the source gate passes
 
     opener = _opener if _opener is not None else urllib.request.build_opener()
@@ -162,6 +178,7 @@ def run_phase2_archive_build(
     codebook_derived_indices: Optional[Mapping[str, int]] = None,
     route_edge_incomplete: bool = False,
     is_zip: bool = False,
+    enforce_exact_columns: bool = True,
 ) -> Dict[str, Any]:
     """Orchestrate a Phase-2 archive build.
 
@@ -217,6 +234,7 @@ def run_phase2_archive_build(
             source_file_date=f_date,
             is_zip=is_zip,
             route_edge_incomplete=route_edge_incomplete,
+            enforce_exact_columns=enforce_exact_columns,
         )
         retained_rows.extend(cls.retained_rows)
         if cls.dropped_by_reason.get(archive.DROP_REASON_EDGE_WINDOW_EXCLUSION, 0):
@@ -259,3 +277,283 @@ def run_phase2_archive_build(
         "archive_artifact": artifact,
         "universe": universe,
     }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Official integrity-manifest + raw-cache verification + retry stability.
+#
+# These functions implement the real-run integrity checks the FUTURE bounded run
+# will use. In THIS dispatch they operate ONLY on synthetic/local fixture bytes;
+# no official manifest is fetched and no daily zip is downloaded. The official
+# manifest URL templates are DEFINED here (provenance), but this module NEVER
+# opens them (network remains behind the source gate / `_open_url`).
+#
+# Authority model: the OFFICIAL `md5sums` and `filesizes` entries are the
+# authoritative integrity check; SHA-256 (of manifest bytes and of file bytes) is
+# recorded as ADDITIONAL local provenance, not a substitute. All functions are
+# value-blind: they operate on whole-file bytes and filenames only and never read,
+# branch on, summarise, or bucket any TTG field value.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Official GDELT v1 event-directory integrity manifests (DEFINED, never opened
+# in this dispatch). Reconciliation/verification below consumes manifest BYTES
+# supplied by the caller; fetching these is a separate future authorization.
+GDELT1_MD5SUMS_URL = "http://data.gdeltproject.org/events/md5sums"
+GDELT1_FILESIZES_URL = "http://data.gdeltproject.org/events/filesizes"
+
+# Where real runs will cache raw zips: under the gitignored data/raw/ tree.
+# This module never creates this directory or writes into it in this dispatch;
+# synthetic tests use pytest temp dirs instead.
+RAW_CACHE_DIR = "data/raw/lane2_ttg_gdelt1_event_zip_cache"
+
+_DAILY_ZIP_SUFFIX = ".export.CSV.zip"
+
+
+class IntegrityManifestError(archive.ArchiveBoundaryError):
+    """Raised when an expected bounded-slice file is missing from the official
+    md5sums/filesizes manifest, or a manifest cannot be reconciled. Fail closed."""
+
+
+class IntegrityVerificationError(archive.ArchiveBoundaryError):
+    """Raised on an official MD5 mismatch or byte-size mismatch. Fail closed."""
+
+
+class UnstableDownloadError(archive.ArchiveBoundaryError):
+    """Raised when a retried download returns non-identical bytes. Fail closed."""
+
+
+class CacheIntegrityError(archive.ArchiveBoundaryError):
+    """Raised when a cached zip exists but fails official integrity verification.
+    Cache presence NEVER bypasses verification; re-download requires a future
+    explicit authorization. Fail closed."""
+
+
+def expected_source_filename(source_file_date: date) -> str:
+    """`date -> '<YYYYMMDD>.export.CSV.zip'` (daily event-file name)."""
+    return archive.SOURCE_FILE_NAME_TEMPLATE.format(
+        yyyymmdd=source_file_date.strftime("%Y%m%d")
+    )
+
+
+def expected_source_filenames(source_file_dates: Sequence[date]) -> List[str]:
+    """Deterministic expected bounded source-file universe (filenames)."""
+    return [expected_source_filename(d) for d in source_file_dates]
+
+
+def _is_daily_zip_name(token: str) -> bool:
+    """True iff `token` is an `<8 digits>.export.CSV.zip` daily event filename."""
+    if not token.endswith(_DAILY_ZIP_SUFFIX):
+        return False
+    head = token[: -len(_DAILY_ZIP_SUFFIX)]
+    return len(head) == 8 and head.isdigit()
+
+
+def parse_md5sums(text: str) -> Dict[str, str]:
+    """Parse official-style `md5sums` bytes into `{filename: md5hex}`.
+
+    Official format is coreutils-style `<32-hex-md5>  <filename>`. This parser is
+    tolerant of token order: on each line it locates a 32-hex-char token and a
+    daily `*.export.CSV.zip` filename token. Only daily event-file entries are
+    retained (GKG/mentions/other lines are ignored). Value-blind: filenames and
+    hex digests only.
+    """
+    out: Dict[str, str] = {}
+    for line in text.splitlines():
+        toks = line.split()
+        if not toks:
+            continue
+        fname = next((t for t in toks if _is_daily_zip_name(t)), None)
+        md5 = next(
+            (
+                t.lower()
+                for t in toks
+                if len(t) == 32 and all(c in "0123456789abcdefABCDEF" for c in t)
+            ),
+            None,
+        )
+        if fname is not None and md5 is not None:
+            out[fname] = md5
+    return out
+
+
+def parse_filesizes(text: str) -> Dict[str, int]:
+    """Parse official-style `filesizes` bytes into `{filename: byte_size}`.
+
+    Tolerant of token order: on each line it locates a daily `*.export.CSV.zip`
+    filename token and an all-digit byte-size token. Only daily event-file
+    entries are retained. Value-blind: filenames and integer sizes only.
+    """
+    out: Dict[str, int] = {}
+    for line in text.splitlines():
+        toks = line.split()
+        if not toks:
+            continue
+        fname = next((t for t in toks if _is_daily_zip_name(t)), None)
+        size = next((t for t in toks if t.isdigit()), None)
+        if fname is not None and size is not None:
+            out[fname] = int(size)
+    return out
+
+
+def manifest_provenance(
+    md5sums_bytes: Optional[bytes] = None,
+    filesizes_bytes: Optional[bytes] = None,
+) -> Dict[str, Any]:
+    """Record SHA-256 + byte size of supplied manifest bytes as provenance.
+
+    SHA-256 here is LOCAL provenance of the manifest artifacts; the official MD5
+    and size entries inside them remain the authoritative file-integrity check.
+    """
+    prov: Dict[str, Any] = {
+        "md5sums_url": GDELT1_MD5SUMS_URL,
+        "filesizes_url": GDELT1_FILESIZES_URL,
+    }
+    if md5sums_bytes is not None:
+        prov["md5sums_sha256"] = archive.sha256_hex(md5sums_bytes)
+        prov["md5sums_byte_size"] = len(md5sums_bytes)
+    if filesizes_bytes is not None:
+        prov["filesizes_sha256"] = archive.sha256_hex(filesizes_bytes)
+        prov["filesizes_byte_size"] = len(filesizes_bytes)
+    return prov
+
+
+def reconcile_universe_against_manifests(
+    expected_filenames: Sequence[str],
+    md5sums: Mapping[str, str],
+    filesizes: Mapping[str, int],
+) -> Dict[str, Any]:
+    """Fail closed unless EVERY expected bounded-slice file is present in BOTH
+    the official md5sums and filesizes manifests.
+
+    Returns a value-agnostic reconciliation status on success. Raises
+    `IntegrityManifestError` if any expected file is missing from either
+    manifest.
+    """
+    missing_md5 = [f for f in expected_filenames if f not in md5sums]
+    missing_size = [f for f in expected_filenames if f not in filesizes]
+    if missing_md5:
+        raise IntegrityManifestError(
+            "expected file(s) missing from official md5sums: {}".format(missing_md5)
+        )
+    if missing_size:
+        raise IntegrityManifestError(
+            "expected file(s) missing from official filesizes: {}".format(missing_size)
+        )
+    return {
+        "expected_count": len(expected_filenames),
+        "present_in_md5sums": len(expected_filenames),
+        "present_in_filesizes": len(expected_filenames),
+        "missing_from_md5sums": [],
+        "missing_from_filesizes": [],
+        "reconciled_ok": True,
+    }
+
+
+def verify_file_integrity(
+    filename: str,
+    file_bytes: bytes,
+    md5sums: Mapping[str, str],
+    filesizes: Mapping[str, int],
+) -> Dict[str, Any]:
+    """Verify one file's bytes against the official MD5 + byte size. Fail closed.
+
+    Raises `IntegrityManifestError` if no official entry exists, and
+    `IntegrityVerificationError` on an MD5 mismatch or byte-size mismatch.
+    Records SHA-256 as additional local provenance. Value-blind (whole-file
+    bytes only).
+    """
+    if filename not in md5sums:
+        raise IntegrityManifestError(
+            "no official md5sums entry for {}".format(filename)
+        )
+    if filename not in filesizes:
+        raise IntegrityManifestError(
+            "no official filesizes entry for {}".format(filename)
+        )
+    official_md5 = md5sums[filename].lower()
+    official_size = int(filesizes[filename])
+    computed_md5 = archive.md5_hex(file_bytes)
+    computed_size = len(file_bytes)
+    if computed_md5 != official_md5:
+        raise IntegrityVerificationError(
+            "MD5 mismatch for {}: official={} computed={}".format(
+                filename, official_md5, computed_md5
+            )
+        )
+    if computed_size != official_size:
+        raise IntegrityVerificationError(
+            "byte-size mismatch for {}: official={} computed={}".format(
+                filename, official_size, computed_size
+            )
+        )
+    return {
+        "filename": filename,
+        "byte_size": computed_size,
+        "official_md5": official_md5,
+        "computed_md5": computed_md5,
+        "md5_ok": True,
+        "size_ok": True,
+        "sha256_local_provenance": archive.sha256_hex(file_bytes),
+        "integrity_status": "verified",
+    }
+
+
+def verify_cached_zip(
+    cache_path: str,
+    filename: str,
+    md5sums: Mapping[str, str],
+    filesizes: Mapping[str, int],
+) -> Dict[str, Any]:
+    """Re-verify a cached zip against official MD5 + size BEFORE use.
+
+    Reads bytes from `cache_path` (a local file; real runs place it under
+    `data/raw/...`, synthetic tests use a temp dir) and verifies them. Cache
+    presence NEVER bypasses verification. On any integrity failure, raises
+    `CacheIntegrityError` (fail closed); re-download requires a future explicit
+    authorization and is NOT performed here. Returns a value-agnostic status with
+    cache path, byte size, MD5, SHA-256, and integrity status.
+    """
+    with open(cache_path, "rb") as fh:
+        data = fh.read()
+    try:
+        status = verify_file_integrity(filename, data, md5sums, filesizes)
+    except (IntegrityVerificationError, IntegrityManifestError) as exc:
+        raise CacheIntegrityError(
+            "cached zip {} failed official integrity ({}); fail closed, "
+            "re-download requires separate authorization".format(cache_path, exc)
+        )
+    status = dict(status)
+    status["cache_path"] = cache_path
+    status["source"] = "cache"
+    return status
+
+
+def fetch_stable(
+    source_file_date: date,
+    *,
+    fetch_callable: Optional[Callable[..., bytes]] = None,
+    attempts: int = 2,
+) -> bytes:
+    """Fetch a file `attempts` times and require byte-identical results.
+
+    A retried download that returns non-identical bytes is treated as unstable
+    and fails closed (`UnstableDownloadError`). The DEFAULT `fetch_callable` is
+    the gated real fetch (`fetch_one_source_file`), which hard-errors before any
+    network contact; synthetic tests inject a non-network callable. This function
+    performs no network access itself.
+    """
+    if attempts < 2:
+        raise ValueError("fetch_stable requires attempts >= 2 to assess stability")
+    fetch = fetch_callable if fetch_callable is not None else fetch_one_source_file
+    url = build_source_file_url(source_file_date)
+    first = fetch(source_file_date, url)
+    first_md5 = archive.md5_hex(first)
+    for _ in range(attempts - 1):
+        nxt = fetch(source_file_date, url)
+        if archive.md5_hex(nxt) != first_md5:
+            raise UnstableDownloadError(
+                "unstable download for {}: retried bytes differ".format(
+                    source_file_date.isoformat()
+                )
+            )
+    return first

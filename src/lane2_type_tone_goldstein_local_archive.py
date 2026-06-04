@@ -181,6 +181,17 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(bytes(data)).hexdigest()
 
 
+def md5_hex(data: bytes) -> str:
+    """MD5 of raw bytes, for reconciliation against the OFFICIAL GDELT
+    `md5sums` manifest. Like `sha256_hex`, this is a structural integrity
+    address over whole-file bytes, not a value-level summary of the approved
+    fields. SHA-256 is recorded as additional local provenance; the official
+    MD5 (and byte size) remain the authoritative integrity check."""
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("md5_hex requires bytes")
+    return hashlib.md5(bytes(data)).hexdigest()
+
+
 def _parse_sqldate_token(tok: str) -> date:
     tok = tok.strip()
     if len(tok) != 8 or not tok.isdigit():
@@ -548,6 +559,16 @@ CODEBOOK_REFERENCE_SHA256 = (
     "3c5fa5bc054fbefaea2a26f9700ee827f2ff86a059d1625ffa127b10bf035a58"
 )
 
+# Exact GDELT 1.0 Event DAILY-layout column count (Apr 1 2013+), per the
+# committed codebook/header reference (§5/§7: 58 tab-separated fields,
+# idx 0..57, SOURCEURL present). This is the EXACT real-byte layout count, used
+# to fail closed on any row that is not exactly this wide. It is DISTINCT from
+# the approved-index short-row guard (`_MAX_APPROVED_INDEX`): a 45-column row can
+# satisfy the max-approved-index guard yet still be the wrong layout, so it must
+# fail the exact-count check. Columns are never inferred/shifted/repaired from
+# values.
+EXPECTED_DAILY_COLUMN_COUNT = 58
+
 # ── Closed structural drop-reason set (§10) ──────────────────────────────────
 DROP_REASON_MALFORMED_ROW = "malformed_row"
 DROP_REASON_SHORT_ROW = "short_row"
@@ -559,6 +580,7 @@ DROP_REASON_FORBIDDEN_FIELD_RETENTION_VIOLATION = "forbidden_field_retention_vio
 DROP_REASON_DUPLICATE_PROVENANCE_INTEGRITY_FAILURE = (
     "duplicate_provenance_integrity_failure"
 )
+DROP_REASON_COLUMN_COUNT_MISMATCH = "column_count_mismatch"
 
 CLOSED_DROP_REASONS: Tuple[str, ...] = (
     DROP_REASON_MALFORMED_ROW,
@@ -569,7 +591,32 @@ CLOSED_DROP_REASONS: Tuple[str, ...] = (
     DROP_REASON_EDGE_WINDOW_EXCLUSION,
     DROP_REASON_FORBIDDEN_FIELD_RETENTION_VIOLATION,
     DROP_REASON_DUPLICATE_PROVENANCE_INTEGRITY_FAILURE,
+    DROP_REASON_COLUMN_COUNT_MISMATCH,
 )
+
+
+def is_exact_daily_layout(num_columns: int) -> bool:
+    """True iff `num_columns` equals the exact GDELT 1.0 daily layout width
+    (`EXPECTED_DAILY_COLUMN_COUNT` = 58). Structural integer check only."""
+    return num_columns == EXPECTED_DAILY_COLUMN_COUNT
+
+
+def exact_daily_layout_status(line: str) -> Dict[str, Any]:
+    """Structural exact-layout status for one raw TAB-separated line.
+
+    Returns only structural integers/flags: observed column count, the expected
+    count, and an `ok` flag. Reads NO field value, branches on NO substantive
+    value, emits NO sample. An empty/whitespace-only line is reported with
+    `column_count = 0` and `ok = False`.
+    """
+    if line is None or not line.strip():
+        return {"column_count": 0, "expected": EXPECTED_DAILY_COLUMN_COUNT, "ok": False}
+    n = len(line.split("\t"))
+    return {
+        "column_count": n,
+        "expected": EXPECTED_DAILY_COLUMN_COUNT,
+        "ok": is_exact_daily_layout(n),
+    }
 
 
 class CodebookIndexMismatch(ArchiveBoundaryError):
@@ -658,6 +705,34 @@ def is_sqldate_fully_covered(sqldate: date) -> bool:
     return lo_needed >= WINDOW_START and hi_needed <= WINDOW_END
 
 
+def fetched_set_fully_covers(sqldate: date, fetched_source_file_dates: Iterable[date]) -> bool:
+    """Slice-aware coverage: a SQLDATE `t` is build-complete for a BOUNDED
+    fetched slice only if every eligible contributing source-file date `{t-1, t,
+    t+1}` is inside the fetched source-file set AND inside the authorized window.
+
+    This is stricter than `is_sqldate_fully_covered` (which checks only the full
+    authorized window): a bounded fetched slice may omit `t+1`/`t-1` even when
+    those dates are in-window, so an edge SQLDATE of the slice is NOT
+    build-complete. Purely structural (date-set membership); no value is read,
+    no network is touched, and a 2023+/pre-window file is never fetched to
+    complete an edge. Example: for a fetched set `2013-04-01..2013-04-30`,
+    `2013-04-02..2013-04-29` are fully covered, while `2013-04-01` (needs
+    pre-window `2013-03-31`) and `2013-04-30` (needs `2013-05-01`, not fetched)
+    are slice-edge incomplete.
+    """
+    needed = {
+        sqldate - timedelta(days=1),
+        sqldate,
+        sqldate + timedelta(days=ELIGIBILITY_DELTA_DAYS),
+    }
+    fetched = set(fetched_source_file_dates)
+    if not needed.issubset(fetched):
+        return False
+    # In-window guard: an eligible date that is sealed/pre-window can never be a
+    # legitimate contributor even if it somehow appeared in the fetched set.
+    return all(WINDOW_START <= d <= WINDOW_END for d in needed)
+
+
 # ── Per-file row classification (structural counts + retained rows) ──────────
 
 class FileClassification:
@@ -695,10 +770,14 @@ def classify_payload_rows(
     source_file_date: date,
     is_zip: bool = False,
     route_edge_incomplete: bool = False,
+    enforce_exact_columns: bool = False,
 ) -> FileClassification:
     """Classify one synthetic payload's rows for the Phase-2 build.
 
     For every non-empty line:
+      - (if `enforce_exact_columns`) columns != 58 -> drop (column_count_mismatch)
+            — the EXACT real-byte layout guard, distinct from the short-row guard;
+              a 45-column row fails here even though it has the max approved index.
       - short row (< required columns)      -> drop (short_row)
       - unparseable SQLDATE token           -> drop (field_parse_failure)
       - content SQLDATE 2023+               -> Post2022SealBreach (defense-in-depth)
@@ -706,6 +785,12 @@ def classify_payload_rows(
       - SQLDATE day not fully covered       -> edge_window_exclusion
             (routed to `edge_routed_rows` iff `route_edge_incomplete`, else dropped)
       - otherwise retain ONLY the five approved fields.
+
+    `enforce_exact_columns` defaults False to preserve the existing synthetic
+    behaviour; the real-byte build path (`run_phase2_archive_build`) passes True
+    so every real row must be exactly 58 columns before approved-field
+    extraction. Columns are never inferred, shifted, repaired, or reinterpreted
+    from values.
 
     Forbidden columns are never read into a retained row. A defensive check
     confirms each retained row carries exactly the approved field names; a
@@ -732,6 +817,12 @@ def classify_payload_rows(
             continue
         raw += 1
         parts = line.split("\t")
+        # Exact real-byte layout guard (distinct from the short-row guard): any
+        # row that is not exactly 58 columns fails closed via a closed reason,
+        # before any approved-field extraction. No value is read to decide this.
+        if enforce_exact_columns and not is_exact_daily_layout(len(parts)):
+            drops[DROP_REASON_COLUMN_COUNT_MISMATCH] += 1
+            continue
         if len(parts) <= _MAX_APPROVED_INDEX:
             drops[DROP_REASON_SHORT_ROW] += 1
             continue
