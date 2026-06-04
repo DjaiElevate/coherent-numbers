@@ -173,6 +173,29 @@ def _open_url(url: str, _opener: Optional[Any] = None) -> bytes:
         return resp.read()
 
 
+def fetch_manifest_bytes(
+    url: str,
+    *,
+    manifest_fetch_callable: Optional[Callable[[str], bytes]] = None,
+) -> bytes:
+    """Acquire official-manifest bytes (`md5sums` / `filesizes`) for one URL.
+
+    The DEFAULT real path routes through the SAME reviewed gated `_open_url` used
+    for daily zips — so with `REAL_FETCH_SOURCE_GATE_ENABLED = False` (shipped)
+    this hard-errors before any `urllib` import or network open, exactly like a
+    daily fetch. There is NO separate `urllib` / `requests` / `curl` / `wget`
+    route for manifests.
+
+    `manifest_fetch_callable(url) -> bytes` is a synthetic/test-only seam so tests
+    can supply in-memory manifest bytes without a network. The seam is rejected in
+    a gate-enabled (real) session by the caller's seam-mode guard
+    (`run_bounded_integrity_build`), so it cannot be used as a real-run bypass.
+    """
+    if manifest_fetch_callable is not None:
+        return manifest_fetch_callable(url)
+    return _open_url(url)
+
+
 # ── SYNTHETIC/LEGACY build harness (cannot perform real fetches) ─────────────
 
 # The real-network primitives the synthetic harness must never wire in. Used by
@@ -216,7 +239,16 @@ def run_phase2_archive_build(
     (4) per file: injected fetch -> classify -> accumulate; (5) write archive +
     value-agnostic provenance manifest.
     """
-    # 0. Synthetic-harness guard: refuse real/default fetch (footgun closure).
+    # 0a. Defense-in-depth: this synthetic harness must never run during a
+    # gate-enabled (real) session. If the source gate is True it fails closed
+    # before any fetch/callable use, so it cannot be used as a real-run bypass.
+    if REAL_FETCH_SOURCE_GATE_ENABLED:
+        raise SyntheticOrchestratorViolation(
+            "run_phase2_archive_build (synthetic/legacy harness) must not run while "
+            "REAL_FETCH_SOURCE_GATE_ENABLED is True. Use run_bounded_integrity_build "
+            "for any real-mode run."
+        )
+    # 0b. Synthetic-harness guard: refuse real/default fetch (footgun closure).
     if fetch_callable is None:
         raise SyntheticOrchestratorViolation(
             "run_phase2_archive_build is a synthetic/legacy harness and requires "
@@ -630,8 +662,9 @@ def run_bounded_integrity_build(
     end_date: str,
     out_dir: str,
     *,
-    md5sums_bytes: bytes,
-    filesizes_bytes: bytes,
+    md5sums_bytes: Optional[bytes] = None,
+    filesizes_bytes: Optional[bytes] = None,
+    manifest_fetch_callable: Optional[Callable[[str], bytes]] = None,
     cli_flag: bool = False,
     module_authorized: Optional[bool] = None,
     env: Optional[Mapping[str, str]] = None,
@@ -650,8 +683,11 @@ def run_bounded_integrity_build(
       3.  Build the bounded source-file universe from start/end and enumerate
           (rejects any date outside the authorized window and any 2023+ date
           BEFORE any fetch/open).
-      4.  Compute manifest provenance (SHA-256 + size of the supplied manifest
-          bytes) and parse official-style md5sums / filesizes.
+      4.  ACQUIRE the official manifests (after enumeration, before daily
+          processing): if `md5sums_bytes` / `filesizes_bytes` are not supplied,
+          fetch them through `fetch_manifest_bytes` -> the SAME gated `_open_url`
+          path used for daily zips (default real path). Then compute manifest
+          provenance (SHA-256 + size) and parse official-style md5sums/filesizes.
       5.  Reconcile the bounded universe against BOTH manifests (fail closed).
       6.  Per source date:
           a. cache check first: if a cached zip exists, `verify_cached_zip`
@@ -670,10 +706,14 @@ def run_bounded_integrity_build(
       8.  Write the approved-fields archive (primary, slice-covered rows only)
           and a value-agnostic provenance manifest.
 
-    `fetch_callable(source_file_date, source_file_url) -> bytes` is a test seam;
-    its DEFAULT is the real gated fetch via `fetch_stable`. Integrity is applied
-    unconditionally to the returned bytes, so an injected fetcher cannot bypass
-    `verify_file_integrity` / exact-58 / slice coverage. Value-blind throughout.
+    Manifest acquisition: `md5sums_bytes` / `filesizes_bytes` /
+    `manifest_fetch_callable` / `fetch_callable` are SYNTHETIC/TEST-ONLY seams.
+    In the future real/default path none of them is supplied: manifests are
+    fetched through the gated `_open_url`, and daily bytes through `fetch_stable`
+    -> the gated fetch. In a gate-enabled (real) session, supplying ANY of those
+    seams fails closed (seam-mode guard below), so the seams cannot be used as a
+    real-run bypass. Integrity / exact-58 / slice coverage are applied
+    unconditionally to whatever bytes are obtained. Value-blind throughout.
     """
     # 1. Codebook index verification (fail closed before anything else).
     archive.assert_codebook_indices(
@@ -688,13 +728,45 @@ def run_bounded_integrity_build(
     ):
         raise archive.ArchiveBuildRefused(archive.REFUSAL_MESSAGE)
 
+    # 2b. Seam-mode guard: in a gate-enabled (real) session, NO synthetic/test
+    # seam may be supplied — real mode must use the gated _open_url for manifests
+    # and the gated fetch for daily zips. This makes the injected seams
+    # synthetic/test-only and not a real-run bypass.
+    if REAL_FETCH_SOURCE_GATE_ENABLED and any(
+        x is not None
+        for x in (md5sums_bytes, filesizes_bytes, manifest_fetch_callable, fetch_callable)
+    ):
+        raise SyntheticOrchestratorViolation(
+            "injected manifest/daily byte seams are synthetic/test-only and must "
+            "not be supplied while REAL_FETCH_SOURCE_GATE_ENABLED is True; the "
+            "real path fetches manifests and daily zips through the gated _open_url."
+        )
+
     # 3. Bounded universe + window/2023+ rejection BEFORE any fetch/open.
     candidate_isos = [d.isoformat() for d in _date_range_inclusive(start_date, end_date)]
     universe = archive.enumerate_source_universe(candidate_isos)  # sorted, in-window
     fetched_dates = {date.fromisoformat(x) for x in universe}
     expected_filenames = expected_source_filenames(sorted(fetched_dates))
 
-    # 4. Manifest provenance + parse official-style manifests.
+    # 4. Acquire official manifests (AFTER enumeration; BEFORE daily processing).
+    # Default real path routes through the gated `_open_url` (no separate route);
+    # with the gate False this hard-errors before any network import/open.
+    manifest_source_mode = (
+        "synthetic_injected"
+        if (md5sums_bytes is not None or filesizes_bytes is not None
+            or manifest_fetch_callable is not None)
+        else "gated_open_url_default"
+    )
+    if md5sums_bytes is None:
+        md5sums_bytes = fetch_manifest_bytes(
+            GDELT1_MD5SUMS_URL, manifest_fetch_callable=manifest_fetch_callable
+        )
+    if filesizes_bytes is None:
+        filesizes_bytes = fetch_manifest_bytes(
+            GDELT1_FILESIZES_URL, manifest_fetch_callable=manifest_fetch_callable
+        )
+
+    # 4b. Manifest provenance + parse official-style manifests.
     prov = manifest_provenance(md5sums_bytes, filesizes_bytes)
     md5map = parse_md5sums(md5sums_bytes.decode("utf-8", "replace"))
     sizemap = parse_filesizes(filesizes_bytes.decode("utf-8", "replace"))
@@ -804,6 +876,7 @@ def run_bounded_integrity_build(
     # Wired-path structural provenance (value-agnostic).
     manifest["wired_orchestrator"] = "run_bounded_integrity_build"
     manifest["manifest_provenance"] = prov
+    manifest["manifest_source_mode"] = manifest_source_mode
     manifest["manifest_reconciliation"] = reconcile_status
     manifest["fetched_source_file_count"] = len(fetched_dates)
     manifest["window_edge_incomplete_day_count"] = len(window_edge_incomplete_days)
@@ -812,6 +885,7 @@ def run_bounded_integrity_build(
     manifest["boundary_declarations"]["single_real_network_entrypoint"] = True
     manifest["boundary_declarations"]["integrity_checked_before_archive_write"] = True
     manifest["boundary_declarations"]["slice_aware_coverage_applied"] = True
+    manifest["boundary_declarations"]["manifest_acquired_via_gated_open_url_in_real_mode"] = True
 
     manifest_path = os.path.join(out_dir, "ttg_archive_provenance_manifest.json")
     with open(manifest_path, "w") as fh:

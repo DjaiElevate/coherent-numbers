@@ -1217,6 +1217,271 @@ def test_wired_injected_fetcher_cannot_bypass_integrity(monkeypatch, tmp_path):
     assert not (tmp_path / "out" / "ttg_approved_fields_archive.csv").exists()
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Manifest-acquisition wiring tests (§8 items 1-25). Synthetic / local only.
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ManifestFetcher:
+    """Synthetic manifest-fetch seam: serves md5sums/filesizes bytes by URL and
+    records the URLs requested. Never touches the network."""
+
+    def __init__(self, md5_b, size_b):
+        self.md5_b = md5_b
+        self.size_b = size_b
+        self.urls = []
+
+    def __call__(self, url):
+        self.urls.append(url)
+        if url == fetch_path.GDELT1_MD5SUMS_URL:
+            return self.md5_b
+        if url == fetch_path.GDELT1_FILESIZES_URL:
+            return self.size_b
+        raise AssertionError("unexpected manifest url: {}".format(url))
+
+
+# 1. Source gate remains disabled in committed code.
+
+def test_manifest_source_gate_remains_disabled():
+    assert fetch_path.REAL_FETCH_SOURCE_GATE_ENABLED is False
+
+
+# 2 & 3 & 17. Default manifest acquisition routes through the gated _open_url,
+# hard-errors before urllib/open, and happens BEFORE daily processing.
+
+def test_manifest_default_routes_through_gated_open_url(monkeypatch, tmp_path):
+    g = _guarded(monkeypatch)
+    daily_spy = FetchSpy()  # records if daily fetch is ever reached
+    # No manifest bytes, no manifest_fetch_callable -> default real acquisition,
+    # which routes through _open_url and hard-errors (gate False).
+    with pytest.raises(fetch_path.RealFetchNotAuthorized) as ei:
+        fetch_path.run_bounded_integrity_build(
+            "2013-04-01", "2013-04-30", out_dir=str(tmp_path / "out"),
+            fetch_callable=daily_spy, **g,
+        )
+    assert "_open_url defense-in-depth gate" in str(ei.value)
+    # Manifest acquisition raised BEFORE any daily zip fetch.
+    assert daily_spy.calls == []
+    assert not (tmp_path / "out" / "ttg_approved_fields_archive.csv").exists()
+
+
+# 4 & 5. No separate manifest network route; only one urllib/_open_url site.
+
+def test_no_separate_manifest_network_route():
+    src = Path(fetch_path.__file__).read_text()
+    # The only network primitive is _open_url's lazy urllib import + single open.
+    assert src.count("import urllib") == 1
+    assert src.count("opener.open(") == 1
+    # No ad hoc network-code routes (these are CODE tokens, not the docstring
+    # prose that merely names curl/wget as forbidden).
+    for bad in ("import requests", "import subprocess", "subprocess.", "os.system(",
+                "os.popen(", "urlopen("):
+        assert bad not in src, bad
+    # fetch_manifest_bytes routes through _open_url (no second opener site).
+    assert "return _open_url(url)" in src
+
+
+# 6-10. Injected manifest source flows through provenance/parse/reconcile.
+
+def test_injected_manifest_callable_flows_through_pipeline(monkeypatch, tmp_path):
+    g = _guarded(monkeypatch)
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    mfetch = ManifestFetcher(md5_b, size_b)
+    res = fetch_path.run_bounded_integrity_build(
+        "2013-04-01", "2013-04-30", out_dir=str(tmp_path / "out"),
+        manifest_fetch_callable=mfetch, fetch_callable=RecordingFetcher(payloads), **g,
+    )
+    # The manifest-fetch seam was used for BOTH official manifests.
+    assert fetch_path.GDELT1_MD5SUMS_URL in mfetch.urls
+    assert fetch_path.GDELT1_FILESIZES_URL in mfetch.urls
+    m = res["manifest"]
+    # 7: provenance ran (SHA-256 of manifest bytes recorded).
+    assert "md5sums_sha256" in m["manifest_provenance"]
+    assert "filesizes_sha256" in m["manifest_provenance"]
+    # 8/9/10: parse + reconcile ran on the injected bytes.
+    assert m["manifest_reconciliation"]["reconciled_ok"] is True
+    assert m["manifest_source_mode"] == "synthetic_injected"
+    # Daily integrity used the parsed maps (md5/size verified per file).
+    assert all(pf["integrity"]["md5_ok"] and pf["integrity"]["size_ok"]
+               for pf in m["per_file_provenance"])
+    # Full slice path still holds.
+    assert res["primary_covered_sqldates"] == ["2013-04-{:02d}".format(d) for d in range(2, 30)]
+
+
+# 11 & 12. Missing manifest entry still fails closed (via the callable seam too).
+
+def test_manifest_missing_entry_via_callable_fails_closed(monkeypatch, tmp_path):
+    import datetime
+    g = _guarded(monkeypatch)
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    drop_fn = fetch_path.expected_source_filename(datetime.date(2013, 4, 15))
+    md5_b2 = ("\n".join(ln for ln in md5_b.decode().splitlines() if drop_fn not in ln) + "\n").encode()
+    mfetch = ManifestFetcher(md5_b2, size_b)
+    with pytest.raises(fetch_path.IntegrityManifestError):
+        fetch_path.run_bounded_integrity_build(
+            "2013-04-01", "2013-04-30", out_dir=str(tmp_path / "out"),
+            manifest_fetch_callable=mfetch, fetch_callable=RecordingFetcher(payloads), **g,
+        )
+    assert not (tmp_path / "out" / "ttg_approved_fields_archive.csv").exists()
+
+
+# 13-16. Ordering: gate/window/2023+/codebook failures never reach manifest acquisition.
+
+def test_codebook_failure_does_not_reach_manifest_acquisition(monkeypatch, tmp_path):
+    g = _guarded(monkeypatch)
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    mfetch = ManifestFetcher(md5_b, size_b)
+    bad = dict(fetch_path.CANONICAL_CODEBOOK_DERIVED_INDICES)
+    bad["avgtone"] = 33
+    with pytest.raises(archive.CodebookIndexMismatch):
+        fetch_path.run_bounded_integrity_build(
+            "2013-04-01", "2013-04-30", out_dir=str(tmp_path / "out"),
+            manifest_fetch_callable=mfetch, fetch_callable=RecordingFetcher(payloads),
+            codebook_derived_indices=bad, **g,
+        )
+    assert mfetch.urls == [], "manifest acquisition must not run after a codebook failure"
+
+
+def test_run_gate_failure_does_not_reach_manifest_acquisition(monkeypatch, tmp_path):
+    # Guards NOT satisfied (no cli_flag / env / module-authorized).
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    mfetch = ManifestFetcher(md5_b, size_b)
+    with pytest.raises(archive.ArchiveBuildRefused):
+        fetch_path.run_bounded_integrity_build(
+            "2013-04-01", "2013-04-30", out_dir=str(tmp_path / "out"),
+            manifest_fetch_callable=mfetch, fetch_callable=RecordingFetcher(payloads),
+            cli_flag=False, module_authorized=False, env={},
+        )
+    assert mfetch.urls == [], "manifest acquisition must not run after a run-gate failure"
+
+
+def test_2023plus_enumeration_does_not_reach_manifest_acquisition(monkeypatch, tmp_path):
+    g = _guarded(monkeypatch)
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    mfetch = ManifestFetcher(md5_b, size_b)
+    with pytest.raises(archive.Post2022SealBreach):
+        fetch_path.run_bounded_integrity_build(
+            "2022-12-30", "2023-01-02", out_dir=str(tmp_path / "out"),
+            manifest_fetch_callable=mfetch, fetch_callable=RecordingFetcher(payloads), **g,
+        )
+    assert mfetch.urls == [], "manifest acquisition must not run after a 2023+ enumeration breach"
+
+
+# 18-20. Daily processing path intact under the callable-manifest seam.
+
+def test_manifest_callable_full_path_with_cache(monkeypatch, tmp_path):
+    g = _guarded(monkeypatch)
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    for d in _april_dates():
+        (cache_dir / fetch_path.expected_source_filename(d)).write_bytes(payloads[d])
+    mfetch = ManifestFetcher(md5_b, size_b)
+
+    def _never(source_file_date, url):
+        raise AssertionError("daily fetch must not be called when cache is complete")
+
+    res = fetch_path.run_bounded_integrity_build(
+        "2013-04-01", "2013-04-30", out_dir=str(tmp_path / "out"),
+        manifest_fetch_callable=mfetch, fetch_callable=_never,
+        cache_dir=str(cache_dir), **g,
+    )
+    # Cache path (verify_cached_zip) used; exact-58 + slice still applied.
+    assert {pf["integrity"]["source"] for pf in res["manifest"]["per_file_provenance"]} == {"cache"}
+    assert res["primary_covered_sqldates"] == ["2013-04-{:02d}".format(d) for d in range(2, 30)]
+
+
+# 21. Single real/default fetch entrypoint remains (default manifest+daily gated).
+
+def test_single_real_entrypoint_default_manifest_and_daily_gated(monkeypatch, tmp_path):
+    g = _guarded(monkeypatch)
+    # No seams at all -> default manifest acquisition hits the gated _open_url first.
+    with pytest.raises(fetch_path.RealFetchNotAuthorized):
+        fetch_path.run_bounded_integrity_build(
+            "2013-04-01", "2013-04-30", out_dir=str(tmp_path / "out"), **g,
+        )
+
+
+# 22. Old/synthetic harness cannot be a real-run bypass; seam-mode guard.
+
+def test_bare_harness_blocked_when_gate_enabled(monkeypatch):
+    g = _guarded(monkeypatch)
+    monkeypatch.setattr(fetch_path, "REAL_FETCH_SOURCE_GATE_ENABLED", True)
+    # Even with a synthetic fetcher, the harness refuses to run in a gate-enabled session.
+    with pytest.raises(fetch_path.SyntheticOrchestratorViolation):
+        fetch_path.run_phase2_archive_build(
+            ["2014-06-10"], out_dir="UNUSED", fetch_callable=FetchSpy(), **g)
+
+
+def test_wired_seam_mode_guard_blocks_injected_seams_when_gate_enabled(monkeypatch, tmp_path):
+    g = _guarded(monkeypatch)
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    monkeypatch.setattr(fetch_path, "REAL_FETCH_SOURCE_GATE_ENABLED", True)
+    # In a gate-enabled (real) session, supplying any synthetic seam fails closed.
+    with pytest.raises(fetch_path.SyntheticOrchestratorViolation):
+        fetch_path.run_bounded_integrity_build(
+            "2013-04-01", "2013-04-30", out_dir=str(tmp_path / "out"),
+            md5sums_bytes=md5_b, filesizes_bytes=size_b, **g,
+        )
+    # Also when only a daily fetch seam is injected.
+    with pytest.raises(fetch_path.SyntheticOrchestratorViolation):
+        fetch_path.run_bounded_integrity_build(
+            "2013-04-01", "2013-04-30", out_dir=str(tmp_path / "out"),
+            fetch_callable=FetchSpy(), **g,
+        )
+
+
+# 24. Manifest-acquisition manifest output stays structural / value-agnostic.
+
+def test_manifest_acquisition_output_value_agnostic(monkeypatch, tmp_path):
+    g = _guarded(monkeypatch)
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    mfetch = ManifestFetcher(md5_b, size_b)
+    res = fetch_path.run_bounded_integrity_build(
+        "2013-04-01", "2013-04-30", out_dir=str(tmp_path / "out"),
+        manifest_fetch_callable=mfetch, fetch_callable=RecordingFetcher(payloads), **g,
+    )
+    keys = _all_keys(res["manifest"])
+    for bad in ("quadclass", "goldsteinscale", "nummentions", "avgtone",
+                "by_value", "by_tone", "by_sign", "_bucket", "bucketed", "sample",
+                "mean", "median", "histogram", "distribution", "value_counts"):
+        for k in keys:
+            assert bad not in k.lower(), (k, bad)
+    assert "rows" not in keys
+    assert res["manifest"]["boundary_declarations"]["manifest_acquired_via_gated_open_url_in_real_mode"] is True
+
+
+# 25. No retry-stability for manifests: truncation/garbage still fails closed
+# through parse + reconcile (documented in the report).
+
+def test_manifest_truncation_fails_closed_via_reconcile(monkeypatch, tmp_path):
+    g = _guarded(monkeypatch)
+    payloads = _april_payloads()
+    md5_b, size_b = _manifests_for(payloads)
+    # Truncate md5sums to a single line -> most expected files missing -> reconcile fails.
+    truncated_md5 = (md5_b.decode().splitlines()[0] + "\n").encode()
+    mfetch = ManifestFetcher(truncated_md5, size_b)
+    with pytest.raises(fetch_path.IntegrityManifestError):
+        fetch_path.run_bounded_integrity_build(
+            "2013-04-01", "2013-04-30", out_dir=str(tmp_path / "out"),
+            manifest_fetch_callable=mfetch, fetch_callable=RecordingFetcher(payloads), **g,
+        )
+    # Garbage manifest bytes -> parse yields no daily entries -> reconcile fails.
+    mfetch2 = ManifestFetcher(b"not a manifest at all\n", size_b)
+    with pytest.raises(fetch_path.IntegrityManifestError):
+        fetch_path.run_bounded_integrity_build(
+            "2013-04-01", "2013-04-30", out_dir=str(tmp_path / "out2"),
+            manifest_fetch_callable=mfetch2, fetch_callable=RecordingFetcher(payloads), **g,
+        )
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _strip_hashes(obj):
