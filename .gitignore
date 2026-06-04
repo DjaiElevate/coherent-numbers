@@ -1,3 +1,18 @@
 .DS_Store
 .claude/
 .ipynb_checkpoints/
+
+# Lane 2 generated/local artifacts — never commit generated data/output.
+# Backstop only: already-tracked files under these paths stay tracked; this
+# blocks NEW untracked outputs from being swept in by a broad `git add`.
+results/
+archive/
+data/raw/
+
+# Paper build artifacts
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/*.pdf
