@@ -513,6 +513,122 @@ def reconcile_universe_against_manifests(
     }
 
 
+# ── Gap-tolerance amendment: manifest presence classification + coverage ─────
+#
+# Tolerance is MUTUAL-manifest-attested absence only. A date absent from BOTH
+# official manifests is a tolerated source gap (not fetched); a date present in
+# exactly one manifest is inconsistency/corruption and aborts. Fetch / verify /
+# cache failures for a present-in-both date remain hard fail-closed (handled in
+# the daily loop) and are NEVER reclassified as gaps.
+
+
+class ColumnLayoutHardFail(archive.ArchiveBoundaryError):
+    """Raised when a manifest-listed source file violates exact-58 file-level
+    layout conformance under `enforce_exact_columns`. Terminal abort: the file is
+    NOT silently dropped and NOT reclassified as a tolerated gap."""
+
+
+# Per-SQLDATE coverage-ledger vocabulary for a COMPLETED build (only these three;
+# a hard-fail finding is a terminal abort, never a per-SQLDATE archive label).
+COVERAGE_COVERED = "covered"
+COVERAGE_EDGE_EXCLUDED = "edge-excluded"
+COVERAGE_GAP_UNCOVERED = "gap-uncovered"
+
+
+def classify_manifest_presence(
+    expected_filenames: Sequence[str],
+    md5sums: Mapping[str, str],
+    filesizes: Mapping[str, int],
+) -> Dict[str, Any]:
+    """Classify each expected (authorized) source filename by manifest presence:
+
+      - `present_in_both`:       in md5sums AND filesizes -> mandatory file;
+      - `absent_in_both`:        in NEITHER -> tolerated source gap (no fetch);
+      - `single_manifest_only`:  in exactly one -> manifest inconsistency.
+
+    Pure / value-blind (filenames + presence only); raises nothing. Callers must
+    abort on any `single_manifest_only` before daily processing.
+    """
+    present_in_both: List[str] = []
+    absent_in_both: List[str] = []
+    single_manifest_only: List[str] = []
+    expected = list(expected_filenames)
+    for f in expected:
+        in_md5 = f in md5sums
+        in_size = f in filesizes
+        if in_md5 and in_size:
+            present_in_both.append(f)
+        elif (not in_md5) and (not in_size):
+            absent_in_both.append(f)
+        else:
+            single_manifest_only.append(f)
+    return {
+        "expected_count": len(expected),
+        "present_in_both": present_in_both,
+        "absent_in_both": absent_in_both,
+        "single_manifest_only": single_manifest_only,
+    }
+
+
+def sqldate_support_set(sqldate: date) -> set:
+    """Source-file dates that can contribute eligible rows to `sqldate` under the
+    production availability convention `source_file_date <= SQLDATE + 1` (offset
+    buckets {+1, 0, -1}): `{sqldate-1, sqldate, sqldate+ELIGIBILITY_DELTA_DAYS}`.
+
+    This mirrors the `needed` set used by the production coverage oracle
+    `archive.fetched_set_fully_covers`. A test pins the two together so this
+    derivation cannot silently drift from the production rule. NOT hand-coded as
+    "missing file only affects its own SQLDATE": the set spans 3 source dates.
+    """
+    d = archive.ELIGIBILITY_DELTA_DAYS
+    return {
+        sqldate - timedelta(days=1),
+        sqldate,
+        sqldate + timedelta(days=d),
+    }
+
+
+def classify_sqldate_coverage(
+    sqldate: date,
+    available_source_dates: Iterable[date],
+    gap_source_dates: Iterable[date],
+) -> Dict[str, Any]:
+    """ONE unified support-aware coverage rule for start-edge, slice-edge, and
+    interior manifest-gap days.
+
+    `available_source_dates` = source-file dates present-in-both and successfully
+    available (in-window). `gap_source_dates` = absent-in-both tolerated gaps.
+
+    Returns `{state, missing_support, gap_causes}`:
+      - `covered`       iff the production oracle `archive.fetched_set_fully_covers`
+                        reports every support file available;
+      - `gap-uncovered` iff any missing support file is a manifest gap
+                        (gap precedence; `gap_causes` names the missing gap file(s));
+      - `edge-excluded` iff uncovered but no missing support file is a gap (the
+                        missing support lies outside the window / requested slice).
+
+    The covered/not decision is delegated to the production oracle; the support
+    set comes from `sqldate_support_set` (pinned to the oracle by test).
+    """
+    available = set(available_source_dates)
+    gaps = set(gap_source_dates)
+    if archive.fetched_set_fully_covers(sqldate, available):
+        return {"state": COVERAGE_COVERED, "missing_support": [], "gap_causes": []}
+    missing = sorted(sqldate_support_set(sqldate) - available)
+    missing_gaps = [d for d in missing if d in gaps]
+    if missing_gaps:
+        return {
+            "state": COVERAGE_GAP_UNCOVERED,
+            "missing_support": [d.isoformat() for d in missing],
+            "gap_causes": [expected_source_filename(d) for d in missing_gaps],
+        }
+    return {
+        "state": COVERAGE_EDGE_EXCLUDED,
+        "missing_support": [d.isoformat() for d in missing],
+        "gap_causes": [],
+    }
+
+
 def verify_file_integrity(
     filename: str,
     file_bytes: bytes,
@@ -688,8 +804,11 @@ def run_bounded_integrity_build(
           fetch them through `fetch_manifest_bytes` -> the SAME gated `_open_url`
           path used for daily zips (default real path). Then compute manifest
           provenance (SHA-256 + size) and parse official-style md5sums/filesizes.
-      5.  Reconcile the bounded universe against BOTH manifests (fail closed).
-      6.  Per source date:
+      5.  Classify the bounded universe against BOTH manifests (gap-tolerant):
+          present-in-both -> mandatory; absent-in-both -> tolerated source gap
+          (NO fetch); single-manifest-only -> manifest inconsistency, abort
+          before daily processing.
+      6.  Per PRESENT-IN-BOTH source date only (gaps not fetched):
           a. cache check first: if a cached zip exists, `verify_cached_zip`
              re-verifies official MD5/size before use (CacheIntegrityError on
              failure; no silent re-download);
@@ -697,14 +816,23 @@ def run_bounded_integrity_build(
              (default = real gated fetch), then `verify_file_integrity`
              (official MD5/size; SHA-256 recorded as local provenance), then
              write the verified bytes to cache (after verification only);
-          c. `classify_payload_rows(..., enforce_exact_columns=True)`.
-      7.  Slice-aware coverage: re-filter classify survivors with
-          `fetched_set_fully_covers` against the ACTUAL fetched date set, so a
-          slice-edge SQLDATE (e.g. 2013-04-30 needing an unfetched 2013-05-01)
-          is routed OUT of the primary archive — never completed by fetching
-          outside the bounded set.
-      8.  Write the approved-fields archive (primary, slice-covered rows only)
-          and a value-agnostic provenance manifest.
+          c. `classify_payload_rows(..., enforce_exact_columns=True)`, then an
+             exact-58 FILE-LEVEL hard-fail check (any column-count deviation in a
+             manifest-listed file is a terminal `ColumnLayoutHardFail`, never a
+             silent drop and never a gap).
+          Integrity / stable-retry / cache failures for a present-in-both file
+          remain hard fail-closed and are NEVER reclassified as gaps.
+      7.  ONE unified support-aware coverage rule (same for start-edge, slice-edge,
+          and interior manifest gaps): re-filter classify survivors with the
+          production oracle `fetched_set_fully_covers` against the AVAILABLE source
+          set (present-in-both, gaps removed); build a per-SQLDATE coverage ledger
+          (`covered` / `edge-excluded` / `gap-uncovered`) over the requested window.
+          A missing interior source file strands every SQLDATE whose support set
+          includes it (fan-out), all named in the ledger.
+      8.  Write the approved-fields archive (primary, covered rows only) and a
+          value-agnostic provenance manifest incl. the coverage ledger. A window
+          that is entirely absent-in-both completes as an empty, fully
+          gap-ledgered build (no abort, no fetch).
 
     Manifest acquisition: `md5sums_bytes` / `filesizes_bytes` /
     `manifest_fetch_callable` / `fetch_callable` are SYNTHETIC/TEST-ONLY seams.
@@ -771,10 +899,37 @@ def run_bounded_integrity_build(
     md5map = parse_md5sums(md5sums_bytes.decode("utf-8", "replace"))
     sizemap = parse_filesizes(filesizes_bytes.decode("utf-8", "replace"))
 
-    # 5. Reconcile bounded universe against BOTH manifests (fail closed).
-    reconcile_status = reconcile_universe_against_manifests(
-        expected_filenames, md5map, sizemap
-    )
+    # 5. Classify the bounded universe against BOTH manifests (gap-tolerant).
+    #    present-in-both -> mandatory (fetch+verify); absent-in-both -> tolerated
+    #    source gap (NO fetch); single-manifest-only -> manifest inconsistency,
+    #    abort BEFORE any daily processing (NOT a tolerated gap).
+    universe_dates = sorted(date.fromisoformat(x) for x in universe)
+    presence = classify_manifest_presence(expected_filenames, md5map, sizemap)
+    if presence["single_manifest_only"]:
+        raise IntegrityManifestError(
+            "manifest inconsistency: file(s) present in exactly one official "
+            "manifest (md5sums XOR filesizes), not a tolerated gap: {}".format(
+                sorted(presence["single_manifest_only"])
+            )
+        )
+    present_dates = sorted(archive.parse_source_file_date(f) for f in presence["present_in_both"])
+    gap_dates = sorted(archive.parse_source_file_date(f) for f in presence["absent_in_both"])
+    available_dates_set = set(present_dates)
+    gap_dates_set = set(gap_dates)
+
+    reconcile_status = {
+        "expected_count": presence["expected_count"],
+        "present_in_both": len(present_dates),
+        "absent_in_both": len(gap_dates),
+        "single_manifest_only": 0,
+        "tolerated_gap_count": len(gap_dates),
+        "reconciled_ok": True,
+        # back-compat keys (single-only aborts above, so present == present_in_both):
+        "present_in_md5sums": len(present_dates),
+        "present_in_filesizes": len(present_dates),
+        "missing_from_md5sums": [],
+        "missing_from_filesizes": [],
+    }
 
     fetch = fetch_callable  # may be None -> fetch_stable uses the real gated fetch
 
@@ -782,8 +937,11 @@ def run_bounded_integrity_build(
     per_file_provenance: List[Dict[str, Any]] = []
     window_edge_incomplete_days: set = set()
 
-    # 6. Per source date: cache-or-stable-fetch -> integrity verify -> classify.
-    for f_date in sorted(fetched_dates):
+    # 6. Per PRESENT-IN-BOTH source date only (tolerated gaps are NOT fetched):
+    #    cache-or-stable-fetch -> integrity verify -> exact-58 file-level check
+    #    -> classify. Integrity / stable-retry / cache failures stay hard
+    #    fail-closed (raised below); they are never reclassified as gaps.
+    for f_date in present_dates:
         filename = expected_source_filename(f_date)
         url = build_source_file_url(f_date)
         cache_path = os.path.join(cache_dir, filename) if cache_dir else None
@@ -818,6 +976,20 @@ def run_bounded_integrity_build(
             route_edge_incomplete=True,
             enforce_exact_columns=True,
         )
+        # 6d. Exact-58 FILE-LEVEL hard fail: any column-count deviation in a
+        #     manifest-listed processed file is terminal (NOT a silent drop, NOT
+        #     a tolerated gap, NOT a per-SQLDATE label). Aborts before any write.
+        col_mismatch = cls.dropped_by_reason.get(
+            archive.DROP_REASON_COLUMN_COUNT_MISMATCH, 0
+        )
+        if col_mismatch:
+            raise ColumnLayoutHardFail(
+                "exact-58 file-level conformance violated for {}: {} row(s) not "
+                "exactly {} columns; terminal hard-fail (offending file named, "
+                "not classified as a gap)".format(
+                    filename, col_mismatch, archive.EXPECTED_DAILY_COLUMN_COUNT
+                )
+            )
         classify_retained.extend(cls.retained_rows)
         if cls.dropped_by_reason.get(archive.DROP_REASON_EDGE_WINDOW_EXCLUSION, 0):
             window_edge_incomplete_days.add(f_date.isoformat())
@@ -839,22 +1011,40 @@ def run_bounded_integrity_build(
             "integrity_status": integ.get("integrity_status"),
             "official_md5": integ.get("official_md5"),
         }
+        entry["exact58_file_level_ok"] = True
         per_file_provenance.append(entry)
 
-    # 7. Slice-aware coverage against the ACTUAL fetched date set. A classify
-    #    survivor whose SQLDATE is not slice-complete is routed OUT of the
-    #    primary archive (slice-edge incomplete) — never completed by fetching
-    #    outside the bounded set.
+    # 7. Unified support-aware coverage. The SAME production oracle
+    #    `archive.fetched_set_fully_covers` governs both (a) the row-level primary
+    #    filter against the AVAILABLE source set (present-in-both, gaps removed),
+    #    and (b) the per-SQLDATE coverage ledger over the requested window. A
+    #    classify survivor whose SQLDATE is not covered by the available set is
+    #    routed OUT of the primary archive (slice-edge / gap-uncovered).
     primary_rows: List[Dict[str, str]] = []
     slice_edge_incomplete_sqldates: set = set()
     for row in classify_retained:
         sqld = date.fromisoformat(row["sqldate"])
-        if archive.fetched_set_fully_covers(sqld, fetched_dates):
+        if archive.fetched_set_fully_covers(sqld, available_dates_set):
             primary_rows.append(row)
         else:
             slice_edge_incomplete_sqldates.add(row["sqldate"])
 
-    # 8. Write archive (primary slice-covered rows) + structural manifest.
+    # 7b. Coverage ledger over the requested universe (covered / edge-excluded /
+    #     gap-uncovered) — derived from the SAME support-aware rule used above.
+    coverage_ledger: Dict[str, Any] = {}
+    for d in universe_dates:
+        coverage_ledger[d.isoformat()] = classify_sqldate_coverage(
+            d, available_dates_set, gap_dates_set
+        )
+    ledger_covered = sorted(k for k, v in coverage_ledger.items()
+                            if v["state"] == COVERAGE_COVERED)
+    ledger_edge_excluded = sorted(k for k, v in coverage_ledger.items()
+                                  if v["state"] == COVERAGE_EDGE_EXCLUDED)
+    ledger_gap_uncovered = sorted(k for k, v in coverage_ledger.items()
+                                  if v["state"] == COVERAGE_GAP_UNCOVERED)
+    tolerated_gap_source_files = [expected_source_filename(d) for d in gap_dates]
+
+    # 8. Write archive (primary covered rows only) + structural manifest.
     os.makedirs(out_dir, exist_ok=True)
     archive_path = os.path.join(out_dir, "ttg_approved_fields_archive.csv")
     artifact = archive.write_approved_archive_csv(primary_rows, archive_path)
@@ -871,14 +1061,26 @@ def run_bounded_integrity_build(
         per_file_provenance=per_file_provenance,
         archive_artifacts=[artifact],
         total_retained_row_count=len(primary_rows),
-        edge_incomplete_day_count=len(window_edge_incomplete_days),
+        edge_incomplete_day_count=len(ledger_edge_excluded),
     )
     # Wired-path structural provenance (value-agnostic).
     manifest["wired_orchestrator"] = "run_bounded_integrity_build"
     manifest["manifest_provenance"] = prov
     manifest["manifest_source_mode"] = manifest_source_mode
     manifest["manifest_reconciliation"] = reconcile_status
-    manifest["fetched_source_file_count"] = len(fetched_dates)
+    manifest["requested_source_file_count"] = len(universe_dates)
+    manifest["fetched_source_file_count"] = len(present_dates)
+    manifest["tolerated_source_gap_count"] = len(gap_dates)
+    manifest["tolerated_source_gaps"] = tolerated_gap_source_files
+    manifest["coverage_ledger"] = coverage_ledger
+    manifest["coverage_summary"] = {
+        "covered_count": len(ledger_covered),
+        "edge_excluded_count": len(ledger_edge_excluded),
+        "gap_uncovered_count": len(ledger_gap_uncovered),
+        "covered_sqldates": ledger_covered,
+        "edge_excluded_sqldates": ledger_edge_excluded,
+        "gap_uncovered_sqldates": ledger_gap_uncovered,
+    }
     manifest["window_edge_incomplete_day_count"] = len(window_edge_incomplete_days)
     manifest["slice_edge_incomplete_sqldate_count"] = len(slice_edge_incomplete_sqldates)
     manifest["primary_covered_sqldate_count"] = len(covered_sqldates)
@@ -886,6 +1088,7 @@ def run_bounded_integrity_build(
     manifest["boundary_declarations"]["integrity_checked_before_archive_write"] = True
     manifest["boundary_declarations"]["slice_aware_coverage_applied"] = True
     manifest["boundary_declarations"]["manifest_acquired_via_gated_open_url_in_real_mode"] = True
+    manifest["boundary_declarations"]["gap_tolerant_coverage_applied"] = True
 
     manifest_path = os.path.join(out_dir, "ttg_archive_provenance_manifest.json")
     with open(manifest_path, "w") as fh:
@@ -896,8 +1099,14 @@ def run_bounded_integrity_build(
         "manifest_path": manifest_path,
         "archive_artifact": artifact,
         "universe": universe,
-        "fetched_dates": sorted(x.isoformat() for x in fetched_dates),
+        "fetched_dates": [d.isoformat() for d in present_dates],
+        "tolerated_source_gaps": tolerated_gap_source_files,
+        "tolerated_gap_dates": [d.isoformat() for d in gap_dates],
         "primary_covered_sqldates": covered_sqldates,
+        "coverage_ledger": coverage_ledger,
+        "ledger_covered_sqldates": ledger_covered,
+        "ledger_edge_excluded_sqldates": ledger_edge_excluded,
+        "ledger_gap_uncovered_sqldates": ledger_gap_uncovered,
         "slice_edge_incomplete_sqldates": sorted(slice_edge_incomplete_sqldates),
         "window_edge_incomplete_days": sorted(window_edge_incomplete_days),
         "reconcile_status": reconcile_status,

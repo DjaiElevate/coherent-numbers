@@ -1095,25 +1095,26 @@ def test_wired_cache_integrity_failure_no_silent_redownload(monkeypatch, tmp_pat
 
 @pytest.mark.parametrize("ncols", [35, 45, 59])
 def test_wired_exact58_enforced_in_orchestration(monkeypatch, tmp_path, ncols):
+    # GAP-TOLERANCE AMENDMENT (§4.6 / §6.7): a manifest-listed file that violates
+    # exact-58 file-level conformance is a TERMINAL hard-fail (ColumnLayoutHardFail),
+    # naming the offending file — NOT a silent drop and NOT a tolerated gap. The
+    # whole-file MD5/size integrity passes; the column-layout violation still aborts.
     import datetime
     g = _guarded(monkeypatch)
     d = datetime.date(2013, 4, 10)
-    # A single wrong-width row for this file's payload.
     payload = ("\n".join([_make_row_ncols(ncols, sqldate="20130410")]) + "\n").encode()
     fn = fetch_path.expected_source_filename(d)
     md5_b, size_b = _mk_manifests({fn: payload})  # whole-file integrity passes
-    res = fetch_path.run_bounded_integrity_build(
-        "2013-04-10", "2013-04-10", out_dir=str(tmp_path / "out"),
-        md5sums_bytes=md5_b, filesizes_bytes=size_b,
-        fetch_callable=lambda dd, u: payload, **g,
-    )
-    pf = res["manifest"]["per_file_provenance"][0]
-    # Integrity passed (whole-file), but the wrong-width row failed exact-58.
-    assert pf["integrity"]["integrity_status"] == "verified"
-    assert pf["dropped_by_reason"]["column_count_mismatch"] == 1
-    assert pf["retained_row_count"] == 0
-    # Nothing wrong-width reached the archive.
-    assert res["primary_covered_sqldates"] == []
+    out = tmp_path / "out"
+    with pytest.raises(fetch_path.ColumnLayoutHardFail) as ei:
+        fetch_path.run_bounded_integrity_build(
+            "2013-04-10", "2013-04-10", out_dir=str(out),
+            md5sums_bytes=md5_b, filesizes_bytes=size_b,
+            fetch_callable=lambda dd, u: payload, **g,
+        )
+    # Offending source file is named; terminal abort, no primary archive written.
+    assert fn in str(ei.value)
+    assert not (out / "ttg_approved_fields_archive.csv").exists()
 
 
 # 21-23. Generated manifest/report data structural-only, value-agnostic.
