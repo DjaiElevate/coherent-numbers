@@ -38,6 +38,9 @@ preconditions — none of which are granted by importing or testing this module.
 
 from __future__ import annotations
 
+import csv
+import hashlib
+import io
 import json
 import os
 from datetime import date, timedelta
@@ -773,6 +776,76 @@ def _date_range_inclusive(start_iso: str, end_iso: str) -> List[date]:
     return out
 
 
+class RetainedOffsetHardFail(archive.ArchiveBoundaryError):
+    """Raised when a manifest-listed source file yields a retained row whose
+    forward offset `SQLDATE - source_file_date` exceeds `ELIGIBILITY_DELTA_DAYS`.
+
+    The bounded sliding-window release depth (`2 * ELIGIBILITY_DELTA_DAYS`) and the
+    support model both assume retained rows are not forward-dated beyond
+    `ELIGIBILITY_DELTA_DAYS`. A row beyond that bound is a terminal hard-fail
+    finding: NOT streamed, NOT silently dropped, NOT a tolerated gap, and never a
+    completed archive."""
+
+
+def streaming_release_depth() -> int:
+    """Release/finality depth, DERIVED from the production
+    `archive.ELIGIBILITY_DELTA_DAYS` (not a hard-coded magic number).
+
+    A source file dated `f` can carry retained rows up to SQLDATE `f + EDD`
+    (offset `+EDD`); coverage of SQLDATE `s` needs support through `s + EDD`, so a
+    block for file `b` is final once source dates through `b + 2*EDD` are final.
+    Hence release depth = `2 * EDD`; the held-block high-water is bounded around
+    `2*EDD + 1`."""
+    return 2 * archive.ELIGIBILITY_DELTA_DAYS
+
+
+class _StreamingArchiveCsvWriter:
+    """Bounded streaming writer that reproduces `write_approved_archive_csv`
+    BYTE-FOR-BYTE while writing incrementally to a temp file.
+
+    Reuses the production approved field order (`archive.APPROVED_FIELD_NAMES`) and
+    the identical CSV serialization semantics (`csv.writer(lineterminator="\\n")`,
+    UTF-8) so the streamed bytes equal the single-call output for the same row
+    sequence (each `writerow` is independent; block boundaries fall on ASCII
+    newlines, so concatenation-of-encodes == encode-of-concatenation). The SHA-256
+    is computed incrementally and equals `archive.sha256_hex` over the full bytes.
+    The header is emitted on construction, so a zero-row build yields the same
+    header-only bytes as `write_approved_archive_csv([])`.
+    """
+
+    def __init__(self, temp_path: str) -> None:
+        self.temp_path = temp_path
+        self._fh = open(temp_path, "wb")
+        self._hash = hashlib.sha256()
+        self.byte_size = 0
+        self.row_count = 0
+        self._closed = False
+        self._emit([list(archive.APPROVED_FIELD_NAMES)])  # header, once
+
+    def _emit(self, rows_as_lists: Sequence[Sequence[str]]) -> None:
+        buf = io.StringIO()
+        w = csv.writer(buf, lineterminator="\n")
+        for r in rows_as_lists:
+            w.writerow(r)
+        data = buf.getvalue().encode("utf-8")
+        self._fh.write(data)
+        self._hash.update(data)
+        self.byte_size += len(data)
+
+    def write_row(self, row: Mapping[str, str]) -> None:
+        self._emit([[row[name] for name in archive.APPROVED_FIELD_NAMES]])
+        self.row_count += 1
+
+    @property
+    def sha256(self) -> str:
+        return self._hash.hexdigest()
+
+    def close(self) -> None:
+        if not self._closed:
+            self._fh.close()
+            self._closed = True
+
+
 def run_bounded_integrity_build(
     start_date: str,
     end_date: str,
@@ -933,104 +1006,175 @@ def run_bounded_integrity_build(
 
     fetch = fetch_callable  # may be None -> fetch_stable uses the real gated fetch
 
-    classify_retained: List[Dict[str, str]] = []
     per_file_provenance: List[Dict[str, Any]] = []
     window_edge_incomplete_days: set = set()
-
-    # 6. Per PRESENT-IN-BOTH source date only (tolerated gaps are NOT fetched):
-    #    cache-or-stable-fetch -> integrity verify -> exact-58 file-level check
-    #    -> classify. Integrity / stable-retry / cache failures stay hard
-    #    fail-closed (raised below); they are never reclassified as gaps.
-    for f_date in present_dates:
-        filename = expected_source_filename(f_date)
-        url = build_source_file_url(f_date)
-        cache_path = os.path.join(cache_dir, filename) if cache_dir else None
-        source = None
-        if cache_path is not None and os.path.exists(cache_path):
-            # 6a. Cache hit: re-verify official MD5/size BEFORE use (fail closed).
-            integ = verify_cached_zip(cache_path, filename, md5map, sizemap)
-            with open(cache_path, "rb") as fh:
-                payload = fh.read()
-            source = "cache"
-        else:
-            # 6b. Cache miss: stable fetch (retry) -> official verify -> cache write.
-            payload = fetch_stable(
-                f_date, fetch_callable=fetch, attempts=fetch_attempts
-            )
-            integ = verify_file_integrity(filename, payload, md5map, sizemap)
-            integ = dict(integ)
-            integ["source"] = "fetch"
-            if cache_path is not None and write_cache:
-                # Write to cache ONLY after integrity verification succeeded.
-                os.makedirs(cache_dir, exist_ok=True)
-                with open(cache_path, "wb") as fh:
-                    fh.write(payload)
-                integ["cache_path"] = cache_path
-            source = "fetch"
-
-        # 6c. Exact-58 classification of VERIFIED bytes only.
-        cls = archive.classify_payload_rows(
-            payload,
-            source_file_date=f_date,
-            is_zip=is_zip,
-            route_edge_incomplete=True,
-            enforce_exact_columns=True,
-        )
-        # 6d. Exact-58 FILE-LEVEL hard fail: any column-count deviation in a
-        #     manifest-listed processed file is terminal (NOT a silent drop, NOT
-        #     a tolerated gap, NOT a per-SQLDATE label). Aborts before any write.
-        col_mismatch = cls.dropped_by_reason.get(
-            archive.DROP_REASON_COLUMN_COUNT_MISMATCH, 0
-        )
-        if col_mismatch:
-            raise ColumnLayoutHardFail(
-                "exact-58 file-level conformance violated for {}: {} row(s) not "
-                "exactly {} columns; terminal hard-fail (offending file named, "
-                "not classified as a gap)".format(
-                    filename, col_mismatch, archive.EXPECTED_DAILY_COLUMN_COUNT
-                )
-            )
-        classify_retained.extend(cls.retained_rows)
-        if cls.dropped_by_reason.get(archive.DROP_REASON_EDGE_WINDOW_EXCLUSION, 0):
-            window_edge_incomplete_days.add(f_date.isoformat())
-
-        entry = archive.build_per_file_provenance_entry(
-            source_file_date=f_date,
-            source_file_url=url,
-            attempted=True,
-            opened=True,
-            classification=cls,
-            byte_hash=integ.get("sha256_local_provenance"),
-            byte_size=integ.get("byte_size"),
-            error_status=None,
-        )
-        entry["integrity"] = {
-            "source": source,
-            "md5_ok": integ.get("md5_ok"),
-            "size_ok": integ.get("size_ok"),
-            "integrity_status": integ.get("integrity_status"),
-            "official_md5": integ.get("official_md5"),
-        }
-        entry["exact58_file_level_ok"] = True
-        per_file_provenance.append(entry)
-
-    # 7. Unified support-aware coverage. The SAME production oracle
-    #    `archive.fetched_set_fully_covers` governs both (a) the row-level primary
-    #    filter against the AVAILABLE source set (present-in-both, gaps removed),
-    #    and (b) the per-SQLDATE coverage ledger over the requested window. A
-    #    classify survivor whose SQLDATE is not covered by the available set is
-    #    routed OUT of the primary archive (slice-edge / gap-uncovered).
-    primary_rows: List[Dict[str, str]] = []
     slice_edge_incomplete_sqldates: set = set()
-    for row in classify_retained:
-        sqld = date.fromisoformat(row["sqldate"])
-        if archive.fetched_set_fully_covers(sqld, available_dates_set):
-            primary_rows.append(row)
-        else:
-            slice_edge_incomplete_sqldates.add(row["sqldate"])
+    covered_sqldates_set: set = set()
 
-    # 7b. Coverage ledger over the requested universe (covered / edge-excluded /
-    #     gap-uncovered) — derived from the SAME support-aware rule used above.
+    # Incremental aggregate counters replace whole-window row accumulation; no
+    # whole-window row list is retained (bounded memory, see streaming buffer).
+    agg_raw_rows = 0
+    agg_date_eligibility_failure = 0
+    agg_edge_window_exclusion = 0
+    agg_classify_retained = 0
+
+    # Bounded sliding file-block buffer + atomic streaming writer.
+    edd = archive.ELIGIBILITY_DELTA_DAYS
+    release_depth = streaming_release_depth()  # = 2 * EDD (derived, not hard-coded)
+    held: List[Dict[str, Any]] = []            # FIFO of {"f_date": date, "rows": [...]}
+    max_buffered_file_blocks = 0
+
+    os.makedirs(out_dir, exist_ok=True)
+    archive_final_path = os.path.join(out_dir, "ttg_approved_fields_archive.csv")
+    archive_temp_path = archive_final_path + ".partial"
+    manifest_final_path = os.path.join(out_dir, "ttg_archive_provenance_manifest.json")
+    manifest_temp_path = manifest_final_path + ".partial"
+
+    writer = _StreamingArchiveCsvWriter(archive_temp_path)
+
+    def _release_block(block: Dict[str, Any]) -> None:
+        # Apply final coverage filtering (production oracle over the precomputed
+        # available set) and stream-write covered rows in classify order.
+        for row in block["rows"]:
+            sqld = date.fromisoformat(row["sqldate"])
+            if archive.fetched_set_fully_covers(sqld, available_dates_set):
+                writer.write_row(row)
+                covered_sqldates_set.add(row["sqldate"])
+            else:
+                slice_edge_incomplete_sqldates.add(row["sqldate"])
+
+    try:
+        # 6. Per PRESENT-IN-BOTH source date only (tolerated gaps are NOT fetched):
+        #    cache-or-stable-fetch -> integrity verify -> exact-58 file-level check
+        #    -> retained-offset guard -> buffer whole file-block -> bounded release.
+        #    Integrity / stable-retry / cache failures stay hard fail-closed; they
+        #    are never reclassified as gaps.
+        for f_date in present_dates:
+            filename = expected_source_filename(f_date)
+            url = build_source_file_url(f_date)
+            cache_path = os.path.join(cache_dir, filename) if cache_dir else None
+            source = None
+            if cache_path is not None and os.path.exists(cache_path):
+                # 6a. Cache hit: re-verify official MD5/size BEFORE use (fail closed).
+                integ = verify_cached_zip(cache_path, filename, md5map, sizemap)
+                with open(cache_path, "rb") as fh:
+                    payload = fh.read()
+                source = "cache"
+            else:
+                # 6b. Cache miss: stable fetch -> official verify -> cache write.
+                payload = fetch_stable(
+                    f_date, fetch_callable=fetch, attempts=fetch_attempts
+                )
+                integ = verify_file_integrity(filename, payload, md5map, sizemap)
+                integ = dict(integ)
+                integ["source"] = "fetch"
+                if cache_path is not None and write_cache:
+                    # Write to cache ONLY after integrity verification succeeded.
+                    os.makedirs(cache_dir, exist_ok=True)
+                    with open(cache_path, "wb") as fh:
+                        fh.write(payload)
+                    integ["cache_path"] = cache_path
+                source = "fetch"
+
+            # 6c. Exact-58 classification of VERIFIED bytes only.
+            cls = archive.classify_payload_rows(
+                payload,
+                source_file_date=f_date,
+                is_zip=is_zip,
+                route_edge_incomplete=True,
+                enforce_exact_columns=True,
+            )
+            # 6d. Exact-58 FILE-LEVEL hard fail: any column-count deviation in a
+            #     manifest-listed processed file is terminal (NOT a silent drop,
+            #     NOT a tolerated gap, NOT a per-SQLDATE label). Before any release.
+            col_mismatch = cls.dropped_by_reason.get(
+                archive.DROP_REASON_COLUMN_COUNT_MISMATCH, 0
+            )
+            if col_mismatch:
+                raise ColumnLayoutHardFail(
+                    "exact-58 file-level conformance violated for {}: {} row(s) not "
+                    "exactly {} columns; terminal hard-fail (offending file named, "
+                    "not classified as a gap)".format(
+                        filename, col_mismatch, archive.EXPECTED_DAILY_COLUMN_COUNT
+                    )
+                )
+            # 6e. Retained-offset guard: no retained row may be forward-dated
+            #     beyond ELIGIBILITY_DELTA_DAYS (it would break the bounded-release
+            #     support model). Terminal hard-fail; named; not streamed/dropped/gap.
+            for row in cls.retained_rows:
+                offset_days = (date.fromisoformat(row["sqldate"]) - f_date).days
+                if offset_days > edd:
+                    raise RetainedOffsetHardFail(
+                        "retained-offset bound violated in {}: SQLDATE {} is offset "
+                        "+{} days from source-file date {} (> ELIGIBILITY_DELTA_DAYS "
+                        "= {}); terminal hard-fail (not streamed, not a gap)".format(
+                            filename, row["sqldate"], offset_days,
+                            f_date.isoformat(), edd
+                        )
+                    )
+
+            # Incremental counters + O(days) per-file provenance metadata.
+            agg_raw_rows += cls.raw_row_count
+            agg_date_eligibility_failure += cls.dropped_by_reason.get(
+                archive.DROP_REASON_DATE_ELIGIBILITY_FAILURE, 0)
+            agg_edge_window_exclusion += cls.dropped_by_reason.get(
+                archive.DROP_REASON_EDGE_WINDOW_EXCLUSION, 0)
+            agg_classify_retained += cls.retained_row_count
+            if cls.dropped_by_reason.get(archive.DROP_REASON_EDGE_WINDOW_EXCLUSION, 0):
+                window_edge_incomplete_days.add(f_date.isoformat())
+
+            entry = archive.build_per_file_provenance_entry(
+                source_file_date=f_date,
+                source_file_url=url,
+                attempted=True,
+                opened=True,
+                classification=cls,
+                byte_hash=integ.get("sha256_local_provenance"),
+                byte_size=integ.get("byte_size"),
+                error_status=None,
+            )
+            entry["integrity"] = {
+                "source": source,
+                "md5_ok": integ.get("md5_ok"),
+                "size_ok": integ.get("size_ok"),
+                "integrity_status": integ.get("integrity_status"),
+                "official_md5": integ.get("official_md5"),
+            }
+            entry["exact58_file_level_ok"] = True
+            per_file_provenance.append(entry)
+
+            # Buffer this file's whole row-block (classify order), record the
+            # high-water, then release any block whose support window is now final
+            # (f_date >= b + release_depth). Bounded ~ release_depth+1 = 2*EDD+1.
+            held.append({"f_date": f_date, "rows": cls.retained_rows})
+            if len(held) > max_buffered_file_blocks:
+                max_buffered_file_blocks = len(held)
+            while held and (held[0]["f_date"] + timedelta(days=release_depth)) <= f_date:
+                _release_block(held.pop(0))
+
+        # 6f. Terminal post-loop flush: release the remaining held blocks in
+        #     source-file order; their forward support (f+1 .. f+EDD) is now
+        #     out-of-window/sealed/unavailable, resolving the final boundary edge.
+        while held:
+            _release_block(held.pop(0))
+
+        writer.close()
+        os.replace(archive_temp_path, archive_final_path)  # promote ONLY on success
+    except BaseException:
+        # Hard-fail / interrupt: leave the un-promoted partial temp (gitignored,
+        # untracked); publish NO final archive and NO manifest.
+        writer.close()
+        raise
+
+    artifact = {
+        "output_path": archive_final_path,
+        "row_count": writer.row_count,
+        "sha256": writer.sha256,
+        "byte_size": writer.byte_size,
+    }
+
+    # 7. Coverage ledger over the requested universe (covered / edge-excluded /
+    #    gap-uncovered) — O(days), from the SAME support-aware production oracle.
     coverage_ledger: Dict[str, Any] = {}
     for d in universe_dates:
         coverage_ledger[d.isoformat()] = classify_sqldate_coverage(
@@ -1043,13 +1187,9 @@ def run_bounded_integrity_build(
     ledger_gap_uncovered = sorted(k for k, v in coverage_ledger.items()
                                   if v["state"] == COVERAGE_GAP_UNCOVERED)
     tolerated_gap_source_files = [expected_source_filename(d) for d in gap_dates]
+    covered_sqldates = sorted(covered_sqldates_set)
 
-    # 8. Write archive (primary covered rows only) + structural manifest.
-    os.makedirs(out_dir, exist_ok=True)
-    archive_path = os.path.join(out_dir, "ttg_approved_fields_archive.csv")
-    artifact = archive.write_approved_archive_csv(primary_rows, archive_path)
-
-    covered_sqldates = sorted({r["sqldate"] for r in primary_rows})
+    # 8. Structural manifest (atomic temp -> promote AFTER archive promotion).
     manifest = archive.build_phase2_provenance_manifest(
         source_file_window={
             "start": start_date,
@@ -1060,7 +1200,7 @@ def run_bounded_integrity_build(
         },
         per_file_provenance=per_file_provenance,
         archive_artifacts=[artifact],
-        total_retained_row_count=len(primary_rows),
+        total_retained_row_count=writer.row_count,
         edge_incomplete_day_count=len(ledger_edge_excluded),
     )
     # Wired-path structural provenance (value-agnostic).
@@ -1084,15 +1224,25 @@ def run_bounded_integrity_build(
     manifest["window_edge_incomplete_day_count"] = len(window_edge_incomplete_days)
     manifest["slice_edge_incomplete_sqldate_count"] = len(slice_edge_incomplete_sqldates)
     manifest["primary_covered_sqldate_count"] = len(covered_sqldates)
+    # Streaming-write structural provenance (value-agnostic).
+    manifest["streaming_release_depth"] = release_depth
+    manifest["max_buffered_source_file_blocks"] = max_buffered_file_blocks
+    manifest["agg_raw_rows"] = agg_raw_rows
+    manifest["agg_date_eligibility_failure"] = agg_date_eligibility_failure
+    manifest["agg_edge_window_exclusion"] = agg_edge_window_exclusion
+    manifest["agg_classify_retained"] = agg_classify_retained
+    manifest["primary_archive_rows"] = writer.row_count
     manifest["boundary_declarations"]["single_real_network_entrypoint"] = True
     manifest["boundary_declarations"]["integrity_checked_before_archive_write"] = True
     manifest["boundary_declarations"]["slice_aware_coverage_applied"] = True
     manifest["boundary_declarations"]["manifest_acquired_via_gated_open_url_in_real_mode"] = True
     manifest["boundary_declarations"]["gap_tolerant_coverage_applied"] = True
+    manifest["boundary_declarations"]["streaming_archive_write"] = True
 
-    manifest_path = os.path.join(out_dir, "ttg_archive_provenance_manifest.json")
-    with open(manifest_path, "w") as fh:
+    with open(manifest_temp_path, "w") as fh:
         json.dump(manifest, fh, indent=2, sort_keys=False)
+    os.replace(manifest_temp_path, manifest_final_path)
+    manifest_path = manifest_final_path
 
     return {
         "manifest": manifest,
@@ -1110,4 +1260,13 @@ def run_bounded_integrity_build(
         "slice_edge_incomplete_sqldates": sorted(slice_edge_incomplete_sqldates),
         "window_edge_incomplete_days": sorted(window_edge_incomplete_days),
         "reconcile_status": reconcile_status,
+        # Streaming-amendment additions (incremental counters; bounded buffer).
+        "agg_raw_rows": agg_raw_rows,
+        "agg_date_eligibility_failure": agg_date_eligibility_failure,
+        "agg_edge_window_exclusion": agg_edge_window_exclusion,
+        "agg_classify_retained": agg_classify_retained,
+        "primary_archive_rows": writer.row_count,
+        "archive_sha256": writer.sha256,
+        "max_buffered_source_file_blocks": max_buffered_file_blocks,
+        "streaming_release_depth": release_depth,
     }
