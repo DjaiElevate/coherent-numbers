@@ -743,6 +743,263 @@ def fetch_stable(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# MISSING-SOURCE RESILIENCE amendment: bounded retry/backoff for transient
+# transport failures + stable-404 classification + operator-authorized allowlist.
+#
+# Design (all value-blind, no network import at module load):
+#   - Transient transport failures (IncompleteRead, timeouts, connection
+#     reset/abort, transient urllib transport, HTTP 429, HTTP 5xx) are retried
+#     under a BOUNDED budget with exponential backoff, BEFORE the source file
+#     enters the streaming buffer. A first-try success is byte-identical to the
+#     pre-amendment path (no retry, no backoff sleep).
+#   - A 404 is NOT an ordinary transient: the first 404 triggers a small bounded
+#     stability re-check; a STABLE 404 is classified `manifest-listed-but-
+#     unavailable` (ManifestPresentButUnavailableError) and is NEVER silently
+#     tolerated by itself — it is routed to allowlist classification by the
+#     orchestrator. A non-stable 404 (a re-check recovers or flakes) is handled as
+#     a recovery / transient.
+#   - Integrity / MD5 / byte-size / exact-58 / stability failures are raised
+#     AFTER a successful fetch and are NOT caught here, so retry can never mask a
+#     genuine integrity failure.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Retryable transient HTTP status codes (server-side / rate-limit conditions).
+RETRYABLE_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
+
+# Bounded retry/backoff defaults for the real run. Tests inject a fake `sleep_fn`
+# and small counts so no test sleeps in real time. None of these is a byte seam;
+# on a first-try success path they have NO effect on output bytes.
+DEFAULT_MAX_TRANSIENT_RETRIES = 4
+DEFAULT_RETRY_BACKOFF_BASE_SECONDS = 2.0
+DEFAULT_STABLE_404_RECHECK_COUNT = 1
+
+
+class TransientFetchError(archive.ArchiveBoundaryError):
+    """Raised when a transient transport failure for a manifest-listed file
+    exhausts the bounded retry budget. Terminal hard-fail (not a tolerated gap)."""
+
+
+class ManifestPresentButUnavailableError(archive.ArchiveBoundaryError):
+    """Raised when a manifest-listed source file returns a STABLE HTTP 404 across
+    the bounded stability re-check (manifest-listed-but-unavailable).
+
+    This is NOT transport flake and is NEVER silently tolerated by itself. The
+    orchestrator routes it to allowlist classification: tolerated as a deliberate
+    operator-allowlisted manifest-present fetch-absent gap ONLY if the source date
+    is explicitly supplied in the run's allowlist; otherwise it is a terminal
+    hard-fail exactly like the pre-amendment unknown-404 behaviour."""
+
+
+def _http_status_of(exc: BaseException) -> Optional[int]:
+    """Return the integer HTTP status of an HTTPError-like exception (one with an
+    int `.code`), else None. No network import required — attribute read only."""
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, int) else None
+
+
+def _describe_exc(exc: BaseException) -> str:
+    """Value-blind short description of an exception (type name + HTTP status
+    only). Never includes any response body, URL query, or row value."""
+    status = _http_status_of(exc)
+    return "{}(code={})".format(type(exc).__name__, status)
+
+
+def classify_fetch_exception(exc: BaseException) -> str:
+    """Classify a fetch exception WITHOUT importing any network library at module
+    load. Returns one of: 'http_404', 'retryable_transient', 'fatal'.
+
+      - HTTPError-like with status 404               -> 'http_404'
+      - HTTPError-like with status in RETRYABLE_*    -> 'retryable_transient'
+      - other HTTPError-like status (e.g. 4xx)       -> 'fatal'
+      - TimeoutError / ConnectionError subclasses    -> 'retryable_transient'
+      - http.client.IncompleteRead / urllib URLError /
+        socket.timeout / connection reset|abort      -> 'retryable_transient'
+        (matched by exception-MRO class name, so no network import is needed)
+      - anything else                                -> 'fatal'
+
+    Integrity/verification failures are raised AFTER a successful fetch, so they
+    never reach this classifier and can never be retried.
+    """
+    status = _http_status_of(exc)
+    if status == 404:
+        return "http_404"
+    if status is not None:
+        return "retryable_transient" if status in RETRYABLE_HTTP_STATUS else "fatal"
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return "retryable_transient"
+    transient_names = {
+        "IncompleteRead",         # http.client.IncompleteRead (truncated body)
+        "URLError",               # urllib.error.URLError (transport-level)
+        "timeout",                # socket.timeout (distinct class on older py)
+        "TimeoutError",
+        "ConnectionError",
+        "ConnectionResetError",
+        "ConnectionAbortedError",
+        "RemoteDisconnected",     # http.client.RemoteDisconnected
+    }
+    if {t.__name__ for t in type(exc).__mro__} & transient_names:
+        return "retryable_transient"
+    return "fatal"
+
+
+def _sleep_default(seconds: float) -> None:
+    """Default backoff sleeper (lazy `time` import; only ever called on a retry)."""
+    import time
+    time.sleep(seconds)
+
+
+def _confirm_404_stability(
+    fetch: Callable[..., bytes],
+    source_file_date: date,
+    url: str,
+    *,
+    recheck_count: int,
+    sleep_fn: Callable[[float], None],
+    backoff_base: float,
+) -> Any:
+    """Bounded re-check of a first 404 (spirit of the probe's repeat-after-delay).
+
+    Re-probes up to `recheck_count` times and returns:
+      - True   iff EVERY re-check is also a 404 (stable manifest-listed-but-unavailable);
+      - bytes  iff a re-check recovers (returns bytes);
+      - False  iff a re-check raises a transient (inconclusive -> caller retries).
+    A re-check that raises a fatal error propagates.
+    """
+    for _ in range(recheck_count):
+        sleep_fn(backoff_base)
+        try:
+            return fetch(source_file_date, url)  # recovered -> bytes
+        except ManifestPresentButUnavailableError:
+            raise
+        except Exception as exc:  # noqa: BLE001 (classified below; fatal re-raised)
+            kind = classify_fetch_exception(exc)
+            if kind == "http_404":
+                continue
+            if kind == "retryable_transient":
+                return False
+            raise
+    return True
+
+
+def _read_once_with_retry(
+    fetch: Callable[..., bytes],
+    source_file_date: date,
+    url: str,
+    *,
+    max_transient_retries: int,
+    backoff_base: float,
+    stable_404_recheck_count: int,
+    sleep_fn: Callable[[float], None],
+) -> bytes:
+    """One logical resilient read: bounded transient retry/backoff + stable-404
+    classification. Returns bytes on success; raises
+    `ManifestPresentButUnavailableError` on a stable 404, `TransientFetchError`
+    when the retry budget is exhausted, or the original fatal error otherwise."""
+    transient_used = 0
+    while True:
+        try:
+            return fetch(source_file_date, url)
+        except ManifestPresentButUnavailableError:
+            raise
+        except Exception as exc:  # noqa: BLE001 (classified; fatal re-raised below)
+            kind = classify_fetch_exception(exc)
+            if kind == "http_404":
+                stable = _confirm_404_stability(
+                    fetch, source_file_date, url,
+                    recheck_count=stable_404_recheck_count,
+                    sleep_fn=sleep_fn, backoff_base=backoff_base,
+                )
+                if stable is True:
+                    raise ManifestPresentButUnavailableError(
+                        "manifest-listed source file {} returned a STABLE HTTP 404 "
+                        "across {} re-check(s): manifest-listed-but-unavailable "
+                        "(not transport flake; routed to allowlist classification)"
+                        .format(expected_source_filename(source_file_date),
+                                stable_404_recheck_count)
+                    )
+                if isinstance(stable, (bytes, bytearray)):
+                    return bytes(stable)  # recovered during re-check
+                kind = "retryable_transient"  # re-check flaked -> treat as transient
+            if kind == "retryable_transient":
+                if transient_used >= max_transient_retries:
+                    raise TransientFetchError(
+                        "transient transport failure for {} exceeded the bounded "
+                        "retry budget ({} retries): last={}".format(
+                            expected_source_filename(source_file_date),
+                            max_transient_retries, _describe_exc(exc))
+                    )
+                transient_used += 1
+                sleep_fn(backoff_base * (2 ** (transient_used - 1)))
+                continue
+            raise  # fatal (other HTTP 4xx, unexpected errors)
+
+
+def fetch_resilient(
+    source_file_date: date,
+    *,
+    fetch_callable: Optional[Callable[..., bytes]] = None,
+    attempts: int = 2,
+    max_transient_retries: int = DEFAULT_MAX_TRANSIENT_RETRIES,
+    retry_backoff_base_seconds: float = DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+    stable_404_recheck_count: int = DEFAULT_STABLE_404_RECHECK_COUNT,
+    sleep_fn: Optional[Callable[[float], None]] = None,
+) -> bytes:
+    """Resilient superset of `fetch_stable`: preserves the byte-identical
+    multi-read download-stability requirement and ADDS bounded transient
+    retry/backoff and stable-404 classification around each read.
+
+    On the all-success first-try path this performs exactly `attempts`
+    successful reads and returns the first bytes — byte-identical to
+    `fetch_stable` (no retry, no backoff sleep) — so archive output is unchanged.
+
+    Raises `ManifestPresentButUnavailableError` (stable 404),
+    `TransientFetchError` (retry budget exhausted), or `UnstableDownloadError`
+    (retried bytes differ). The DEFAULT `fetch_callable` is the gated real fetch,
+    which hard-errors before any network contact; synthetic tests inject a
+    non-network callable and a fake `sleep_fn`.
+    """
+    if attempts < 2:
+        raise ValueError("fetch_resilient requires attempts >= 2 to assess stability")
+    fetch = fetch_callable if fetch_callable is not None else fetch_one_source_file
+    if sleep_fn is None:
+        sleep_fn = _sleep_default
+    url = build_source_file_url(source_file_date)
+    kw = dict(
+        max_transient_retries=max_transient_retries,
+        backoff_base=retry_backoff_base_seconds,
+        stable_404_recheck_count=stable_404_recheck_count,
+        sleep_fn=sleep_fn,
+    )
+    first = _read_once_with_retry(fetch, source_file_date, url, **kw)
+    first_md5 = archive.md5_hex(first)
+    for _ in range(attempts - 1):
+        nxt = _read_once_with_retry(fetch, source_file_date, url, **kw)
+        if archive.md5_hex(nxt) != first_md5:
+            raise UnstableDownloadError(
+                "unstable download for {}: retried bytes differ".format(
+                    source_file_date.isoformat()
+                )
+            )
+    return first
+
+
+def parse_fetch_absent_allowlist(allowlist: Optional[Sequence[str]]) -> set:
+    """Parse an operator-supplied fetch-absent allowlist (ISO `YYYY-MM-DD` source
+    dates) into a set of `date`s. Default `None`/empty -> empty/strict set.
+
+    The allowlist is operator-supplied per authorized run ONLY. It is NEVER
+    inferred from manifests, cache state, runtime failures, fail reports, or probe
+    reports, and runtime failures never auto-populate it. An empty allowlist means
+    every stable-404 on a manifest-listed file is a terminal hard-fail."""
+    out: set = set()
+    if not allowlist:
+        return out
+    for raw in allowlist:
+        out.add(date.fromisoformat(str(raw).strip()))
+    return out
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # WIRED bounded-run orchestration — the SINGLE real/default fetch entrypoint.
 #
 # This is the one orchestrator the future bounded real run will use. It wires the
@@ -863,6 +1120,11 @@ def run_bounded_integrity_build(
     is_zip: bool = False,
     fetch_attempts: int = 2,
     write_cache: bool = True,
+    fetch_absent_allowlist: Optional[Sequence[str]] = None,
+    max_transient_retries: int = DEFAULT_MAX_TRANSIENT_RETRIES,
+    retry_backoff_base_seconds: float = DEFAULT_RETRY_BACKOFF_BASE_SECONDS,
+    stable_404_recheck_count: int = DEFAULT_STABLE_404_RECHECK_COUNT,
+    sleep_fn: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """Wired, integrity-checked bounded-run orchestration (single real entrypoint).
 
@@ -943,6 +1205,15 @@ def run_bounded_integrity_build(
             "real path fetches manifests and daily zips through the gated _open_url."
         )
 
+    # 2c. Parse the operator-supplied fetch-absent allowlist (default empty/strict).
+    #     This is the ONLY source of allowlist entries: never inferred from
+    #     manifests, cache, runtime failures, fail reports, or probe reports, and
+    #     runtime failures never auto-populate it. With an empty allowlist every
+    #     stable-404 on a manifest-listed file remains a terminal hard-fail.
+    allowlist_dates = parse_fetch_absent_allowlist(fetch_absent_allowlist)
+    if sleep_fn is None:
+        sleep_fn = _sleep_default
+
     # 3. Bounded universe + window/2023+ rejection BEFORE any fetch/open.
     candidate_isos = [d.isoformat() for d in _date_range_inclusive(start_date, end_date)]
     universe = archive.enumerate_source_universe(candidate_isos)  # sorted, in-window
@@ -1010,6 +1281,10 @@ def run_bounded_integrity_build(
     window_edge_incomplete_days: set = set()
     slice_edge_incomplete_sqldates: set = set()
     covered_sqldates_set: set = set()
+    # Source dates that were present-in-both manifests but returned a STABLE 404
+    # and are explicitly operator-allowlisted -> deliberate tolerated fetch-absent
+    # gaps (removed from the available set; folded into the coverage gap set).
+    fetch_absent_allowlisted_dates: set = set()
 
     # Incremental aggregate counters replace whole-window row accumulation; no
     # whole-window row list is retained (bounded memory, see streaming buffer).
@@ -1061,10 +1336,44 @@ def run_bounded_integrity_build(
                     payload = fh.read()
                 source = "cache"
             else:
-                # 6b. Cache miss: stable fetch -> official verify -> cache write.
-                payload = fetch_stable(
-                    f_date, fetch_callable=fetch, attempts=fetch_attempts
-                )
+                # 6b. Cache miss: resilient fetch (bounded transient retry/backoff
+                #     + stable-404 classification) -> official verify -> cache write.
+                #     A STABLE 404 on a manifest-listed file is NEVER silently
+                #     tolerated: it is tolerated as a deliberate fetch-absent gap
+                #     ONLY if the source date is explicitly operator-allowlisted;
+                #     otherwise it is a terminal hard-fail (as pre-amendment).
+                try:
+                    payload = fetch_resilient(
+                        f_date, fetch_callable=fetch, attempts=fetch_attempts,
+                        max_transient_retries=max_transient_retries,
+                        retry_backoff_base_seconds=retry_backoff_base_seconds,
+                        stable_404_recheck_count=stable_404_recheck_count,
+                        sleep_fn=sleep_fn,
+                    )
+                except ManifestPresentButUnavailableError:
+                    if f_date not in allowlist_dates:
+                        raise  # stable 404 on a NON-allowlisted date -> hard fail
+                    # Deliberate operator-allowlisted manifest-present fetch-absent
+                    # gap: remove from the available set BEFORE any dependent block
+                    # is released, fold into the coverage gap set, record value-blind
+                    # provenance, advance the release clock, and continue (no bytes,
+                    # no integrity, no classify, no block buffered).
+                    available_dates_set.discard(f_date)
+                    fetch_absent_allowlisted_dates.add(f_date)
+                    per_file_provenance.append({
+                        "source_file_date": f_date.isoformat(),
+                        "source_file_url": url,
+                        "attempted": True,
+                        "opened": False,
+                        "coverage_status": "manifest_present_fetch_absent_allowlisted",
+                        "error_status": "stable_http_404_manifest_present_fetch_absent",
+                        "fetch_absent_allowlisted": True,
+                    })
+                    while held and (
+                        held[0]["f_date"] + timedelta(days=release_depth)
+                    ) <= f_date:
+                        _release_block(held.pop(0))
+                    continue
                 integ = verify_file_integrity(filename, payload, md5map, sizemap)
                 integ = dict(integ)
                 integ["source"] = "fetch"
@@ -1175,10 +1484,16 @@ def run_bounded_integrity_build(
 
     # 7. Coverage ledger over the requested universe (covered / edge-excluded /
     #    gap-uncovered) — O(days), from the SAME support-aware production oracle.
+    # Coverage propagation: operator-allowlisted fetch-absent dates are folded
+    # into the SAME coverage gap set used for mutual-absence gaps, and were already
+    # removed from `available_dates_set` during the loop — so the unified
+    # support-aware oracle strands every SQLDATE whose {t-1,t,t+1} support includes
+    # a fetch-absent date, with NO parallel special-case primary-set filter.
+    combined_gap_set = set(gap_dates_set) | fetch_absent_allowlisted_dates
     coverage_ledger: Dict[str, Any] = {}
     for d in universe_dates:
         coverage_ledger[d.isoformat()] = classify_sqldate_coverage(
-            d, available_dates_set, gap_dates_set
+            d, available_dates_set, combined_gap_set
         )
     ledger_covered = sorted(k for k, v in coverage_ledger.items()
                             if v["state"] == COVERAGE_COVERED)
@@ -1188,6 +1503,20 @@ def run_bounded_integrity_build(
                                   if v["state"] == COVERAGE_GAP_UNCOVERED)
     tolerated_gap_source_files = [expected_source_filename(d) for d in gap_dates]
     covered_sqldates = sorted(covered_sqldates_set)
+
+    # Operator-allowlisted manifest-present fetch-absent coverage losses (distinct,
+    # clearly-categorized reporting). The per-SQLDATE ledger state is unified
+    # (gap-uncovered via the same oracle); this names the fetch-absent cause set
+    # and the dependent SQLDATEs separately from mutual-absence manifest gaps.
+    fetch_absent_allowlisted_sorted = sorted(fetch_absent_allowlisted_dates)
+    fetch_absent_allowlisted_files = [
+        expected_source_filename(d) for d in fetch_absent_allowlisted_sorted
+    ]
+    fetch_absent_coverage_loss_sqldates = sorted(
+        d.isoformat() for d in universe_dates
+        if (sqldate_support_set(d) & fetch_absent_allowlisted_dates)
+        and not archive.fetched_set_fully_covers(d, available_dates_set)
+    )
 
     # 8. Structural manifest (atomic temp -> promote AFTER archive promotion).
     manifest = archive.build_phase2_provenance_manifest(
@@ -1238,6 +1567,34 @@ def run_bounded_integrity_build(
     manifest["boundary_declarations"]["manifest_acquired_via_gated_open_url_in_real_mode"] = True
     manifest["boundary_declarations"]["gap_tolerant_coverage_applied"] = True
     manifest["boundary_declarations"]["streaming_archive_write"] = True
+    # Missing-source resilience amendment provenance (value-agnostic, top-level so
+    # the pre-amendment coverage_summary/reconcile_status structures are untouched
+    # and the all-success empty-allowlist happy path stays byte-neutral).
+    manifest["retry_backoff_config"] = {
+        "max_transient_retries": max_transient_retries,
+        "retry_backoff_base_seconds": retry_backoff_base_seconds,
+        "stable_404_recheck_count": stable_404_recheck_count,
+        "fetch_attempts": fetch_attempts,
+    }
+    manifest["fetch_absent_allowlist_supplied"] = sorted(
+        d.isoformat() for d in allowlist_dates
+    )
+    manifest["fetch_absent_allowlisted_source_date_count"] = len(
+        fetch_absent_allowlisted_sorted
+    )
+    manifest["fetch_absent_allowlisted_source_dates"] = [
+        d.isoformat() for d in fetch_absent_allowlisted_sorted
+    ]
+    manifest["fetch_absent_allowlisted_source_files"] = fetch_absent_allowlisted_files
+    manifest["fetch_absent_coverage_loss_sqldates"] = fetch_absent_coverage_loss_sqldates
+    manifest["fetch_absent_coverage_loss_count"] = len(
+        fetch_absent_coverage_loss_sqldates
+    )
+    manifest["boundary_declarations"]["bounded_retry_backoff_applied"] = True
+    manifest["boundary_declarations"]["stable_404_classified_not_silently_tolerated"] = True
+    manifest["boundary_declarations"]["fetch_absent_allowlist_empty_this_run"] = (
+        len(allowlist_dates) == 0
+    )
 
     with open(manifest_temp_path, "w") as fh:
         json.dump(manifest, fh, indent=2, sort_keys=False)
@@ -1269,4 +1626,12 @@ def run_bounded_integrity_build(
         "archive_sha256": writer.sha256,
         "max_buffered_source_file_blocks": max_buffered_file_blocks,
         "streaming_release_depth": release_depth,
+        # Missing-source resilience amendment additions (value-agnostic).
+        "fetch_absent_allowlist_supplied": sorted(d.isoformat() for d in allowlist_dates),
+        "fetch_absent_allowlisted_source_dates": [
+            d.isoformat() for d in fetch_absent_allowlisted_sorted
+        ],
+        "fetch_absent_allowlisted_source_files": fetch_absent_allowlisted_files,
+        "fetch_absent_coverage_loss_sqldates": fetch_absent_coverage_loss_sqldates,
+        "retry_backoff_config": manifest["retry_backoff_config"],
     }
