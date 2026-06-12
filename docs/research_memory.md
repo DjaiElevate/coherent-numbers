@@ -3,8 +3,8 @@
 **Status: LIVING STATE INDEX**
 **Repo: /Users/jay/Documents/GitHub/coherent-numbers**
 **Branch at creation: main**
-**Last updated: 2026-06-08**
-**Last reconciled against commit: 4ce9bf3df4ff2ed1847cebf74b185a10bd859944**
+**Last updated: 2026-06-12**
+**Last reconciled against commit: ac098b660cabdc04aafff54aec7356ab55b143f4**
 **Purpose: map to authoritative committed records (Lane 2 / TTG closure); not a replacement for preregs, result docs, decision memos, research logs, result reports, or closure memos**
 **Value-safety: no raw data, no row-level data, no OHLC rows, no returns rows, no source URLs, no secrets, no 2023+ data filenames/rows, no execution authorization, no OOS authorization**
 **Bootstrap rule: future sessions must read this file first, then verify every cited commit/path against git before relying on it**
@@ -58,6 +58,17 @@ Run at the start of any session that intends to rely on this file:
 - **No base-12 inference** from TTG→SPY.
 - **No "negative news makes price go down" conclusion** is supported or drawn.
 - Anchor: `docs/lane2_ttg_spy_v1_results_v0.1.md` @ `2003fc855bd0583f137e8814c173485981540270`. Full row in §10.
+
+### Cusp Geometry Lane v0.3 — closed exploratory null
+
+- **Status:** closed; terminal scientific outcome **FAIL — exploratory null**.
+- **Pre-registered sandbox gate** (SPY in-window sandbox 2005-01-01…2022-12-31, `adj_close`): does adding the living-line curvature statistic `F2_kappa_mean` to the M0 baseline (`const + B1_ln_rv63 + B2_ln_rv21 + B3_abs_ret21 + B4_range63 + B5_ac1_63 + B6_mean_abs_dz`) improve out-of-fold prediction of forward log realized vol? OLS over the frozen `purged_blocked_folds` (N_FOLDS=10, PURGE=3); 209 records from frozen `make_records`.
+- **Pooled out-of-fold incremental R² = `-0.0256` (< 0)**; **improving folds = `0/10`**. PASS condition (incremental R² > 0 AND ≥7/10 improve) failed on both clauses.
+- **Interpretation:** B6 (F2's linearized small-z shadow) and the standard volatility baselines absorb the curvature statistic; F2 adds nothing and degrades OOF prediction (fold-wise F2 coefficient sign unstable, 5 positive / 5 negative).
+- **Protocol consequence:** lane closed per the **pre-registered FAIL branch**. **No tuning, no alternatives, no full-sandbox refit** were run. **2023+ sealed data remains unopened** (only the 2005–2022 in-window sandbox was read).
+- **Instrument freeze commit:** `4536be27f6955be72bdb7abad4b4cb38ac1278ad` (memo SHA-256 `7d47f9a8a840984bc12a95933f377a73a853d59ad223403a095bc3a0b3d6d8e8`; code SHA-256 `bd2a9d46e7637fc2eede7ecd1584cedd9d7859cbca82d1e867ca84af90568014`). **Closure commit:** `ac098b660cabdc04aafff54aec7356ab55b143f4`.
+- **Report:** `docs/cusp_geometry_lane_v0_3_sandbox_gate_report.md` SHA-256 `28d97171f902ec50b0ac945160fe7489ef06398e3c8d21a21ea7f289f28849a6`. **Derived sandbox CSV** SHA-256 `5cd925026d37c1825363db525483ecc454e680ea21d1addfe1c83cb134ea5901` — **not committed** because `data/raw/` is gitignored (the gate is reproducible from the SHA-pinned source + committed loader).
+- **Local branch:** `main` is **two commits ahead this session** (freeze → closure) and **unpushed**. Two unrelated untracked docs (`docs/influential_numbers_field_modulated_identity_design_memo_v0.1.md`, `docs/lane2_gdelt1_gate5_prerun_diagnostic_post10_report_v0.1.md`) were left untracked and untouched. Full rows in §10.
 
 ## 4. TTG magnitude-pressure closure
 
@@ -129,6 +140,8 @@ All commits/paths below were resolved and confirmed against git at the last-reco
 | TTG magnitude-pressure benchmark-limitation memo (daily horizon) | committed | committed-doc claim | `docs/lane2_ttg_magnitude_pressure_predata_benchmark_limitation_memo_v0.1.md` | `c841f3c37762156038996460a420e537aa7cb8bb` | introduced (A) verified; daily settled OPTION_C_NONVIABLE_BEST_CASE_FAIL |
 | TTG multi-horizon screen design v0.3 (DRAFT, weekly-centered) | committed; draft, not locked | committed-doc claim | `docs/lane2_ttg_magnitude_pressure_option_a_multi_horizon_screen_design_v0.3.md` | `ddc5c92ed2588219b4c7a8700b611022b967cf35` | introduced (A) verified; not a prereg-triggering artifact |
 | TTG → SPY directional v1 results | closed weak/null | committed-doc claim | `docs/lane2_ttg_spy_v1_results_v0.1.md` | `2003fc855bd0583f137e8814c173485981540270` | introduced (A) verified; AUC≈0.5266, primary p≈0.166, statistical_confirmed=False |
+| Cusp Geometry Lane v0.3 instrument freeze | frozen | committed-doc claim | `docs/cusp_geometry_lane_design_memo_v0_3.md` + `src/cusp_geometry_v0_3.py` | `4536be27f6955be72bdb7abad4b4cb38ac1278ad` | introduced (A) verified; memo SHA-256 `7d47f9a8…b3d6d8e8`, code SHA-256 `bd2a9d46…90568014`; smoke test PASS |
+| Cusp Geometry Lane v0.3 sandbox null (closure) | closed / FAIL exploratory null | committed-doc claim | `docs/cusp_geometry_lane_v0_3_sandbox_gate_report.md` | `ac098b660cabdc04aafff54aec7356ab55b143f4` | introduced (A) verified; pooled incremental R²=`-0.0256`, 0/10 folds improve; report SHA-256 `28d97171…f28849a6`; derived sandbox CSV SHA-256 `5cd92502…ea5901` (not committed, `data/raw/` ignored); FAIL branch — no tuning/alternatives/refit; sealed data unopened |
 
 Additional committed TTG→SPY directional v1 scaffolding exists in earlier commits (outcome-source pin, execution-environment note, zero-return amendment) and is reachable through git history; it is supporting, not load-bearing for this closure index, and is intentionally not enumerated as separate anchor rows. Verify directly from git if needed.
 
