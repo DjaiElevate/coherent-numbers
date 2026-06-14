@@ -108,16 +108,23 @@ This preserves the Cusp-lane logic: **sandbox failure closes a lane without spen
 - No lane may open sealed data (≥ `2023-01-01`) without **explicit owner authorization after a sandbox PASS**.
 - A **sandbox FAIL closes the promoted lane as exploratory null** unless a **new version is explicitly designed and logged before any further data contact**.
 
-**Card status values.** Every card carries exactly one of these four primary statuses:
+**Card status values.** Every card carries exactly one of these five primary statuses (this is the single authoritative status vocabulary):
 - `OPEN` — available and not closed/reserved (fully specifiable; eligible for promotion).
 - `STUB` — concept exists but the required data is not currently available or not usable; cannot be fully specified yet.
 - `RESERVED` — owned by another live lane; do not promote here until that lane resolves.
 - `CLOSED` — a prior lane closed it, or the force cannot be reopened under current protocol; do not reopen.
+- `INFEASIBLE` — a lane or matched design passed into an approved pre-test / pre-gate feasibility audit, but the audit found the instrument could not populate the required comparison cleanly under the frozen design and sandbox. **No wake/outcome was computed, no sandbox gate was run, and no sealed alpha was spent.** It is scoped to a specific `(design × dataset)` pair and must be recorded that way (e.g. `INFEASIBLE — matched design, SPY 2005–2022`).
+  - `INFEASIBLE` is **not** `CLOSED-as-null`.
+  - `INFEASIBLE` is **not** a sandbox FAIL.
+  - `INFEASIBLE` is **not** evidence for or against the untested wake/outcome hypothesis.
+  - It is an **instrument-feasibility status**, not a hypothesis verdict.
+  - Because it is scoped to `(design × dataset)`, a materially different instrument (e.g. a distributional/regression design on the same sandbox) or the same design on a materially different dataset (e.g. longer history, or an asset with more symmetric jump frequency) could re-open the underlying question **only as a NEW lane requiring a fresh Stage-1 design memo and a separate promotion decision.** Neither path is authorized by recording this status.
 
-`PARTIAL` is an **optional availability label** (not a fifth status) for forces with partial data — the card must still carry one of the four primary statuses (typically `OPEN`) and **state exactly what is partial** (e.g. "OHLC available 2013–2022 only").
+`PARTIAL` is an **optional availability label** (not a primary status) for forces with partial data — the card must still carry one of the five primary statuses (typically `OPEN`) and **state exactly what is partial** (e.g. "OHLC available 2013–2022 only").
 
 **Pre-set statuses (owner-fixed for v0.1):**
 - **Curvature → `CLOSED`** — Cusp Geometry Lane v0.3; not separable from zigzag/B6 for SPY 2005–2022; do not reopen.
+- **Shock/jump (aftershock) → `INFEASIBLE — matched design, SPY 2005–2022`** — promoted (first-promotion decision `23591ba`), Stage-1 rules-frozen (`cd10162`), then the matched design failed the Stage-2 pre-gate count audit; closure committed `526b12d`. Instrument-feasibility status only: no wake/outcome computed, no sandbox gate run, no sealed alpha spent. See the Shock/jump card (§7 Force Dictionary) for the full anchor and result.
 - **News direction → `CLOSED`** — prior Lane 2 v1.1 null; not open unless owner provides new scope.
 - **GDELT raw-count/coverage proxy → `CLOSED`** — prior exploratory null / drift-confounded (raw Spearman ≈ −0.15 to −0.18, dissolved under drift control; `docs/lane2_divergence_record_4f31bcb_6a75ec7.md`). Raw count is **not a promotable canonical representative**; it may appear only as read-only prior art or as an explicitly drift-confounded artifact.
 - **News magnitude → `OPEN`** — intensity/valence → next-session absolute move or volatility; untested here; requires its own locked design if promoted.
@@ -148,7 +155,7 @@ A force is **not distinct merely because it has a new name.** To count as its ow
 
 | Cluster | Canonical representative | Members |
 | --- | --- | --- |
-| **VOLATILITY** | trailing realized volatility | volatility, zigzag, range expansion, compression, shock/jump, path length, volatility-of-volatility, drawdown, recovery (curvature/cusp belong here but are **CLOSED**) |
+| **VOLATILITY** | trailing realized volatility | volatility, zigzag, range expansion, compression, shock/jump (**INFEASIBLE — matched design, SPY 2005–2022**), path length, volatility-of-volatility, drawdown, recovery (curvature/cusp belong here but are **CLOSED**) |
 | **AUTOCORRELATION** | lag-k autocorrelation / simple continuation–reversal statistic | trend, momentum, mean reversion — **one axis, different signs/horizons**, not three forces |
 | **NEWS/ATTENTION** | **coverage-normalized / drift-controlled** news or attention count (**not** raw count) | attention, narratives, news velocity, news decay, sentiment disagreement, news magnitude (news direction CLOSED) |
 | **MACRO WEATHER** | simple macro variable or event flag | all Group 3 macro forces |
@@ -170,7 +177,7 @@ Every FULL card **must** declare its **cluster**, its **canonical representative
 
 **VOLATILITY cluster.**
 - Canonical representative: **trailing realized volatility**.
-- Members include volatility, zigzag, range expansion, compression, shock/jump, path length, volatility-of-volatility (drawdown and recovery also sit here; curvature/cusp belong here but are **CLOSED**).
+- Members include volatility, zigzag, range expansion, compression, shock/jump (**INFEASIBLE — matched design, SPY 2005–2022**), path length, volatility-of-volatility (drawdown and recovery also sit here; curvature/cusp belong here but are **CLOSED**).
 - Any member must **beat trailing realized volatility** (or the relevant canonical representative — e.g. roughness forces must additionally beat **zigzag/B6**, which already beat curvature) to count as distinct.
 
 **AUTOCORRELATION cluster.**
@@ -390,8 +397,12 @@ Field legend (FULL card): force name · status · group · cluster · canonical 
 #### Compression — FULL
 - Mirror of range expansion (low range / coiling). **Cluster:** VOLATILITY · rep trailing realized vol · OPEN. **Availability:** ✅ adj_close (vol-compression) 2005–2022; OHLC-range-compression 2013–2022. **Null:** compression adds nothing beyond low trailing vol. **Distinctness:** must beat "vol is simply low." **Confound:** definitionally the inverse of vol level. **Metaphor:** the unnatural stillness before wind. **Prior-art:** none specific.
 
-#### Shock / jump — FULL
-- **Status:** OPEN · **Cluster:** VOLATILITY · rep trailing realized vol · Group 1. **Metaphor:** a branch suddenly snapping. **Proxy:** standardized return exceedance / jump indicator on adj_close. **Availability:** ✅ 2005–2022. **Outcome family:** forward realized vol (1); forward max drawdown (2). **Null:** jump count adds nothing beyond trailing realized vol for forward vol/drawdown. **Distinctness:** beat realized vol; show jumps ≠ high-vol tail. **Confound:** jumps inflate realized vol itself (mechanical overlap). **Prior-art:** none specific.
+#### Shock / jump (aftershock) — INFEASIBLE (matched design, SPY 2005–2022)
+- **Status:** `INFEASIBLE — matched design, SPY 2005–2022` · **Cluster:** VOLATILITY · rep trailing realized vol · Group 1. **Metaphor:** a branch suddenly snapping. **Proxy:** standardized return exceedance / jump indicator on adj_close. **Availability:** ✅ 2005–2022. **Outcome family (untested):** forward realized vol (1); forward max drawdown (2). **Original null:** jump count adds nothing beyond trailing realized vol for forward vol/drawdown. **Confound:** jumps inflate realized vol itself (mechanical overlap).
+- **Closure anchor.** Closure commit `526b12de8cf2fb6b7a1f680ac7818274c6e1cd50`; Stage-1 design commit `cd1016295ba4b843a61e8c9cd1811c86e88c0406`; audit report `docs/shock_jump_asymmetry_pregate_count_audit_report_v0_1.md`; audit script `scripts/run_shock_jump_asymmetry_pregate_count_audit.py`; decision memo `docs/shock_jump_asymmetry_pregate_count_audit_decision_v0_1.md`.
+- **Key result.** Max time-local one-to-one no-replacement matched pairs: **6** under either ruler. Max widened/descriptive-only matched pairs: **9**. Candidate floors 20 / 30 / 40: **none feasible**. Binding constraint: **large up-shocks too scarce** to populate the matched comparison arm. No wake/outcome computed; no sandbox gate run; no sealed data accessed; **zero alpha spent**.
+- **Interpretation guard.** *Frequency asymmetry is not wake asymmetry.* The pre-gate audit found that large up-shocks are too scarce to populate the matched comparison arm; it did **not** test, support, or null the wake-asymmetry hypothesis.
+- **Future-lane guard.** The matched Shock design **does not proceed to Stage-2 literal freeze.** The wake-asymmetry question remains **open-but-unaskable by this matched design on this sandbox.** Any distributional / regression-based Shock variant would be a **new lane** requiring a fresh Stage-1 design memo and a separate promotion decision. The same matched design on a materially different dataset (e.g. longer history, or an asset with more symmetric jump frequency) is likewise a **new lane / new design context, not a continuation.** No rescue by lowering the threshold, widening time matching, reusing scarce up-shocks, or switching to many-to-one / replacement matching. **Compression remains the named fallback, but is NOT authorized by this amendment, and no next lane is promoted by it.** **Prior-art:** none specific (this lane's own audit is the record).
 
 #### Cusp / reversal — CLOSED
 - **Status:** `CLOSED` · **Group:** 1 · **Cluster:** VOLATILITY · rep trailing realized vol / zigzag.
