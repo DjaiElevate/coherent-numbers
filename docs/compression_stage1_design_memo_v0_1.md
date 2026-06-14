@@ -299,13 +299,15 @@ The future episode-count audit must pre-justify: the episode-collapsing rule; th
 
 ## 17. Stage structure (draft, not authorized)
 
-- **Stage-1 design memo draft:** this file.
-- **Stage-1 acceptance/freeze:** future owner review and commit only.
-- **Pre-gate collinearity diagnostic:** future explicit authorization only.
-- **Pre-gate feasibility/count audit:** future explicit authorization only, and only **after** the collinearity diagnostic.
-- **Stage-2 literal freeze:** if diagnostics are adequate.
-- **Sandbox gate:** only after Stage-2 freeze and explicit authorization.
-- **Sealed data:** none until separately authorized under atlas rules.
+This sequence is the same order as §14's required future order; no step authorizes the next.
+
+1. **Stage-1 design memo draft:** this file.
+2. **Stage-1 design-rules acceptance / accepted-draft commit:** already completed by commit `41efee576636761e5550ebf45d8f4461e08ad4c7`. This accepts the design rules as a draft only; it is **not** a literal freeze. **No literal freeze is authorized before the pre-gate collinearity diagnostic and the distinct-episode feasibility/count audit are completed and judged adequate.**
+3. **Pre-gate collinearity diagnostic:** future explicit authorization only.
+4. **Pre-gate distinct-episode feasibility/count audit:** future explicit authorization only, and only **after** the collinearity diagnostic.
+5. **Stage-2 literal freeze:** only if diagnostics are adequate.
+6. **Sandbox gate:** only after Stage-2 freeze and explicit authorization.
+7. **Sealed data:** only under separate atlas authorization.
 
 ---
 
